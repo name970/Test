@@ -1,0 +1,11 @@
+[package]
+name = "scheduler"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Module 4: deterministic sequential D'Hondt allocation over discrete ShareIDs"
+
+[dependencies]
+primitives = { path = "../primitives" }
+
+[lints]
+workspace = true

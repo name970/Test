@@ -1,0 +1,11 @@
+[package]
+name = "work"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Module 1: canonical 512x512 INT8 Fresh Work tile and Freivalds verification"
+
+[dependencies]
+primitives = { path = "../primitives" }
+
+[lints]
+workspace = true
