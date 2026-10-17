@@ -1,0 +1,11 @@
+[package]
+name = "ledger"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Module 5: eight-category supply-conserving state, founder vesting and fee lots"
+
+[dependencies]
+primitives = { path = "../primitives" }
+
+[lints]
+workspace = true
