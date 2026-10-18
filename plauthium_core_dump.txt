@@ -1,0 +1,1916 @@
+################################################################################
+PLAUTHIUM CORE DUMP
+format:    plauthium-core-dump/1
+workspace: plauthium-workspace
+crates:    primitives work scivm scheduler ledger poc
+generated: 2026-10-18T08:35:36Z by scripts/make_core_dump.sh, from the 5 files uploaded to the session
+files:     5 present, 10 missing
+
+Each file appears between the markers
+  ##### BEGIN FILE: <path> | <n> lines | sha256 <hex>
+  ##### END FILE: <path>
+Content between the markers is verbatim. Paths are relative to the workspace root.
+################################################################################
+
+MANIFEST
+  MISSING  Cargo.toml
+  PRESENT  Cargo.lock                            47 lines  sha256 15c934277a300553476218877617fa6f59c42cd4bb97821a449b121596d72caf
+  PRESENT  .gitignore                             1 lines  sha256 44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb
+  MISSING  primitives/Cargo.toml
+  MISSING  primitives/src/lib.rs (or src/main.rs)
+  MISSING  work/Cargo.toml
+  MISSING  work/src/lib.rs (or src/main.rs)
+  MISSING  scivm/Cargo.toml
+  MISSING  scivm/src/lib.rs (or src/main.rs)
+  PRESENT  scheduler/Cargo.toml                  11 lines  sha256 9bc020dcc84a1dd5180b5af65f6c756638c3a39ff50e4ed29176fb98d2e9d974
+  MISSING  scheduler/src/lib.rs (or src/main.rs)
+  MISSING  ledger/Cargo.toml
+  PRESENT  ledger/src/lib.rs                   1193 lines  sha256 fb6c260bdbe36066b7515b05752651760f0360ea0a6eea296b2a677d9eb744bc
+  MISSING  poc/Cargo.toml
+  PRESENT  poc/src/main.rs                      485 lines  sha256 a1d6ea45bff876c17ee54ccd1df9f667219dcfd074fb8e99c92b3ee7636cafe2
+
+################################################################################
+SESSION NOTE - READ FIRST (this block is not source code)
+################################################################################
+This dump was built from the 5 files uploaded to the Claude Code session of
+2026-10-18. The other 10 expected files (see MANIFEST) were not uploaded, so
+THIS DUMP IS PARTIAL:
+
+  workspace root ... Cargo.lock + .gitignore present; Cargo.toml missing
+  primitives ....... no files (Cargo.toml and src/lib.rs missing)
+  work ............. no files (Cargo.toml and src/lib.rs missing)
+  scivm ............ no files (Cargo.toml and src/lib.rs missing)
+  scheduler ........ Cargo.toml present; src/lib.rs missing
+  ledger ........... src/lib.rs present; Cargo.toml missing
+  poc .............. src/main.rs present; Cargo.toml missing
+
+To produce the complete dump, run this from the repository root against the
+real workspace:
+
+  scripts/make_core_dump.sh /path/to/plauthium-workspace plauthium_core_dump.txt
+
+The regenerated file uses the same format and drops this note and the
+appendix below. Give Argon the COMPLETE dump. The appendix exists only so the
+blueprint (testnet_blueprint.md, section 13) can be checked against the API
+the PoC really calls.
+
+How the uploaded files were identified:
+  ledger/src/lib.rs     header "Module 5 - hybrid state, supply invariant and
+                        tokenomics"; defines every item poc imports from
+                        `ledger`; uses only `primitives`, as Cargo.lock says.
+  poc/src/main.rs       imports ledger, primitives, scheduler, scivm and work,
+                        matching the poc entry of Cargo.lock.
+  scheduler/Cargo.toml  name = "scheduler".
+Crate directories are siblings of each other
+(scheduler/Cargo.toml: primitives = { path = "../primitives" }).
+
+################################################################################
+APPENDIX - PUBLIC API SEEN AT CALL SITES (reconstructed, NOT source)
+################################################################################
+Each item below is used by ledger/src/lib.rs (L:<line>) or poc/src/main.rs
+(P:<line>). Both files compile against the real crates, so each item exists
+with at least the shape shown. "?" marks details the call sites leave open.
+
+Workspace
+  - Cargo.lock version 4, zero third-party dependencies (std only).
+  - edition 2024 and `[lints] workspace = true` (scheduler/Cargo.toml), so the
+    root Cargo.toml defines [workspace.lints].
+  - MSRV >= 1.87, because poc uses u64::is_multiple_of (P:328).
+
+primitives
+  pub struct Atoms(pub u64)                              L:29, L:41 (`.0` in const)
+      derives at least Copy, Clone, Debug, PartialEq, Eq, PartialOrd (L:856);
+      implements Display (P:127, P:164)
+      const ZERO: Atoms                                  L:347
+      fn get(&self) -> u64                               L:119
+      fn checked_add(self, Atoms) -> Option<Atoms>       L:733 (try_fold)
+      fn from_plau(u64) -> Option<Atoms>                 L:939, P:299
+          (1 PLAU = 10^8 atoms per whitepaper eq. 7.18; confirm in source)
+  pub type ShareWeight = u64                             L:1007 ([3, 5, 7]); P:117 + P:120 (Vec<u64>)
+  pub const TOTAL_SUPPLY: Atoms  (= 1_500_000_000_000_000)   L:41-42, L:947
+  pub struct DomainSeparatedHash                         non-cryptographic placeholder (P:11)
+      Copy (P:107 moves ids.work_id, then P:224/P:412 reuse ids)
+      fn new(label: &str, parts: &[&[u8]]) -> Self       P:233
+      fn short_hex(&self, n: integer) -> impl Display    P:69, P:96-102, P:376
+      ? byte accessors, digest length and Ord are not visible at call sites
+  pub struct Mersenne61 with const P (Display; p = 2^61 - 1)   P:93
+
+work
+  const TILE_DIM               (512; integer, cast `as u64`)          P:136, P:287
+  const CLASSICAL_MACS: u64    (= 512^3 = 134_217_728)                P:78
+  const ACCUMULATION_BOUND     (numeric, cast `as u64`; = 512 * 127^2 = 8_258_048)  P:80
+  const DEFAULT_FREIVALDS_ROUNDS (= 6)                                P:83
+  const FREIVALDS_FIELD_MULS: u64 (= 3 * 6 * 512^2 = 4_718_592)       P:425
+  pub struct FreshWorkContext { 16 pub fields }                       P:237-254
+      chain_id: integer ?            (literal 0x504c_4155, "PLAU")
+      genesis_id: DomainSeparatedHash
+      protocol_version: integer ?    (2)
+      crypto_suite_id: integer ?     (1)
+      program_id: DomainSeparatedHash
+      air_id: DomainSeparatedHash
+      generator_version: integer ?   (2)
+      parent_canonical_id: DomainSeparatedHash
+      stable_anchor_id: DomainSeparatedHash
+      height: u64
+      miner_policy_digest: DomainSeparatedHash
+      payout_policy_digest: DomainSeparatedHash
+      attempt_nonce: u64
+      body_core_root: DomainSeparatedHash
+      parent_derived_difficulty_context: DomainSeparatedHash
+      time_bucket: u64
+      fn instance(&self) -> _ { seed: DomainSeparatedHash, x, y }     P:66-73
+  INT8 tile matrix (type of instance.x and instance.y)
+      fn max_abs(&self) -> impl Display                               P:73
+      fn product(&self, &Self) -> <INT32 product>                     P:75
+  INT32 product matrix
+      Clone; fn max_abs(&self) (numeric, cast `as u64`)               P:79, P:84
+      fn get(&self, row, col) -> signed integer                       P:85
+      fn set(&mut self, row, col, value) -> Result<_, E: Error>       P:86
+  fn verify_freivalds_rounds(&x, &y, &product, rounds) -> bool        P:82-88
+  pub struct FreshWorkIds { output_root, work_id, block_id,
+                            share_ticket, seal_ticket: DomainSeparatedHash }
+      fn derive(&FreshWorkContext, &product) -> FreshWorkIds          P:95-102
+
+scivm
+  const CONSENSUS_WEIGHT (Display; 0 per whitepaper Table 1)          P:151
+  pub struct OzakiIIProfile { version, moduli: Vec<_>, inner_dim: u64,
+                              bound_x, bound_y, rounding: RoundingMode }   P:133-140
+      fn validate(&self) -> Result<(), E: Error>                      P:141
+      fn exact_dot(&self, &[f64], &[f64]) -> Result<i128, E: Error>   P:143-149
+      fn reconstruction_modulus(&self) -> Result<N, E: Error>, N numeric (cast `as f64`)  P:153
+  pub enum RoundingMode { NearestTiesToEven, ? }                      P:139
+
+scheduler
+  pub struct OwnerId(pub u64)                                         P:263, P:377
+  pub struct ShareID { id: DomainSeparatedHash, weight: u64, owner: OwnerId }   P:260-264, P:117
+  pub fn dhondt_allocation(&[ShareID], slots: usize) -> Result<Allocation, E: Error>   P:108
+  pub struct Allocation
+      per_share: Vec<integer>   slots held by each input share, input order   P:373, P:397
+      slots: Vec<integer>       slot index -> input share index (Display)     P:382
+      fn assigned(&self) -> usize                                     P:110
+
+ledger
+  Full source follows below.
+
+################################################################################
+##### BEGIN FILE: Cargo.lock | 47 lines | sha256 15c934277a300553476218877617fa6f59c42cd4bb97821a449b121596d72caf
+################################################################################
+# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = "ledger"
+version = "0.1.0"
+dependencies = [
+ "primitives",
+]
+
+[[package]]
+name = "poc"
+version = "0.1.0"
+dependencies = [
+ "ledger",
+ "primitives",
+ "scheduler",
+ "scivm",
+ "work",
+]
+
+[[package]]
+name = "primitives"
+version = "0.1.0"
+
+[[package]]
+name = "scheduler"
+version = "0.1.0"
+dependencies = [
+ "primitives",
+]
+
+[[package]]
+name = "scivm"
+version = "0.1.0"
+dependencies = [
+ "primitives",
+ "work",
+]
+
+[[package]]
+name = "work"
+version = "0.1.0"
+dependencies = [
+ "primitives",
+]
+##### END FILE: Cargo.lock
+
+################################################################################
+##### BEGIN FILE: .gitignore | 1 lines | sha256 44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb
+################################################################################
+/target
+##### END FILE: .gitignore
+
+################################################################################
+##### BEGIN FILE: scheduler/Cargo.toml | 11 lines | sha256 9bc020dcc84a1dd5180b5af65f6c756638c3a39ff50e4ed29176fb98d2e9d974
+################################################################################
+[package]
+name = "scheduler"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Module 4: deterministic sequential D'Hondt allocation over discrete ShareIDs"
+
+[dependencies]
+primitives = { path = "../primitives" }
+
+[lints]
+workspace = true
+##### END FILE: scheduler/Cargo.toml
+
+################################################################################
+##### BEGIN FILE: ledger/src/lib.rs | 1193 lines | sha256 fb6c260bdbe36066b7515b05752651760f0360ea0a6eea296b2a677d9eb744bc
+################################################################################
+//! Module 5 — hybrid state, supply invariant and tokenomics.
+//!
+//! The supply is fixed at `M = 1.5 * 10^15` atoms and is partitioned into
+//! eight disjoint, non-negative balance categories that sum to `M` in every
+//! reachable state (eq. 7.19). Every operation moves value between categories
+//! by deltas that sum to zero (eq. 7.13) and commits atomically or not at all
+//! (eq. 7.14).
+//!
+//! Two sub-ledgers refine categories without adding a balance:
+//!
+//! * **FounderAllocation** — 1,460 time-locked Genesis UTXOs inside
+//!   [`StateCategory::Circulating`] (`U`). Vesting changes only spendability;
+//!   it "adds no ninth balance" (§7.6).
+//! * **MatureFeeLots** — independent, immutable fee lots inside
+//!   [`StateCategory::EmissionReserve`] (`R_a`), alongside the Genesis emission
+//!   lot and the permanently segregated rounding dust (§7.8).
+//!
+//! **PoC status:** `U`, `S_z`, `B_bond` and `V_L2` are aggregate balances
+//! (no per-UTXO ownership, notes or signatures). Epoch length, maturation
+//! delay `L`, emission rate `η` and fee tariffs are deployment parameters;
+//! [`LedgerParams::poc`] picks illustrative values.
+
+use core::fmt;
+use std::collections::BTreeMap;
+
+use primitives::{Atoms, ShareWeight, TOTAL_SUPPLY};
+
+/// Genesis Founder Allocation `F = M / 10 = 150,000,000,000,000` atoms.
+pub const FOUNDER_ALLOCATION: Atoms = Atoms(150_000_000_000_000);
+/// Genesis Network Emission Reserve `R_a^(0) = M - F = 1,350,000,000,000,000` atoms.
+pub const GENESIS_EMISSION_RESERVE: Atoms = Atoms(1_350_000_000_000_000);
+/// Number of daily founder vesting tranches, `D_vest`.
+pub const VESTING_TRANCHES: u64 = 1_460;
+/// Nominal block interval `T_B` in seconds.
+pub const BLOCK_INTERVAL_SECONDS: u64 = 120;
+/// Blocks per nominal day, `B_day = 86,400 s / T_B`.
+pub const BLOCKS_PER_DAY: u64 = 720;
+/// Blocks until full vesting, `D_vest * B_day` (four 365-day years).
+pub const VESTING_BLOCKS: u64 = 1_051_200;
+
+const _: () = assert!(FOUNDER_ALLOCATION.0 * 10 == TOTAL_SUPPLY.0);
+const _: () = assert!(FOUNDER_ALLOCATION.0 + GENESIS_EMISSION_RESERVE.0 == TOTAL_SUPPLY.0);
+const _: () = assert!(86_400 / BLOCK_INTERVAL_SECONDS == BLOCKS_PER_DAY);
+const _: () = assert!(VESTING_TRANCHES == 4 * 365);
+const _: () = assert!(VESTING_TRANCHES * BLOCKS_PER_DAY == VESTING_BLOCKS);
+
+// ---------------------------------------------------------------------------
+// State categories and deltas (eqs. 7.13, 7.19)
+// ---------------------------------------------------------------------------
+
+/// The eight disjoint balance categories of eq. (7.19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StateCategory {
+    /// `U` — public UTXOs, including the FounderAllocation tranches.
+    Circulating,
+    /// `S_z` — shielded pool balance (equals the sum of unspent notes).
+    ShieldedPool,
+    /// `E_esc` — job escrows.
+    Escrow,
+    /// `B_bond` — executor bonds.
+    Bonds,
+    /// `V_L2` — L2 settlement-slot vaults.
+    L2Vaults,
+    /// `R_a` — available reserve: Genesis emission lot, MatureFeeLots and segregated dust.
+    EmissionReserve,
+    /// `R_l` — locked reserve: Base Fees and queue fees awaiting maturation.
+    LockedBaseFees,
+    /// `P_pending` — booked Fresh Work rewards not yet paid.
+    PendingRewards,
+}
+
+impl StateCategory {
+    /// Number of categories.
+    pub const COUNT: usize = 8;
+
+    /// All categories in canonical order.
+    pub const ALL: [StateCategory; StateCategory::COUNT] = [
+        StateCategory::Circulating,
+        StateCategory::ShieldedPool,
+        StateCategory::Escrow,
+        StateCategory::Bonds,
+        StateCategory::L2Vaults,
+        StateCategory::EmissionReserve,
+        StateCategory::LockedBaseFees,
+        StateCategory::PendingRewards,
+    ];
+
+    /// Position in [`StateCategory::ALL`].
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The symbol used in the specification.
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            StateCategory::Circulating => "U",
+            StateCategory::ShieldedPool => "S_z",
+            StateCategory::Escrow => "E_esc",
+            StateCategory::Bonds => "B_bond",
+            StateCategory::L2Vaults => "V_L2",
+            StateCategory::EmissionReserve => "R_a",
+            StateCategory::LockedBaseFees => "R_l",
+            StateCategory::PendingRewards => "P_pending",
+        }
+    }
+}
+
+/// Signed per-category change produced by one operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BalanceDelta([i128; StateCategory::COUNT]);
+
+impl BalanceDelta {
+    /// The empty delta.
+    pub const ZERO: BalanceDelta = BalanceDelta([0; StateCategory::COUNT]);
+
+    /// Moves `amount` from one category to another.
+    pub fn transfer(from: StateCategory, to: StateCategory, amount: Atoms) -> Self {
+        Self::ZERO
+            .with(from, -i128::from(amount.get()))
+            .with(to, i128::from(amount.get()))
+    }
+
+    /// Adds `change` to one category's entry.
+    pub fn with(mut self, category: StateCategory, change: i128) -> Self {
+        self.0[category.index()] += change;
+        self
+    }
+
+    /// Change for one category.
+    pub fn get(&self, category: StateCategory) -> i128 {
+        self.0[category.index()]
+    }
+
+    /// Sum over all categories; zero for every admissible delta (eq. 7.13).
+    pub fn sum(&self) -> i128 {
+        self.0.iter().sum()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parameters
+// ---------------------------------------------------------------------------
+
+/// Exact emission rate `η = u / v` with `0 < u < v` and `gcd(u, v) = 1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EmissionRate {
+    numerator: u64,
+    denominator: u64,
+}
+
+impl EmissionRate {
+    /// Validates and builds `η = u / v`.
+    pub fn new(numerator: u64, denominator: u64) -> Result<Self, LedgerError> {
+        if numerator == 0 || numerator >= denominator || gcd(numerator, denominator) != 1 {
+            return Err(LedgerError::InvalidEmissionRate {
+                numerator,
+                denominator,
+            });
+        }
+        Ok(EmissionRate {
+            numerator,
+            denominator,
+        })
+    }
+
+    /// `u`.
+    pub fn numerator(&self) -> u64 {
+        self.numerator
+    }
+
+    /// `v`.
+    pub fn denominator(&self) -> u64 {
+        self.denominator
+    }
+
+    /// Exact integer ceiling budget `ceil(u A / v) = floor((u A + v - 1) / v)` (eq. 7.25).
+    /// Since `u < v`, the budget never exceeds the principal `A`.
+    pub fn budget(&self, principal: Atoms) -> Atoms {
+        let (u, v) = (u128::from(self.numerator), u128::from(self.denominator));
+        Atoms((u * u128::from(principal.get())).div_ceil(v) as u64)
+    }
+}
+
+/// Deployment parameters of the ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LedgerParams {
+    /// Genesis height `h_G`.
+    pub genesis_height: u64,
+    /// Blocks per reward epoch.
+    pub blocks_per_epoch: u64,
+    /// Maturation delay `L` in epochs: a fee paid in epoch `e` matures in `e + L + 1`.
+    pub maturation_delay: u64,
+    /// Emission rate `η` applied to every eligible lot each epoch.
+    pub emission_rate: EmissionRate,
+}
+
+impl LedgerParams {
+    /// Illustrative PoC values: one-day epochs, `L = 2`, `η = 1/1000`.
+    pub fn poc() -> Self {
+        LedgerParams {
+            genesis_height: 0,
+            blocks_per_epoch: BLOCKS_PER_DAY,
+            maturation_delay: 2,
+            emission_rate: EmissionRate {
+                numerator: 1,
+                denominator: 1_000,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Founder vesting (eqs. 7.19a–7.19b)
+// ---------------------------------------------------------------------------
+
+/// One time-locked Genesis founder UTXO `g_d`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FounderTranche {
+    /// Tranche index `d` in `1..=1460`.
+    pub day: u64,
+    /// Immutable value `a_d = V_d - V_{d-1}`.
+    pub value: Atoms,
+    /// Unlock height `h_d = h_G + d * B_day`.
+    pub unlock_height: u64,
+}
+
+/// The FounderAllocation: 1,460 daily UTXO tranches over four nominal years.
+///
+/// `V_d = floor(F d / D_vest)` and `a_d = V_d - V_{d-1}`; the telescoping
+/// differences allocate every atom of `F` exactly once with no rounding loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FounderVesting {
+    genesis_height: u64,
+    allocation: Atoms,
+}
+
+impl FounderVesting {
+    /// The vesting schedule of `allocation` starting at `genesis_height`.
+    pub const fn new(genesis_height: u64, allocation: Atoms) -> Self {
+        FounderVesting {
+            genesis_height,
+            allocation,
+        }
+    }
+
+    /// Total allocation `F`.
+    pub fn allocation(&self) -> Atoms {
+        self.allocation
+    }
+
+    /// Cumulative eligible atoms after day `d`, `V_d` (clamped at `D_vest`).
+    pub fn cumulative(&self, day: u64) -> Atoms {
+        let d = u128::from(day.min(VESTING_TRANCHES));
+        Atoms((u128::from(self.allocation.get()) * d / u128::from(VESTING_TRANCHES)) as u64)
+    }
+
+    /// Tranche `g_d` for `1 <= d <= 1460`.
+    pub fn tranche(&self, day: u64) -> Option<FounderTranche> {
+        (1..=VESTING_TRANCHES)
+            .contains(&day)
+            .then(|| FounderTranche {
+                day,
+                value: Atoms(self.cumulative(day).get() - self.cumulative(day - 1).get()),
+                unlock_height: self.genesis_height + day * BLOCKS_PER_DAY,
+            })
+    }
+
+    /// All 1,460 tranches in order.
+    pub fn tranches(&self) -> impl Iterator<Item = FounderTranche> + '_ {
+        (1..=VESTING_TRANCHES).filter_map(|d| self.tranche(d))
+    }
+
+    /// Completed vesting intervals `d(h) = min(D_vest, max(0, floor((h - h_G) / B_day)))`.
+    pub fn completed_intervals(&self, height: u64) -> u64 {
+        (height.saturating_sub(self.genesis_height) / BLOCKS_PER_DAY).min(VESTING_TRANCHES)
+    }
+
+    /// Cumulative unlocked value `V_F(h) = V_{d(h)}`.
+    pub fn vested_at(&self, height: u64) -> Atoms {
+        self.cumulative(self.completed_intervals(height))
+    }
+
+    /// Value still time-locked at `height`, `F - V_F(h)`.
+    pub fn locked_at(&self, height: u64) -> Atoms {
+        Atoms(self.allocation.get() - self.vested_at(height).get())
+    }
+
+    /// `FounderOK` without the UTXO-presence conjunct: the height lock has
+    /// passed and the spend carries the treasury dual signature (eq. 2.5).
+    pub fn can_spend(&self, day: u64, height: u64, treasury_authorized: bool) -> bool {
+        self.tranche(day)
+            .is_some_and(|t| height >= t.unlock_height && treasury_authorized)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fee lots and reserve dynamics (eqs. 7.24–7.26)
+// ---------------------------------------------------------------------------
+
+/// Unique identifier of a reserve lot; lot `0` is the Genesis emission lot `c_G`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LotId(pub u64);
+
+/// An independent, immutable reserve lot `c`.
+///
+/// Each epoch the lot budgets `b = ceil(η A)` of its unbudgeted principal `A`
+/// and pays every mature share `floor(b w_s / W_e)`. The flooring remainder
+/// `r = b - sum floor(...)` is dust: it leaves the lot's principal and is
+/// permanently segregated in `R_a`, never funding a later budget. Lots are
+/// never merged, topped up or matured twice, so for every lot
+/// `source_fee = principal + booked_total + dust_total` at all times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeeLot {
+    id: LotId,
+    source_fee: Atoms,
+    paid_epoch: u64,
+    maturity_epoch: u64,
+    principal: Atoms,
+    booked_total: Atoms,
+    dust_total: Atoms,
+}
+
+/// One lot's contribution to one epoch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LotEpochPayout {
+    /// The lot.
+    pub lot: LotId,
+    /// Ceiling budget `b_{c,e}`.
+    pub budget: Atoms,
+    /// `Reward_{s,c,e}`, indexed like the input weights.
+    pub rewards: Vec<Atoms>,
+    /// Booked payouts `p_{c,e} = sum_s Reward_{s,c,e}`.
+    pub booked: Atoms,
+    /// Unpayable dust `r_{c,e} = b_{c,e} - p_{c,e}`.
+    pub dust: Atoms,
+}
+
+impl FeeLot {
+    /// The Genesis emission lot `c_G` with `A_{c_G,0} = R_0`.
+    pub fn genesis(reserve: Atoms) -> Self {
+        FeeLot {
+            id: LotId(0),
+            source_fee: reserve,
+            paid_epoch: 0,
+            maturity_epoch: 0,
+            principal: reserve,
+            booked_total: Atoms::ZERO,
+            dust_total: Atoms::ZERO,
+        }
+    }
+
+    /// A fresh lot for a matured fee `F_c` paid in `paid_epoch`.
+    pub fn matured(id: LotId, fee: Atoms, paid_epoch: u64, maturity_epoch: u64) -> Self {
+        FeeLot {
+            id,
+            source_fee: fee,
+            paid_epoch,
+            maturity_epoch,
+            principal: fee,
+            booked_total: Atoms::ZERO,
+            dust_total: Atoms::ZERO,
+        }
+    }
+
+    /// Lot identifier.
+    pub fn id(&self) -> LotId {
+        self.id
+    }
+    /// Original fee `F_c` (or `R_0` for the Genesis lot).
+    pub fn source_fee(&self) -> Atoms {
+        self.source_fee
+    }
+    /// Epoch `e_c` in which the fee was paid.
+    pub fn paid_epoch(&self) -> u64 {
+        self.paid_epoch
+    }
+    /// First eligible epoch `m_c = e_c + L + 1`.
+    pub fn maturity_epoch(&self) -> u64 {
+        self.maturity_epoch
+    }
+    /// Unbudgeted principal `A_{c,e}`.
+    pub fn principal(&self) -> Atoms {
+        self.principal
+    }
+    /// Cumulative booked payouts.
+    pub fn booked_total(&self) -> Atoms {
+        self.booked_total
+    }
+    /// Cumulative segregated dust.
+    pub fn dust_total(&self) -> Atoms {
+        self.dust_total
+    }
+
+    /// Settles one epoch against the mature share weights `w_s` (eq. 7.25).
+    ///
+    /// With `W_e = 0` the budget and every payout are zero. All divisions are
+    /// exact Euclidean integer divisions; `0 <= p <= b <= A` always holds.
+    pub fn settle_epoch(&mut self, rate: &EmissionRate, weights: &[ShareWeight]) -> LotEpochPayout {
+        let total_weight: u128 = weights.iter().map(|&w| u128::from(w)).sum();
+        let budget = if total_weight == 0 {
+            Atoms::ZERO
+        } else {
+            rate.budget(self.principal)
+        };
+        let rewards: Vec<Atoms> = weights
+            .iter()
+            .map(|&w| {
+                let reward = (u128::from(budget.get()) * u128::from(w)).checked_div(total_weight);
+                Atoms(reward.unwrap_or(0) as u64)
+            })
+            .collect();
+        let booked = Atoms(rewards.iter().map(|r| r.get()).sum());
+        let dust = Atoms(budget.get() - booked.get());
+        self.principal = Atoms(self.principal.get() - budget.get());
+        self.booked_total = Atoms(self.booked_total.get() + booked.get());
+        self.dust_total = Atoms(self.dust_total.get() + dust.get());
+        LotEpochPayout {
+            lot: self.id,
+            budget,
+            rewards,
+            booked,
+            dust,
+        }
+    }
+}
+
+/// A fee held in the locked reserve `R_l` until its maturity epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockedFee {
+    /// The lot this fee becomes on maturation.
+    pub lot: LotId,
+    /// Fee amount.
+    pub amount: Atoms,
+    /// Epoch of the irrevocable transfer.
+    pub paid_epoch: u64,
+    /// First epoch in which it may mature, `e + L + 1`.
+    pub maturity_epoch: u64,
+}
+
+/// One epoch's reward booking across all eligible lots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpochPayout {
+    /// Epoch `e`.
+    pub epoch: u64,
+    /// `E_e = sum_c b_{c,e}`.
+    pub budget: Atoms,
+    /// `P_e = sum_c p_{c,e}`, moved from `R_a` to `P_pending`.
+    pub booked: Atoms,
+    /// `r_e = E_e - P_e`, newly segregated dust.
+    pub dust: Atoms,
+    /// `Reward_{s,e} = sum_c Reward_{s,c,e}`, indexed like the input weights.
+    pub per_share: Vec<Atoms>,
+    /// Per-lot detail.
+    pub lots: Vec<LotEpochPayout>,
+}
+
+// ---------------------------------------------------------------------------
+// Ledger
+// ---------------------------------------------------------------------------
+
+/// Identifier of an escrowed job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct JobId(pub u64);
+
+/// Rejection reasons. A rejected operation leaves the state unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LedgerError {
+    /// The delta does not sum to zero (eq. 7.13).
+    NonZeroSumDelta(i128),
+    /// A category would become negative.
+    NegativeBalance(StateCategory),
+    /// A category would exceed `u64`.
+    BalanceOverflow(StateCategory),
+    /// The categories would not sum to `M`.
+    SupplyViolation {
+        /// The offending total.
+        total: u128,
+    },
+    /// The spend would consume time-locked founder tranches.
+    FounderTrancheLocked {
+        /// Value still locked at the current height.
+        locked: Atoms,
+        /// `U` after the operation.
+        circulating_after: Atoms,
+    },
+    /// `η` must satisfy `0 < u < v` and `gcd(u, v) = 1`.
+    InvalidEmissionRate {
+        /// `u`.
+        numerator: u64,
+        /// `v`.
+        denominator: u64,
+    },
+    /// A deployment parameter is unusable.
+    InvalidParams(&'static str),
+    /// Heights only move forward.
+    HeightRegression {
+        /// Current height.
+        current: u64,
+        /// Requested height.
+        requested: u64,
+    },
+    /// No escrow exists for the job.
+    UnknownJob(JobId),
+    /// The job already has an escrow.
+    JobAlreadyFunded(JobId),
+    /// The escrow cannot cover the requested movement.
+    InsufficientEscrow {
+        /// The job.
+        job: JobId,
+        /// Escrow balance.
+        available: Atoms,
+        /// Requested amount.
+        required: Atoms,
+    },
+    /// Tariffs are positive integers.
+    ZeroAmount,
+    /// Rewards for this epoch were already booked.
+    EpochAlreadyBooked(u64),
+    /// A sub-ledger disagrees with its category balance.
+    Inconsistent(&'static str),
+}
+
+impl fmt::Display for LedgerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LedgerError::NonZeroSumDelta(s) => write!(f, "delta sums to {s}, not zero"),
+            LedgerError::NegativeBalance(c) => write!(f, "{} would become negative", c.symbol()),
+            LedgerError::BalanceOverflow(c) => write!(f, "{} would overflow", c.symbol()),
+            LedgerError::SupplyViolation { total } => write!(f, "categories sum to {total}, not M"),
+            LedgerError::FounderTrancheLocked {
+                locked,
+                circulating_after,
+            } => write!(
+                f,
+                "U would drop to {} atoms below {} locked founder atoms",
+                circulating_after.get(),
+                locked.get()
+            ),
+            LedgerError::InvalidEmissionRate {
+                numerator,
+                denominator,
+            } => {
+                write!(f, "invalid emission rate {numerator}/{denominator}")
+            }
+            LedgerError::InvalidParams(why) => write!(f, "invalid parameters: {why}"),
+            LedgerError::HeightRegression { current, requested } => {
+                write!(f, "height {requested} is below current height {current}")
+            }
+            LedgerError::UnknownJob(j) => write!(f, "no escrow for job {}", j.0),
+            LedgerError::JobAlreadyFunded(j) => write!(f, "job {} is already funded", j.0),
+            LedgerError::InsufficientEscrow {
+                job,
+                available,
+                required,
+            } => write!(
+                f,
+                "job {} escrow {} atoms < required {} atoms",
+                job.0,
+                available.get(),
+                required.get()
+            ),
+            LedgerError::ZeroAmount => write!(f, "amounts must be positive"),
+            LedgerError::EpochAlreadyBooked(e) => write!(f, "epoch {e} already booked"),
+            LedgerError::Inconsistent(what) => write!(f, "inconsistent state: {what}"),
+        }
+    }
+}
+
+impl std::error::Error for LedgerError {}
+
+/// The eight-category ledger state with its sub-ledgers.
+#[derive(Clone, Debug)]
+pub struct Ledger {
+    params: LedgerParams,
+    height: u64,
+    balances: [Atoms; StateCategory::COUNT],
+    founder: FounderVesting,
+    escrows: BTreeMap<JobId, Atoms>,
+    locked: Vec<LockedFee>,
+    lots: Vec<FeeLot>,
+    segregated_dust: Atoms,
+    next_lot: u64,
+    last_booked_epoch: Option<u64>,
+}
+
+impl Ledger {
+    /// Genesis: `U = F` as 1,460 founder tranches, `R_a = M - F` as the Genesis
+    /// emission lot, and zero in the other six categories.
+    pub fn genesis(params: LedgerParams) -> Result<Self, LedgerError> {
+        if params.blocks_per_epoch == 0 {
+            return Err(LedgerError::InvalidParams(
+                "blocks_per_epoch must be positive",
+            ));
+        }
+        let mut balances = [Atoms::ZERO; StateCategory::COUNT];
+        balances[StateCategory::Circulating.index()] = FOUNDER_ALLOCATION;
+        balances[StateCategory::EmissionReserve.index()] = GENESIS_EMISSION_RESERVE;
+        let ledger = Ledger {
+            params,
+            height: params.genesis_height,
+            balances,
+            founder: FounderVesting::new(params.genesis_height, FOUNDER_ALLOCATION),
+            escrows: BTreeMap::new(),
+            locked: Vec::new(),
+            lots: vec![FeeLot::genesis(GENESIS_EMISSION_RESERVE)],
+            segregated_dust: Atoms::ZERO,
+            next_lot: 1,
+            last_booked_epoch: None,
+        };
+        ledger.check_invariants()?;
+        Ok(ledger)
+    }
+
+    /// Deployment parameters.
+    pub fn params(&self) -> &LedgerParams {
+        &self.params
+    }
+    /// Current height.
+    pub fn height(&self) -> u64 {
+        self.height
+    }
+    /// Epoch containing the current height.
+    pub fn epoch(&self) -> u64 {
+        self.epoch_of(self.height)
+    }
+    /// Epoch `e(h)` containing `height`.
+    pub fn epoch_of(&self, height: u64) -> u64 {
+        height.saturating_sub(self.params.genesis_height) / self.params.blocks_per_epoch
+    }
+    /// Balance of one category.
+    pub fn balance(&self, category: StateCategory) -> Atoms {
+        self.balances[category.index()]
+    }
+    /// Sum over all eight categories.
+    pub fn total(&self) -> u128 {
+        self.balances.iter().map(|b| u128::from(b.get())).sum()
+    }
+    /// The FounderAllocation schedule.
+    pub fn founder_vesting(&self) -> &FounderVesting {
+        &self.founder
+    }
+    /// Lots in `R_a`: the Genesis emission lot followed by MatureFeeLots.
+    pub fn fee_lots(&self) -> &[FeeLot] {
+        &self.lots
+    }
+    /// Fees still locked in `R_l`.
+    pub fn locked_fees(&self) -> &[LockedFee] {
+        &self.locked
+    }
+    /// Rounding dust permanently segregated in `R_a`.
+    pub fn segregated_dust(&self) -> Atoms {
+        self.segregated_dust
+    }
+    /// Escrow balance of a job.
+    pub fn escrow(&self, job: JobId) -> Atoms {
+        self.escrows.get(&job).copied().unwrap_or(Atoms::ZERO)
+    }
+
+    /// Advances the height. This changes lock eligibility only and produces no
+    /// balance delta.
+    pub fn advance_to(&mut self, height: u64) -> Result<(), LedgerError> {
+        if height < self.height {
+            return Err(LedgerError::HeightRegression {
+                current: self.height,
+                requested: height,
+            });
+        }
+        self.height = height;
+        Ok(())
+    }
+
+    /// `ESCROW_FUND_AND_QUEUE`: `ΔU = -(D + f_queue)`, `ΔE_esc = D`, `ΔR_l = f_queue`.
+    /// The queue fee is an irrevocable fee transfer and becomes its own lot.
+    pub fn escrow_fund_and_queue(
+        &mut self,
+        job: JobId,
+        deposit: Atoms,
+        queue_fee: Atoms,
+    ) -> Result<BalanceDelta, LedgerError> {
+        if deposit == Atoms::ZERO || queue_fee == Atoms::ZERO {
+            return Err(LedgerError::ZeroAmount);
+        }
+        if self.escrows.contains_key(&job) {
+            return Err(LedgerError::JobAlreadyFunded(job));
+        }
+        let total = i128::from(deposit.get()) + i128::from(queue_fee.get());
+        let delta = BalanceDelta::ZERO
+            .with(StateCategory::Circulating, -total)
+            .with(StateCategory::Escrow, i128::from(deposit.get()))
+            .with(StateCategory::LockedBaseFees, i128::from(queue_fee.get()));
+        let staged = self.stage(&delta)?;
+        self.balances = staged;
+        self.escrows.insert(job, deposit);
+        self.lock_fee(queue_fee);
+        Ok(delta)
+    }
+
+    /// `JOB_ADMIT_AND_LEASE`: `ΔE_esc = -F_base`, `ΔR_l = F_base`.
+    ///
+    /// The Base Fee moves irretrievably into `R_l[e(h_admit) + L]`; no operation
+    /// ever moves value from `R_l` back to an escrow or a client (eq. 7.21).
+    pub fn job_admit_and_lease(
+        &mut self,
+        job: JobId,
+        base_fee: Atoms,
+    ) -> Result<BalanceDelta, LedgerError> {
+        if base_fee == Atoms::ZERO {
+            return Err(LedgerError::ZeroAmount);
+        }
+        self.require_escrow(job, base_fee)?;
+        let delta = BalanceDelta::transfer(
+            StateCategory::Escrow,
+            StateCategory::LockedBaseFees,
+            base_fee,
+        );
+        let staged = self.stage(&delta)?;
+        self.balances = staged;
+        self.debit_escrow(job, base_fee);
+        self.lock_fee(base_fee);
+        Ok(delta)
+    }
+
+    /// `RESULT_SETTLE`: `ΔE_esc = -(v_exec + v_DA + v_ref)`, `ΔU = v_exec + v_DA + v_ref`.
+    pub fn result_settle(
+        &mut self,
+        job: JobId,
+        v_exec: Atoms,
+        v_da: Atoms,
+        v_ref: Atoms,
+    ) -> Result<BalanceDelta, LedgerError> {
+        let total = [v_exec, v_da, v_ref]
+            .into_iter()
+            .try_fold(Atoms::ZERO, Atoms::checked_add)
+            .ok_or(LedgerError::BalanceOverflow(StateCategory::Escrow))?;
+        self.require_escrow(job, total)?;
+        let delta =
+            BalanceDelta::transfer(StateCategory::Escrow, StateCategory::Circulating, total);
+        let staged = self.stage(&delta)?;
+        self.balances = staged;
+        self.debit_escrow(job, total);
+        Ok(delta)
+    }
+
+    /// `RESERVE_MATURE`: every locked fee whose maturity epoch has arrived moves
+    /// `R_l -> R_a` as a new, independent MatureFeeLot (`ΔR_l = -v_mat`, `ΔR_a = v_mat`).
+    pub fn reserve_mature(&mut self) -> Result<(BalanceDelta, Vec<LotId>), LedgerError> {
+        let epoch = self.epoch();
+        let (ready, waiting): (Vec<LockedFee>, Vec<LockedFee>) =
+            self.locked.iter().partition(|f| f.maturity_epoch <= epoch);
+        let v_mat = Atoms(ready.iter().map(|f| f.amount.get()).sum());
+        let delta = BalanceDelta::transfer(
+            StateCategory::LockedBaseFees,
+            StateCategory::EmissionReserve,
+            v_mat,
+        );
+        let staged = self.stage(&delta)?;
+        self.balances = staged;
+        self.locked = waiting;
+        let ids = ready.iter().map(|f| f.lot).collect();
+        self.lots.extend(
+            ready
+                .iter()
+                .map(|f| FeeLot::matured(f.lot, f.amount, f.paid_epoch, f.maturity_epoch)),
+        );
+        Ok((delta, ids))
+    }
+
+    /// Epoch budget: every eligible lot settles against the mature share
+    /// weights; booked payouts move `R_a -> P_pending` (`ΔR_a = -P_e`,
+    /// `ΔP_pending = P_e`) and the dust `r_e` stays segregated in `R_a`.
+    /// Each epoch is booked at most once.
+    pub fn book_epoch(
+        &mut self,
+        weights: &[ShareWeight],
+    ) -> Result<(BalanceDelta, EpochPayout), LedgerError> {
+        let epoch = self.epoch();
+        if self.last_booked_epoch.is_some_and(|last| last >= epoch) {
+            return Err(LedgerError::EpochAlreadyBooked(epoch));
+        }
+        let rate = self.params.emission_rate;
+        let mut lots = self.lots.clone();
+        let mut per_share = vec![Atoms::ZERO; weights.len()];
+        let mut details = Vec::new();
+        for lot in lots
+            .iter_mut()
+            .filter(|l| l.maturity_epoch <= epoch && l.principal > Atoms::ZERO)
+        {
+            let payout = lot.settle_epoch(&rate, weights);
+            for (acc, r) in per_share.iter_mut().zip(&payout.rewards) {
+                *acc = Atoms(acc.get() + r.get());
+            }
+            details.push(payout);
+        }
+        let sum = |f: fn(&LotEpochPayout) -> Atoms| Atoms(details.iter().map(|d| f(d).get()).sum());
+        let payout = EpochPayout {
+            epoch,
+            budget: sum(|d| d.budget),
+            booked: sum(|d| d.booked),
+            dust: sum(|d| d.dust),
+            per_share,
+            lots: details,
+        };
+        let delta = BalanceDelta::transfer(
+            StateCategory::EmissionReserve,
+            StateCategory::PendingRewards,
+            payout.booked,
+        );
+        let staged = self.stage(&delta)?;
+        self.balances = staged;
+        self.lots = lots;
+        self.segregated_dust = Atoms(self.segregated_dust.get() + payout.dust.get());
+        self.last_booked_epoch = Some(epoch);
+        Ok((delta, payout))
+    }
+
+    /// `FW_REWARD`: `ΔP_pending = -v_pay`, `ΔU = v_pay`.
+    pub fn fw_reward(&mut self, amount: Atoms) -> Result<BalanceDelta, LedgerError> {
+        let delta = BalanceDelta::transfer(
+            StateCategory::PendingRewards,
+            StateCategory::Circulating,
+            amount,
+        );
+        self.balances = self.stage(&delta)?;
+        Ok(delta)
+    }
+
+    /// Verifies the supply invariant and that every sub-ledger matches its category.
+    pub fn check_invariants(&self) -> Result<(), LedgerError> {
+        if self.total() != u128::from(TOTAL_SUPPLY.get()) {
+            return Err(LedgerError::SupplyViolation {
+                total: self.total(),
+            });
+        }
+        let reserve =
+            self.segregated_dust.get() + self.lots.iter().map(|l| l.principal.get()).sum::<u64>();
+        if reserve != self.balance(StateCategory::EmissionReserve).get() {
+            return Err(LedgerError::Inconsistent(
+                "R_a != dust + sum of lot principals",
+            ));
+        }
+        let locked: u64 = self.locked.iter().map(|f| f.amount.get()).sum();
+        if locked != self.balance(StateCategory::LockedBaseFees).get() {
+            return Err(LedgerError::Inconsistent("R_l != sum of locked fees"));
+        }
+        let escrowed: u64 = self.escrows.values().map(|a| a.get()).sum();
+        if escrowed != self.balance(StateCategory::Escrow).get() {
+            return Err(LedgerError::Inconsistent("E_esc != sum of job escrows"));
+        }
+        if self.lots.iter().any(|l| {
+            l.principal.get() + l.booked_total.get() + l.dust_total.get() != l.source_fee.get()
+        }) {
+            return Err(LedgerError::Inconsistent(
+                "lot principal + booked + dust != source fee",
+            ));
+        }
+        if self.balance(StateCategory::Circulating) < self.founder.locked_at(self.height) {
+            return Err(LedgerError::Inconsistent("U below locked founder tranches"));
+        }
+        Ok(())
+    }
+
+    /// Validates a delta against the current state without mutating it:
+    /// zero sum (eq. 7.13), non-negativity, supply `M` (eq. 7.19) and the
+    /// founder time locks. Callers commit the returned balances together with
+    /// their sub-ledger updates, which makes every operation all-or-nothing.
+    fn stage(&self, delta: &BalanceDelta) -> Result<[Atoms; StateCategory::COUNT], LedgerError> {
+        if delta.sum() != 0 {
+            return Err(LedgerError::NonZeroSumDelta(delta.sum()));
+        }
+        let mut next = self.balances;
+        for category in StateCategory::ALL {
+            let value = i128::from(next[category.index()].get()) + delta.get(category);
+            if value < 0 {
+                return Err(LedgerError::NegativeBalance(category));
+            }
+            next[category.index()] =
+                Atoms(u64::try_from(value).map_err(|_| LedgerError::BalanceOverflow(category))?);
+        }
+        let total: u128 = next.iter().map(|b| u128::from(b.get())).sum();
+        if total != u128::from(TOTAL_SUPPLY.get()) {
+            return Err(LedgerError::SupplyViolation { total });
+        }
+        let locked = self.founder.locked_at(self.height);
+        let circulating_after = next[StateCategory::Circulating.index()];
+        if circulating_after < locked {
+            return Err(LedgerError::FounderTrancheLocked {
+                locked,
+                circulating_after,
+            });
+        }
+        Ok(next)
+    }
+
+    fn require_escrow(&self, job: JobId, required: Atoms) -> Result<(), LedgerError> {
+        let available = *self.escrows.get(&job).ok_or(LedgerError::UnknownJob(job))?;
+        if available < required {
+            return Err(LedgerError::InsufficientEscrow {
+                job,
+                available,
+                required,
+            });
+        }
+        Ok(())
+    }
+
+    fn debit_escrow(&mut self, job: JobId, amount: Atoms) {
+        if let Some(balance) = self.escrows.get_mut(&job) {
+            *balance = Atoms(balance.get() - amount.get());
+            if *balance == Atoms::ZERO {
+                self.escrows.remove(&job);
+            }
+        }
+    }
+
+    fn lock_fee(&mut self, amount: Atoms) {
+        let paid_epoch = self.epoch();
+        self.locked.push(LockedFee {
+            lot: LotId(self.next_lot),
+            amount,
+            paid_epoch,
+            maturity_epoch: paid_epoch + self.params.maturation_delay + 1,
+        });
+        self.next_lot += 1;
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plau(n: u64) -> Atoms {
+        Atoms::from_plau(n).unwrap()
+    }
+
+    fn assert_supply(ledger: &Ledger) {
+        let sum: u128 = StateCategory::ALL
+            .iter()
+            .map(|&c| u128::from(ledger.balance(c).get()))
+            .sum();
+        assert_eq!(sum, 1_500_000_000_000_000);
+        ledger.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn genesis_categories_sum_to_exactly_total_supply() {
+        let ledger = Ledger::genesis(LedgerParams::poc()).unwrap();
+        assert_supply(&ledger);
+        assert_eq!(StateCategory::ALL.len(), 8);
+        assert_eq!(
+            ledger.balance(StateCategory::Circulating),
+            FOUNDER_ALLOCATION
+        );
+        assert_eq!(
+            ledger.balance(StateCategory::EmissionReserve),
+            GENESIS_EMISSION_RESERVE
+        );
+        let others = [
+            StateCategory::ShieldedPool,
+            StateCategory::Escrow,
+            StateCategory::Bonds,
+            StateCategory::L2Vaults,
+            StateCategory::LockedBaseFees,
+            StateCategory::PendingRewards,
+        ];
+        assert!(others.iter().all(|&c| ledger.balance(c) == Atoms::ZERO));
+    }
+
+    #[test]
+    fn zero_sum_delta_rule() {
+        let mut ledger = Ledger::genesis(LedgerParams::poc()).unwrap();
+        ledger.advance_to(VESTING_BLOCKS).unwrap(); // everything vested
+        let before = ledger.balances;
+
+        // Minting one atom is rejected and changes nothing.
+        let mint = BalanceDelta::ZERO.with(StateCategory::Circulating, 1);
+        assert_eq!(ledger.stage(&mint), Err(LedgerError::NonZeroSumDelta(1)));
+        // A zero-sum delta that overdraws a category is rejected too.
+        let overdraw =
+            BalanceDelta::transfer(StateCategory::Bonds, StateCategory::Circulating, Atoms(1));
+        assert_eq!(
+            ledger.stage(&overdraw),
+            Err(LedgerError::NegativeBalance(StateCategory::Bonds))
+        );
+        assert_eq!(ledger.balances, before);
+
+        // Shield, bond and bridge value: every category moves, the sum does not.
+        let spread = BalanceDelta::ZERO
+            .with(StateCategory::Circulating, -3_000)
+            .with(StateCategory::ShieldedPool, 1_000)
+            .with(StateCategory::Bonds, 1_500)
+            .with(StateCategory::L2Vaults, 500);
+        assert_eq!(spread.sum(), 0);
+        ledger.balances = ledger.stage(&spread).unwrap();
+        assert_supply(&ledger);
+    }
+
+    #[test]
+    fn full_fee_lifecycle_conserves_supply() {
+        let mut ledger = Ledger::genesis(LedgerParams::poc()).unwrap();
+        let weights = [3, 5, 7];
+        let (_, first) = ledger.book_epoch(&weights).unwrap();
+        assert_supply(&ledger);
+        ledger.fw_reward(first.booked).unwrap();
+        assert_supply(&ledger);
+
+        // Worked budget of eq. (7.17): D = 10 + 80 + 5 + 5 = 100 PLAU.
+        let job = JobId(1);
+        ledger
+            .escrow_fund_and_queue(job, plau(100), plau(1))
+            .unwrap();
+        assert_supply(&ledger);
+        ledger.job_admit_and_lease(job, plau(10)).unwrap();
+        assert_supply(&ledger);
+        assert_eq!(ledger.balance(StateCategory::LockedBaseFees), plau(11));
+        ledger
+            .result_settle(job, plau(80), plau(5), plau(5))
+            .unwrap();
+        assert_supply(&ledger);
+        assert_eq!(ledger.escrow(job), Atoms::ZERO);
+
+        // Nothing matures before e + L + 1.
+        let (delta, ids) = ledger.reserve_mature().unwrap();
+        assert!(ids.is_empty() && delta == BalanceDelta::ZERO);
+        let maturity = ledger.locked_fees()[0].maturity_epoch;
+        ledger.advance_to(maturity * BLOCKS_PER_DAY).unwrap();
+        let (_, ids) = ledger.reserve_mature().unwrap();
+        assert_eq!(ids.len(), 2, "queue fee and Base Fee are independent lots");
+        assert_eq!(ledger.balance(StateCategory::LockedBaseFees), Atoms::ZERO);
+        assert_supply(&ledger);
+
+        let (_, second) = ledger.book_epoch(&weights).unwrap();
+        assert_eq!(second.lots.len(), 3, "Genesis lot plus two fee lots");
+        assert_eq!(second.budget.get(), second.booked.get() + second.dust.get());
+        assert_supply(&ledger);
+        ledger.fw_reward(second.booked).unwrap();
+        assert_supply(&ledger);
+        assert_eq!(ledger.balance(StateCategory::PendingRewards), Atoms::ZERO);
+        assert_eq!(
+            ledger.book_epoch(&weights).unwrap_err(),
+            LedgerError::EpochAlreadyBooked(maturity)
+        );
+    }
+
+    #[test]
+    fn founder_vesting_has_1460_exact_tranches() {
+        let v = FounderVesting::new(0, FOUNDER_ALLOCATION);
+        let tranches: Vec<FounderTranche> = v.tranches().collect();
+        assert_eq!(tranches.len(), 1_460);
+        let sum: u64 = tranches.iter().map(|t| t.value.get()).sum();
+        assert_eq!(
+            sum,
+            FOUNDER_ALLOCATION.get(),
+            "telescoping allocates every atom once"
+        );
+        assert_eq!(tranches[0].unlock_height, 720);
+        assert_eq!(tranches[1_459].unlock_height, VESTING_BLOCKS);
+        // F / 1460 is not an integer, so tranche values differ by at most one atom.
+        let min = tranches.iter().map(|t| t.value.get()).min().unwrap();
+        let max = tranches.iter().map(|t| t.value.get()).max().unwrap();
+        assert_eq!((min, max), (102_739_726_027, 102_739_726_028));
+
+        assert_eq!(v.vested_at(0), Atoms::ZERO);
+        assert_eq!(v.vested_at(719), Atoms::ZERO);
+        assert_eq!(v.vested_at(720), tranches[0].value);
+        assert_eq!(v.vested_at(VESTING_BLOCKS), FOUNDER_ALLOCATION);
+        assert_eq!(v.vested_at(u64::MAX), FOUNDER_ALLOCATION);
+        assert_eq!(v.completed_intervals(10 * VESTING_BLOCKS), VESTING_TRANCHES);
+
+        assert!(!v.can_spend(1, 719, true));
+        assert!(
+            !v.can_spend(1, 720, false),
+            "treasury dual signature required"
+        );
+        assert!(v.can_spend(1, 720, true));
+        assert!(!v.can_spend(0, u64::MAX, true) && !v.can_spend(1_461, u64::MAX, true));
+    }
+
+    #[test]
+    fn locked_founder_tranches_cannot_be_spent() {
+        let mut ledger = Ledger::genesis(LedgerParams::poc()).unwrap();
+        let err = ledger
+            .escrow_fund_and_queue(JobId(1), plau(100), plau(1))
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::FounderTrancheLocked { .. }));
+        assert_eq!(
+            ledger.balance(StateCategory::Circulating),
+            FOUNDER_ALLOCATION
+        );
+        assert!(ledger.locked_fees().is_empty());
+        // After the first day, exactly tranche 1 is spendable.
+        ledger.advance_to(BLOCKS_PER_DAY).unwrap();
+        let a1 = ledger.founder_vesting().tranche(1).unwrap().value;
+        ledger
+            .escrow_fund_and_queue(JobId(1), Atoms(a1.get() - 1), Atoms(1))
+            .unwrap();
+        assert_supply(&ledger);
+    }
+
+    #[test]
+    fn fee_lot_pays_by_integer_division_and_segregates_dust() {
+        let rate = EmissionRate::new(1, 1_000).unwrap();
+        let mut lot = FeeLot::matured(LotId(9), Atoms(1_000_000_000), 0, 3);
+        let first = lot.settle_epoch(&rate, &[1, 1, 1]);
+        assert_eq!(first.budget, Atoms(1_000_000));
+        assert_eq!(first.rewards, vec![Atoms(333_333); 3]);
+        assert_eq!((first.booked, first.dust), (Atoms(999_999), Atoms(1)));
+        assert_eq!(lot.principal(), Atoms(999_000_000));
+
+        // Dust never returns to principal: the next budget is ceil(η * 999,000,000).
+        let second = lot.settle_epoch(&rate, &[2, 5]);
+        assert_eq!(second.budget, Atoms(999_000));
+        assert_eq!(second.rewards, vec![Atoms(285_428), Atoms(713_571)]);
+        assert_eq!(second.dust, Atoms(1));
+        assert_eq!(lot.dust_total(), Atoms(2));
+        assert_eq!(
+            lot.principal().get() + lot.booked_total().get() + lot.dust_total().get(),
+            lot.source_fee().get()
+        );
+
+        // W_e = 0 (no shares, or only zero weights): nothing is budgeted.
+        let before = lot.principal();
+        for weights in [&[][..], &[0, 0][..]] {
+            let idle = lot.settle_epoch(&rate, weights);
+            assert_eq!(
+                (idle.budget, idle.booked, idle.dust),
+                (Atoms::ZERO, Atoms::ZERO, Atoms::ZERO)
+            );
+            assert!(idle.rewards.iter().all(|&r| r == Atoms::ZERO));
+        }
+        assert_eq!(lot.principal(), before);
+
+        // Ceiling budget: ceil(1001 / 1000) = 2, and a 1-atom lot budgets its last atom.
+        assert_eq!(rate.budget(Atoms(1_001)), Atoms(2));
+        assert_eq!(rate.budget(Atoms(1)), Atoms(1));
+        assert_eq!(rate.budget(Atoms::ZERO), Atoms::ZERO);
+    }
+
+    #[test]
+    fn emission_rate_is_a_reduced_proper_fraction() {
+        assert!(EmissionRate::new(1, 1_000).is_ok());
+        assert!(EmissionRate::new(0, 7).is_err());
+        assert!(EmissionRate::new(7, 7).is_err());
+        assert!(EmissionRate::new(8, 7).is_err());
+        assert!(EmissionRate::new(2, 4).is_err());
+    }
+
+    #[test]
+    fn base_fee_is_irretrievable() {
+        let mut ledger = Ledger::genesis(LedgerParams::poc()).unwrap();
+        ledger.advance_to(VESTING_BLOCKS).unwrap();
+        let job = JobId(7);
+        ledger
+            .escrow_fund_and_queue(job, plau(100), plau(1))
+            .unwrap();
+        ledger.job_admit_and_lease(job, plau(10)).unwrap();
+        // The client cannot settle or reclaim the full deposit any more.
+        assert_eq!(
+            ledger
+                .result_settle(job, plau(100), Atoms::ZERO, Atoms::ZERO)
+                .unwrap_err(),
+            LedgerError::InsufficientEscrow {
+                job,
+                available: plau(90),
+                required: plau(100)
+            }
+        );
+        assert_eq!(
+            ledger.job_admit_and_lease(JobId(8), plau(1)).unwrap_err(),
+            LedgerError::UnknownJob(JobId(8))
+        );
+        assert_eq!(
+            ledger
+                .escrow_fund_and_queue(job, plau(1), plau(1))
+                .unwrap_err(),
+            LedgerError::JobAlreadyFunded(job)
+        );
+        assert_eq!(
+            ledger.advance_to(0).unwrap_err(),
+            LedgerError::HeightRegression {
+                current: VESTING_BLOCKS,
+                requested: 0
+            }
+        );
+        assert_supply(&ledger);
+    }
+}
+##### END FILE: ledger/src/lib.rs
+
+################################################################################
+##### BEGIN FILE: poc/src/main.rs | 485 lines | sha256 a1d6ea45bff876c17ee54ccd1df9f667219dcfd074fb8e99c92b3ee7636cafe2
+################################################################################
+//! Plauthium proof of concept: one mock block transition across all five modules.
+//!
+//! a) Genesis ledger: Emission Reserve and Founder Allocation.
+//! b) Fresh Work: expand a seed into two 512 x 512 INT8 tiles, compute the
+//!    exact INT32 product and certify it with six Freivalds rounds.
+//! c) Scheduler: sequential D'Hondt lease allocation over discrete ShareIDs.
+//! d) Ledger: lock a Base Fee, mature it into an independent fee lot and pay
+//!    Fresh Work rewards from it with segregated rounding dust.
+//! e) ASCII summary.
+//!
+//! Hashes, XOFs and signatures are placeholders (see the `primitives` crate).
+
+use std::error::Error;
+
+use ledger::{
+    BLOCKS_PER_DAY, FOUNDER_ALLOCATION, JobId, Ledger, LedgerParams, StateCategory,
+    VESTING_TRANCHES,
+};
+use primitives::{Atoms, DomainSeparatedHash, Mersenne61, TOTAL_SUPPLY};
+use scheduler::{Allocation, OwnerId, ShareID, dhondt_allocation};
+use scivm::{CONSENSUS_WEIGHT, OzakiIIProfile, RoundingMode};
+use work::{
+    ACCUMULATION_BOUND, CLASSICAL_MACS, DEFAULT_FREIVALDS_ROUNDS, FREIVALDS_FIELD_MULS,
+    FreshWorkContext, FreshWorkIds, TILE_DIM, verify_freivalds_rounds,
+};
+
+/// Height of the block this PoC seals.
+const BLOCK_HEIGHT: u64 = 1;
+/// Execution slots (ready tiles) offered to the scheduler in this batch.
+const LEASE_SLOTS: usize = 8;
+
+type PocResult<T> = Result<T, Box<dyn Error>>;
+
+fn main() -> PocResult<()> {
+    println!("Plauthium PoC - mock block transition");
+    println!("(hash/XOF/signatures are non-cryptographic placeholders)\n");
+
+    // ---------------------------------------------------------------- (a)
+    section("a", "Genesis ledger");
+    let mut ledger = Ledger::genesis(LedgerParams::poc())?;
+    print_categories(&ledger);
+    let vesting = *ledger.founder_vesting();
+    let first = vesting.tranche(1).ok_or("missing tranche 1")?;
+    let last = vesting
+        .tranche(VESTING_TRANCHES)
+        .ok_or("missing last tranche")?;
+    println!(
+        "  FounderAllocation: {} tranches inside U; tranche 1 = {} atoms @ h={}, tranche {} @ h={}",
+        VESTING_TRANCHES,
+        group(first.value.get()),
+        first.unlock_height,
+        last.day,
+        group(last.unlock_height),
+    );
+    println!(
+        "  EmissionReserve:   Genesis lot c_G with A = {} atoms\n",
+        group(ledger.fee_lots()[0].principal().get())
+    );
+
+    // ---------------------------------------------------------------- (b)
+    section(
+        "b",
+        "Fresh Work: seed -> 512x512 INT8 tiles -> INT32 product",
+    );
+    let context = mock_context(BLOCK_HEIGHT, 0);
+    let instance = context.instance();
+    println!(
+        "  seed = H512(FW/INPUT/v2, x)       {}..",
+        instance.seed.short_hex(16)
+    );
+    println!(
+        "  X, Y = Map(XOF(FW/A|FW/B, seed))  {TILE_DIM}x{TILE_DIM}, entries in [-127, 127], max|X| = {}",
+        instance.x.max_abs()
+    );
+    let product = instance.x.product(&instance.y);
+    println!(
+        "  Z = XY ({} MACs)         max|Z| = {} <= {}",
+        group(CLASSICAL_MACS),
+        group(product.max_abs() as u64),
+        group(ACCUMULATION_BOUND as u64)
+    );
+    let accepted =
+        verify_freivalds_rounds(&instance.x, &instance.y, &product, DEFAULT_FREIVALDS_ROUNDS);
+    let mut forged = product.clone();
+    let entry = forged.get(17, 42);
+    forged.set(17, 42, if entry > 0 { entry - 1 } else { entry + 1 })?;
+    let forged_rejected =
+        !verify_freivalds_rounds(&instance.x, &instance.y, &forged, DEFAULT_FREIVALDS_ROUNDS);
+    ensure(accepted, "Freivalds rejected the honest product")?;
+    ensure(forged_rejected, "Freivalds accepted a forged product")?;
+    println!(
+        "  Freivalds r_F = {DEFAULT_FREIVALDS_ROUNDS} over F_p (p = {}): honest ACCEPT, forged REJECT",
+        Mersenne61::P
+    );
+    let ids = FreshWorkIds::derive(&context, &product);
+    println!("  outputRoot {}..", ids.output_root.short_hex(16));
+    println!("  WorkID     {}..  (= ShareID)", ids.work_id.short_hex(16));
+    println!("  BlockID    {}..", ids.block_id.short_hex(16));
+    println!(
+        "  theta_S    {}..  theta_B {}..\n",
+        ids.share_ticket.short_hex(8),
+        ids.seal_ticket.short_hex(8)
+    );
+
+    // ---------------------------------------------------------------- (c)
+    section("c", "Scheduler: sequential D'Hondt over discrete ShareIDs");
+    let shares = mock_cohort(ids.work_id);
+    let allocation = dhondt_allocation(&shares, LEASE_SLOTS)?;
+    ensure(
+        allocation.assigned() == LEASE_SLOTS,
+        "D'Hondt left slots unassigned",
+    )?;
+    print_allocation(&shares, &allocation);
+
+    // ---------------------------------------------------------------- (d)
+    section("d", "Ledger: Base Fee lock -> maturation -> fee-lot payout");
+    let weights: Vec<u64> = shares.iter().map(|s| s.weight).collect();
+
+    // Epoch 0 rewards from the Genesis lot give miners spendable outputs in U.
+    let (_, genesis_epoch) = ledger.book_epoch(&weights)?;
+    ledger.fw_reward(genesis_epoch.booked)?;
+    step(
+        &ledger,
+        "FW_REWARD (epoch 0, Genesis lot)",
+        format!(
+            "{} paid, {} atoms dust",
+            genesis_epoch.booked,
+            genesis_epoch.dust.get()
+        ),
+    )?;
+
+    // The commercial job runs on the SciVM under a bound Ozaki-II profile.
+    let profile = OzakiIIProfile {
+        version: 1,
+        moduli: vec![255, 254, 253, 251, 247, 241, 239, 233],
+        inner_dim: TILE_DIM as u64,
+        bound_x: 1 << 23,
+        bound_y: 1 << 23,
+        rounding: RoundingMode::NearestTiesToEven,
+    };
+    profile.validate()?;
+    let (xs, ys) = mock_scientific_operands();
+    let dot = profile.exact_dot(&xs, &ys)?;
+    let direct: i128 = xs
+        .iter()
+        .zip(&ys)
+        .map(|(&a, &b)| a as i128 * b as i128)
+        .sum();
+    ensure(dot == direct, "Ozaki-II reconstruction mismatch")?;
+    println!(
+        "  SciVM Ozaki-II: {} moduli, Q ~ 2^{:.1} > 2*B_rec; exact dot = {} (consensus weight {CONSENSUS_WEIGHT})",
+        profile.moduli.len(),
+        (profile.reconstruction_modulus()? as f64).log2(),
+        dot
+    );
+
+    // Worked budget of eq. (7.17): D = F_base + v_exec + v_DA + v_ref = 100 PLAU.
+    let job = JobId(1);
+    let (deposit, queue_fee, base_fee) = (plau(100)?, plau(1)?, plau(10)?);
+    ledger.escrow_fund_and_queue(job, deposit, queue_fee)?;
+    step(
+        &ledger,
+        "ESCROW_FUND_AND_QUEUE",
+        format!("D = {deposit}, f_queue = {queue_fee}"),
+    )?;
+    ledger.job_admit_and_lease(job, base_fee)?;
+    step(
+        &ledger,
+        "JOB_ADMIT_AND_LEASE",
+        format!("Base Fee {base_fee} -> R_l (irretrievable)"),
+    )?;
+    ledger.result_settle(job, plau(80)?, plau(5)?, plau(5)?)?;
+    step(
+        &ledger,
+        "RESULT_SETTLE",
+        "v_exec 80 + v_DA 5 + v_ref 5 PLAU -> U".to_string(),
+    )?;
+
+    let maturity_epoch = ledger
+        .locked_fees()
+        .iter()
+        .map(|f| f.maturity_epoch)
+        .max()
+        .ok_or("no locked fees")?;
+    let maturity_height =
+        ledger.params().genesis_height + maturity_epoch * ledger.params().blocks_per_epoch;
+    ledger.advance_to(maturity_height)?;
+    let (_, matured) = ledger.reserve_mature()?;
+    step(
+        &ledger,
+        "RESERVE_MATURE",
+        format!(
+            "h={maturity_height} (epoch {maturity_epoch}): {} lots R_l -> R_a",
+            matured.len()
+        ),
+    )?;
+
+    let (_, epoch) = ledger.book_epoch(&weights)?;
+    ledger.fw_reward(epoch.booked)?;
+    step(
+        &ledger,
+        "FW_REWARD (epoch with fee lots)",
+        format!("{} paid from {} lots", epoch.booked, epoch.lots.len()),
+    )?;
+    for lot in epoch.lots.iter().filter(|l| matured.contains(&l.lot)) {
+        let source = ledger
+            .fee_lots()
+            .iter()
+            .find(|l| l.id() == lot.lot)
+            .map_or(Atoms::ZERO, |l| l.source_fee());
+        println!(
+            "    fee lot #{} (F_c = {source}): budget {} atoms = {} booked + {} dust (segregated)",
+            lot.lot.0,
+            group(lot.budget.get()),
+            group(lot.booked.get()),
+            lot.dust.get()
+        );
+    }
+    ledger.check_invariants()?;
+    println!();
+    print_categories(&ledger);
+
+    // ---------------------------------------------------------------- (e)
+    print_summary(&ledger, &ids, &allocation, matured.len(), epoch.dust)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mock inputs
+// ---------------------------------------------------------------------------
+
+fn tag(name: &str) -> DomainSeparatedHash {
+    DomainSeparatedHash::new("POC/MOCK/v2", &[name.as_bytes()])
+}
+
+fn mock_context(height: u64, attempt_nonce: u64) -> FreshWorkContext {
+    FreshWorkContext {
+        chain_id: 0x504c_4155, // "PLAU"
+        genesis_id: tag("genesis"),
+        protocol_version: 2,
+        crypto_suite_id: 1,
+        program_id: tag("fresh-work-program"),
+        air_id: tag("int8-tile-air"),
+        generator_version: 2,
+        parent_canonical_id: tag("block-0"),
+        stable_anchor_id: tag("anchor-0"),
+        height,
+        miner_policy_digest: tag("miner-policy"),
+        payout_policy_digest: tag("payout-policy"),
+        attempt_nonce,
+        body_core_root: tag("body-core-1"),
+        parent_derived_difficulty_context: tag("difficulty-0"),
+        time_bucket: height * ledger::BLOCK_INTERVAL_SECONDS,
+    }
+}
+
+/// The fresh share plus five mature shares from other miners. Owner 2 holds
+/// two ShareIDs: its slots are simply the sum over them.
+fn mock_cohort(fresh: DomainSeparatedHash) -> Vec<ShareID> {
+    let mut shares = vec![ShareID {
+        id: fresh,
+        weight: 1_000_003,
+        owner: OwnerId(1),
+    }];
+    for (i, (weight, owner)) in [
+        (2_400_017u64, 2u64),
+        (700_001, 2),
+        (1_600_009, 3),
+        (300_007, 4),
+        (999_983, 5),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shares.push(ShareID {
+            id: tag(&format!("mature-share-{i}")),
+            weight,
+            owner: OwnerId(owner),
+        });
+    }
+    shares
+}
+
+/// Deterministic scaled integer operands with |x|, |y| < 2^23.
+fn mock_scientific_operands() -> (Vec<f64>, Vec<f64>) {
+    let operands = |mul: u64| -> Vec<f64> {
+        (0..TILE_DIM as u64)
+            .map(|i| ((i.wrapping_mul(mul) >> 7) % (1 << 24)) as f64 - (1 << 23) as f64)
+            .collect()
+    };
+    (operands(2_654_435_761), operands(40_503))
+}
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+
+fn plau(n: u64) -> PocResult<Atoms> {
+    Atoms::from_plau(n).ok_or_else(|| "PLAU amount overflows".into())
+}
+
+fn ensure(condition: bool, message: &str) -> PocResult<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(message.into())
+    }
+}
+
+fn section(letter: &str, title: &str) {
+    println!("({letter}) {title}");
+}
+
+/// Reports one operation and re-checks the supply after it.
+fn step(ledger: &Ledger, op: &str, detail: String) -> PocResult<()> {
+    ensure(
+        ledger.total() == u128::from(TOTAL_SUPPLY.get()),
+        "supply changed",
+    )?;
+    println!("  {op:<32} {detail}");
+    Ok(())
+}
+
+fn group(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn print_categories(ledger: &Ledger) {
+    let rule = "  +-----------------+-----------+---------------------------+";
+    println!("{rule}");
+    println!(
+        "  | {:<15} | {:<9} | {:>25} |",
+        "Category", "Symbol", "Balance (atoms)"
+    );
+    println!("{rule}");
+    for category in StateCategory::ALL {
+        println!(
+            "  | {:<15} | {:<9} | {:>25} |",
+            format!("{category:?}"),
+            category.symbol(),
+            group(ledger.balance(category).get())
+        );
+    }
+    println!("{rule}");
+    let total = ledger.total() as u64;
+    let verdict = if u128::from(total) == u128::from(TOTAL_SUPPLY.get()) {
+        "== M"
+    } else {
+        "!= M"
+    };
+    println!(
+        "  | {:<15} | {:<9} | {:>25} |",
+        "SUM",
+        verdict,
+        group(total)
+    );
+    println!("{rule}\n");
+}
+
+fn print_allocation(shares: &[ShareID], allocation: &Allocation) {
+    let rule = "  +----+--------------------+-------+-----------+-------+";
+    println!("{rule}");
+    println!("  | #  | ShareID            | Owner | Weight    | Slots |");
+    println!("{rule}");
+    for (i, (share, slots)) in shares.iter().zip(&allocation.per_share).enumerate() {
+        println!(
+            "  | {i:<2} | {}.. | {:<5} | {:>9} | {slots:>5} |",
+            share.id.short_hex(8),
+            share.owner.0,
+            group(share.weight)
+        );
+    }
+    println!("{rule}");
+    let order: Vec<String> = allocation.slots.iter().map(|s| s.to_string()).collect();
+    println!("  lease order (slot -> share #): {}\n", order.join(" "));
+}
+
+fn print_summary(
+    ledger: &Ledger,
+    ids: &FreshWorkIds,
+    allocation: &Allocation,
+    matured_lots: usize,
+    epoch_dust: Atoms,
+) -> PocResult<()> {
+    const WIDTH: usize = 72;
+    let border = format!("+{}+", "=".repeat(WIDTH));
+    let rule = format!("+{}+", "-".repeat(WIDTH));
+    let line = |key: &str, value: String| println!("| {key:<20}: {value:<w$}|", w = WIDTH - 23);
+    let distinct = allocation.per_share.iter().filter(|&&a| a > 0).count();
+    let vested = ledger
+        .founder_vesting()
+        .completed_intervals(ledger.height());
+
+    println!("{border}");
+    println!("|{:^WIDTH$}|", "PLAUTHIUM BLOCK EXECUTED SUCCESSFULLY");
+    println!("{border}");
+    line(
+        "Block height",
+        format!("{BLOCK_HEIGHT} (state advanced to h={})", ledger.height()),
+    );
+    line("BlockID", format!("{}..", ids.block_id.short_hex(16)));
+    line(
+        "WorkID = ShareID",
+        format!("{}..", ids.work_id.short_hex(16)),
+    );
+    line(
+        "Work unit",
+        format!(
+            "{TILE_DIM}x{TILE_DIM} INT8 -> INT32, |Z| <= {}",
+            group(ACCUMULATION_BOUND as u64)
+        ),
+    );
+    line(
+        "Freivalds",
+        format!(
+            "ACCEPT, r_F = {DEFAULT_FREIVALDS_ROUNDS}, {} F_p mults (9/256)",
+            group(FREIVALDS_FIELD_MULS)
+        ),
+    );
+    line(
+        "D'Hondt leases",
+        format!(
+            "{}/{LEASE_SLOTS} slots -> {distinct} discrete ShareIDs",
+            allocation.assigned()
+        ),
+    );
+    line(
+        "Fee lots matured",
+        format!("{matured_lots} (queue fee + Base Fee), R_l -> R_a"),
+    );
+    line(
+        "Dust this epoch",
+        format!(
+            "{} atoms (total segregated {})",
+            epoch_dust.get(),
+            ledger.segregated_dust().get()
+        ),
+    );
+    line(
+        "Founder vesting",
+        format!(
+            "{vested}/{VESTING_TRANCHES} tranches unlocked ({} days x {BLOCKS_PER_DAY} blocks)",
+            vested
+        ),
+    );
+    line(
+        "Founder locked",
+        format!(
+            "{} of {} atoms",
+            group(ledger.founder_vesting().locked_at(ledger.height()).get()),
+            group(FOUNDER_ALLOCATION.get())
+        ),
+    );
+    println!("{rule}");
+    for category in StateCategory::ALL {
+        line(
+            category.symbol(),
+            format!(
+                "{:<16}{:>25}",
+                format!("{category:?}"),
+                group(ledger.balance(category).get())
+            ),
+        );
+    }
+    println!("{rule}");
+    let total = ledger.total();
+    ensure(
+        total == u128::from(TOTAL_SUPPLY.get()),
+        "supply invariant violated",
+    )?;
+    line(
+        "SUM (== M)",
+        format!("{:<16}{:>25}  OK", "", group(total as u64)),
+    );
+    println!("{border}");
+    Ok(())
+}
+##### END FILE: poc/src/main.rs
+
