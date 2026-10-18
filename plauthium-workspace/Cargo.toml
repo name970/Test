@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["primitives", "work", "scivm", "scheduler", "ledger", "poc"]
+
+# Consensus code: no `unsafe`, and every public item documented.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

@@ -1,0 +1,15 @@
+[package]
+name = "poc"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium proof-of-concept: one mock block transition across all five protocol modules"
+
+[dependencies]
+primitives = { path = "../primitives" }
+work = { path = "../work" }
+scivm = { path = "../scivm" }
+scheduler = { path = "../scheduler" }
+ledger = { path = "../ledger" }
+
+[lints]
+workspace = true
