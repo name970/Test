@@ -3,8 +3,8 @@ PLAUTHIUM CORE DUMP
 format:    plauthium-core-dump/1
 workspace: plauthium-workspace
 crates:    primitives work scivm scheduler ledger poc
-generated: 2026-10-18T08:35:36Z by scripts/make_core_dump.sh, from the 5 files uploaded to the session
-files:     5 present, 10 missing
+generated: 2026-10-18T15:55:45Z by scripts/make_core_dump.sh
+files:     15 present, 0 missing
 
 Each file appears between the markers
   ##### BEGIN FILE: <path> | <n> lines | sha256 <hex>
@@ -13,151 +13,495 @@ Content between the markers is verbatim. Paths are relative to the workspace roo
 ################################################################################
 
 MANIFEST
-  MISSING  Cargo.toml
-  PRESENT  Cargo.lock                            47 lines  sha256 15c934277a300553476218877617fa6f59c42cd4bb97821a449b121596d72caf
+  PRESENT  Cargo.toml                            56 lines  sha256 e4b8f2c12394912b2d896e32009936bc25203215f2fdad2e85690392fa601e30
+  PRESENT  Cargo.lock                           934 lines  sha256 e12398dd14eb424b62db36647b63881e534cbc9f6f47a265b09762e709feaa32
   PRESENT  .gitignore                             1 lines  sha256 44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb
-  MISSING  primitives/Cargo.toml
-  MISSING  primitives/src/lib.rs (or src/main.rs)
-  MISSING  work/Cargo.toml
-  MISSING  work/src/lib.rs (or src/main.rs)
-  MISSING  scivm/Cargo.toml
-  MISSING  scivm/src/lib.rs (or src/main.rs)
+  PRESENT  primitives/Cargo.toml                 10 lines  sha256 075b16b683f65d514d0006b23cdb58e5f689c59cd8dccf27526ceead2139ffc0
+  PRESENT  primitives/src/lib.rs                663 lines  sha256 a83f540adffd44e7fa3960fd6da6397c0767a5f3d9d5e7a43a53e54233537380
+  PRESENT  work/Cargo.toml                       11 lines  sha256 f2ac56bd414d80276268bf1363a2c9fb4f62927a9af99dfaed3c4dd0a942f4c5
+  PRESENT  work/src/lib.rs                      645 lines  sha256 ddcd22727b45ce82f8553ef0148fd6e640927c41bc3a45b6f22da0cb3d75560f
+  PRESENT  scivm/Cargo.toml                      12 lines  sha256 4030df8be42c977ed05a3d176d08b5fff501040326db7b28bf2ee989eff505bf
+  PRESENT  scivm/src/lib.rs                     499 lines  sha256 3355af1b946eff294bb03a1b38e8d76b995005865f96bd8f93dbb5361111b518
   PRESENT  scheduler/Cargo.toml                  11 lines  sha256 9bc020dcc84a1dd5180b5af65f6c756638c3a39ff50e4ed29176fb98d2e9d974
-  MISSING  scheduler/src/lib.rs (or src/main.rs)
-  MISSING  ledger/Cargo.toml
+  PRESENT  scheduler/src/lib.rs                 335 lines  sha256 88c69749b2c6f1f2a67964f3990c6c8c980cafce01e9cd236504c3648180ecec
+  PRESENT  ledger/Cargo.toml                     11 lines  sha256 9ceb5af43ddb447cd5961932125163e4eea86a731fbddd96d4dba9eaa8e59169
   PRESENT  ledger/src/lib.rs                   1193 lines  sha256 fb6c260bdbe36066b7515b05752651760f0360ea0a6eea296b2a677d9eb744bc
-  MISSING  poc/Cargo.toml
+  PRESENT  poc/Cargo.toml                        15 lines  sha256 3ca9fae7abbf0b49160c37901ae153b6d0b7410e00cfcc540dbc70694112ec53
   PRESENT  poc/src/main.rs                      485 lines  sha256 a1d6ea45bff876c17ee54ccd1df9f667219dcfd074fb8e99c92b3ee7636cafe2
 
 ################################################################################
-SESSION NOTE - READ FIRST (this block is not source code)
+##### BEGIN FILE: Cargo.toml | 56 lines | sha256 e4b8f2c12394912b2d896e32009936bc25203215f2fdad2e85690392fa601e30
 ################################################################################
-This dump was built from the 5 files uploaded to the Claude Code session of
-2026-10-18. The other 10 expected files (see MANIFEST) were not uploaded, so
-THIS DUMP IS PARTIAL:
+[workspace]
+resolver = "3"
+members = [
+    "primitives",
+    "work",
+    "scivm",
+    "scheduler",
+    "ledger",
+    "poc",
+    "wire",
+    "chain",
+    "node",
+]
 
-  workspace root ... Cargo.lock + .gitignore present; Cargo.toml missing
-  primitives ....... no files (Cargo.toml and src/lib.rs missing)
-  work ............. no files (Cargo.toml and src/lib.rs missing)
-  scivm ............ no files (Cargo.toml and src/lib.rs missing)
-  scheduler ........ Cargo.toml present; src/lib.rs missing
-  ledger ........... src/lib.rs present; Cargo.toml missing
-  poc .............. src/main.rs present; Cargo.toml missing
+# Consensus code: no `unsafe`, and every public item documented.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
 
-To produce the complete dump, run this from the repository root against the
-real workspace:
+[workspace.dependencies]
+primitives = { path = "primitives" }
+work = { path = "work" }
+scivm = { path = "scivm" }
+scheduler = { path = "scheduler" }
+ledger = { path = "ledger" }
+wire = { path = "wire" }
+chain = { path = "chain" }
 
-  scripts/make_core_dump.sh /path/to/plauthium-workspace plauthium_core_dump.txt
+serde = { version = "1.0.228", features = ["derive"] }
+# 3.0.0 is a compile_error! tombstone (RUSTSEC-2025-0141); 1.3.3 is declared complete.
+bincode = "=1.3.3"
+serde_json = "1"
+tokio = { version = "1.53", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+    "signal",
+    "fs",
+] }
+tokio-util = { version = "0.7.20", features = ["codec"] }
+futures = "0.3.34"
+bytes = "1"
+axum = "0.8.9"
+clap = { version = "4.6", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-The regenerated file uses the same format and drops this note and the
-appendix below. Give Argon the COMPLETE dump. The appendix exists only so the
-blueprint (testnet_blueprint.md, section 13) can be checked against the API
-the PoC really calls.
-
-How the uploaded files were identified:
-  ledger/src/lib.rs     header "Module 5 - hybrid state, supply invariant and
-                        tokenomics"; defines every item poc imports from
-                        `ledger`; uses only `primitives`, as Cargo.lock says.
-  poc/src/main.rs       imports ledger, primitives, scheduler, scivm and work,
-                        matching the poc entry of Cargo.lock.
-  scheduler/Cargo.toml  name = "scheduler".
-Crate directories are siblings of each other
-(scheduler/Cargo.toml: primitives = { path = "../primitives" }).
-
-################################################################################
-APPENDIX - PUBLIC API SEEN AT CALL SITES (reconstructed, NOT source)
-################################################################################
-Each item below is used by ledger/src/lib.rs (L:<line>) or poc/src/main.rs
-(P:<line>). Both files compile against the real crates, so each item exists
-with at least the shape shown. "?" marks details the call sites leave open.
-
-Workspace
-  - Cargo.lock version 4, zero third-party dependencies (std only).
-  - edition 2024 and `[lints] workspace = true` (scheduler/Cargo.toml), so the
-    root Cargo.toml defines [workspace.lints].
-  - MSRV >= 1.87, because poc uses u64::is_multiple_of (P:328).
-
-primitives
-  pub struct Atoms(pub u64)                              L:29, L:41 (`.0` in const)
-      derives at least Copy, Clone, Debug, PartialEq, Eq, PartialOrd (L:856);
-      implements Display (P:127, P:164)
-      const ZERO: Atoms                                  L:347
-      fn get(&self) -> u64                               L:119
-      fn checked_add(self, Atoms) -> Option<Atoms>       L:733 (try_fold)
-      fn from_plau(u64) -> Option<Atoms>                 L:939, P:299
-          (1 PLAU = 10^8 atoms per whitepaper eq. 7.18; confirm in source)
-  pub type ShareWeight = u64                             L:1007 ([3, 5, 7]); P:117 + P:120 (Vec<u64>)
-  pub const TOTAL_SUPPLY: Atoms  (= 1_500_000_000_000_000)   L:41-42, L:947
-  pub struct DomainSeparatedHash                         non-cryptographic placeholder (P:11)
-      Copy (P:107 moves ids.work_id, then P:224/P:412 reuse ids)
-      fn new(label: &str, parts: &[&[u8]]) -> Self       P:233
-      fn short_hex(&self, n: integer) -> impl Display    P:69, P:96-102, P:376
-      ? byte accessors, digest length and Ord are not visible at call sites
-  pub struct Mersenne61 with const P (Display; p = 2^61 - 1)   P:93
-
-work
-  const TILE_DIM               (512; integer, cast `as u64`)          P:136, P:287
-  const CLASSICAL_MACS: u64    (= 512^3 = 134_217_728)                P:78
-  const ACCUMULATION_BOUND     (numeric, cast `as u64`; = 512 * 127^2 = 8_258_048)  P:80
-  const DEFAULT_FREIVALDS_ROUNDS (= 6)                                P:83
-  const FREIVALDS_FIELD_MULS: u64 (= 3 * 6 * 512^2 = 4_718_592)       P:425
-  pub struct FreshWorkContext { 16 pub fields }                       P:237-254
-      chain_id: integer ?            (literal 0x504c_4155, "PLAU")
-      genesis_id: DomainSeparatedHash
-      protocol_version: integer ?    (2)
-      crypto_suite_id: integer ?     (1)
-      program_id: DomainSeparatedHash
-      air_id: DomainSeparatedHash
-      generator_version: integer ?   (2)
-      parent_canonical_id: DomainSeparatedHash
-      stable_anchor_id: DomainSeparatedHash
-      height: u64
-      miner_policy_digest: DomainSeparatedHash
-      payout_policy_digest: DomainSeparatedHash
-      attempt_nonce: u64
-      body_core_root: DomainSeparatedHash
-      parent_derived_difficulty_context: DomainSeparatedHash
-      time_bucket: u64
-      fn instance(&self) -> _ { seed: DomainSeparatedHash, x, y }     P:66-73
-  INT8 tile matrix (type of instance.x and instance.y)
-      fn max_abs(&self) -> impl Display                               P:73
-      fn product(&self, &Self) -> <INT32 product>                     P:75
-  INT32 product matrix
-      Clone; fn max_abs(&self) (numeric, cast `as u64`)               P:79, P:84
-      fn get(&self, row, col) -> signed integer                       P:85
-      fn set(&mut self, row, col, value) -> Result<_, E: Error>       P:86
-  fn verify_freivalds_rounds(&x, &y, &product, rounds) -> bool        P:82-88
-  pub struct FreshWorkIds { output_root, work_id, block_id,
-                            share_ticket, seal_ticket: DomainSeparatedHash }
-      fn derive(&FreshWorkContext, &product) -> FreshWorkIds          P:95-102
-
-scivm
-  const CONSENSUS_WEIGHT (Display; 0 per whitepaper Table 1)          P:151
-  pub struct OzakiIIProfile { version, moduli: Vec<_>, inner_dim: u64,
-                              bound_x, bound_y, rounding: RoundingMode }   P:133-140
-      fn validate(&self) -> Result<(), E: Error>                      P:141
-      fn exact_dot(&self, &[f64], &[f64]) -> Result<i128, E: Error>   P:143-149
-      fn reconstruction_modulus(&self) -> Result<N, E: Error>, N numeric (cast `as f64`)  P:153
-  pub enum RoundingMode { NearestTiesToEven, ? }                      P:139
-
-scheduler
-  pub struct OwnerId(pub u64)                                         P:263, P:377
-  pub struct ShareID { id: DomainSeparatedHash, weight: u64, owner: OwnerId }   P:260-264, P:117
-  pub fn dhondt_allocation(&[ShareID], slots: usize) -> Result<Allocation, E: Error>   P:108
-  pub struct Allocation
-      per_share: Vec<integer>   slots held by each input share, input order   P:373, P:397
-      slots: Vec<integer>       slot index -> input share index (Display)     P:382
-      fn assigned(&self) -> usize                                     P:110
-
-ledger
-  Full source follows below.
+# One 512^3 tile at opt-level 0 is roughly 30x slower; tests mine and verify real tiles.
+[profile.dev.package.work]
+opt-level = 3
+[profile.dev.package.primitives]
+opt-level = 3
+[profile.dev.package.scivm]
+opt-level = 3
+##### END FILE: Cargo.toml
 
 ################################################################################
-##### BEGIN FILE: Cargo.lock | 47 lines | sha256 15c934277a300553476218877617fa6f59c42cd4bb97821a449b121596d72caf
+##### BEGIN FILE: Cargo.lock | 934 lines | sha256 e12398dd14eb424b62db36647b63881e534cbc9f6f47a265b09762e709feaa32
 ################################################################################
 # This file is automatically @generated by Cargo.
 # It is not intended for manual editing.
 version = 4
+
+[[package]]
+name = "aho-corasick"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "anstream"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
+dependencies = [
+ "anstyle",
+ "anstyle-parse",
+ "anstyle-query",
+ "anstyle-wincon",
+ "colorchoice",
+ "is_terminal_polyfill",
+ "utf8parse",
+]
+
+[[package]]
+name = "anstyle"
+version = "1.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
+
+[[package]]
+name = "anstyle-parse"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e"
+dependencies = [
+ "utf8parse",
+]
+
+[[package]]
+name = "anstyle-query"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
+name = "anstyle-wincon"
+version = "3.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
+dependencies = [
+ "anstyle",
+ "once_cell_polyfill",
+ "windows-sys",
+]
+
+[[package]]
+name = "atomic-waker"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
+name = "axum"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
+dependencies = [
+ "axum-core",
+ "bytes",
+ "form_urlencoded",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "itoa",
+ "matchit",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "bytes"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "cfg-if"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
+name = "chain"
+version = "0.1.0"
+dependencies = [
+ "ledger",
+ "primitives",
+ "scheduler",
+ "scivm",
+ "wire",
+ "work",
+]
+
+[[package]]
+name = "clap"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946"
+dependencies = [
+ "clap_builder",
+ "clap_derive",
+]
+
+[[package]]
+name = "clap_builder"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "clap_lex",
+ "strsim",
+]
+
+[[package]]
+name = "clap_derive"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "clap_lex"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
+
+[[package]]
+name = "colorchoice"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
+
+[[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
+name = "form_urlencoded"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+dependencies = [
+ "percent-encoding",
+]
+
+[[package]]
+name = "futures"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
+name = "futures-channel"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+]
+
+[[package]]
+name = "futures-core"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "031b47cf1a3c6cc8bc2fc76cd437f521619387907d469316e7c0bc278f1f5432"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
+name = "futures-io"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
+
+[[package]]
+name = "futures-macro"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "futures-sink"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
+
+[[package]]
+name = "futures-task"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
+
+[[package]]
+name = "futures-util"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-macro",
+ "futures-sink",
+ "futures-task",
+ "memchr",
+ "pin-project-lite",
+ "slab",
+]
+
+[[package]]
+name = "heck"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "http"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
+dependencies = [
+ "bytes",
+ "itoa",
+]
+
+[[package]]
+name = "http-body"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c"
+dependencies = [
+ "bytes",
+ "http",
+]
+
+[[package]]
+name = "http-body-util"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "hyper"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "httparse",
+ "httpdate",
+ "itoa",
+ "pin-project-lite",
+ "smallvec",
+ "tokio",
+]
+
+[[package]]
+name = "hyper-util"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "hyper",
+ "pin-project-lite",
+ "tokio",
+ "tower-service",
+]
+
+[[package]]
+name = "is_terminal_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itoa"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "lazy_static"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "ledger"
@@ -165,6 +509,111 @@ version = "0.1.0"
 dependencies = [
  "primitives",
 ]
+
+[[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "log"
+version = "0.4.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "mime"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mio"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
+dependencies = [
+ "libc",
+ "wasi",
+ "windows-sys",
+]
+
+[[package]]
+name = "node"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "chain",
+ "clap",
+ "futures",
+ "ledger",
+ "primitives",
+ "scivm",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "wire",
+ "work",
+]
+
+[[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
+name = "once_cell"
+version = "1.21.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "once_cell_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "percent-encoding"
+version = "2.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "pin-project-lite"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "poc"
@@ -182,6 +631,47 @@ name = "primitives"
 version = "0.1.0"
 
 [[package]]
+name = "proc-macro2"
+version = "1.0.107"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
+dependencies = [
+ "unicode-ident",
+]
+
+[[package]]
+name = "quote"
+version = "1.0.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
+dependencies = [
+ "proc-macro2",
+]
+
+[[package]]
+name = "regex-automata"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-syntax",
+]
+
+[[package]]
+name = "regex-syntax"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "scheduler"
 version = "0.1.0"
 dependencies = [
@@ -197,11 +687,346 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+dependencies = [
+ "serde_core",
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_core"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
+dependencies = [
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_derive"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
+ "itoa",
+ "ryu",
+ "serde",
+]
+
+[[package]]
+name = "sharded-slab"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
+name = "slab"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "smallvec"
+version = "1.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
+
+[[package]]
+name = "socket2"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
+name = "strsim"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "syn"
+version = "2.0.119"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "sync_wrapper"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
+
+[[package]]
+name = "thread_local"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
+name = "tokio"
+version = "1.53.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
+dependencies = [
+ "bytes",
+ "libc",
+ "mio",
+ "pin-project-lite",
+ "signal-hook-registry",
+ "socket2",
+ "tokio-macros",
+ "windows-sys",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "libc",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "tower"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
+dependencies = [
+ "futures-core",
+ "futures-util",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tokio",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "tower-layer"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
+
+[[package]]
+name = "tower-service"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
+
+[[package]]
+name = "tracing"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
+dependencies = [
+ "log",
+ "pin-project-lite",
+ "tracing-attributes",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "tracing-core"
+version = "0.1.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
+dependencies = [
+ "once_cell",
+ "valuable",
+]
+
+[[package]]
+name = "tracing-log"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
+dependencies = [
+ "log",
+ "once_cell",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-subscriber"
+version = "0.3.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
+dependencies = [
+ "matchers",
+ "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
+ "sharded-slab",
+ "smallvec",
+ "thread_local",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+]
+
+[[package]]
+name = "unicode-ident"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "utf8parse"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "valuable"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+
+[[package]]
+name = "windows-link"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
+]
+
+[[package]]
+name = "wire"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "work"
 version = "0.1.0"
 dependencies = [
  "primitives",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 ##### END FILE: Cargo.lock
 
 ################################################################################
@@ -209,6 +1034,1876 @@ dependencies = [
 ################################################################################
 /target
 ##### END FILE: .gitignore
+
+################################################################################
+##### BEGIN FILE: primitives/Cargo.toml | 10 lines | sha256 075b16b683f65d514d0006b23cdb58e5f689c59cd8dccf27526ceead2139ffc0
+################################################################################
+[package]
+name = "primitives"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium shared primitives: atoms, supply, Mersenne-61 field, domain-separated hashing, block resources"
+
+[dependencies]
+
+[lints]
+workspace = true
+##### END FILE: primitives/Cargo.toml
+
+################################################################################
+##### BEGIN FILE: primitives/src/lib.rs | 663 lines | sha256 a83f540adffd44e7fa3960fd6da6397c0767a5f3d9d5e7a43a53e54233537380
+################################################################################
+//! Shared Plauthium primitives.
+//!
+//! Every consensus quantity is an integer (spec §1.4): amounts are [`Atoms`],
+//! field arithmetic is over [`Mersenne61`], and every committed object is a
+//! 512-bit [`DomainSeparatedHash`] of a typed, length-prefixed encoding.
+//!
+//! **PoC status:** [`DomainSeparatedHash`] and [`MockXof`] are deterministic,
+//! *non-cryptographic* placeholders for SHA3-512 and SHAKE256. They keep the
+//! normative interface (label, injective encoding, 64-byte digests) so that the
+//! real primitives can be swapped in without touching callers.
+
+use core::fmt;
+use core::ops::{Add, AddAssign, Mul, Neg, Sub};
+
+// ---------------------------------------------------------------------------
+// Amounts and supply (spec §7.6, eq. 7.18)
+// ---------------------------------------------------------------------------
+
+/// Number of atoms in one PLAU (`1 TKN = 10^8 atoms`).
+pub const ATOMS_PER_PLAU: u64 = 100_000_000;
+
+/// Fixed supply in whole PLAU.
+pub const TOTAL_SUPPLY_PLAU: u64 = 15_000_000;
+
+/// Fixed supply `M = 1.5 * 10^15` atoms. It never changes in any reachable state.
+pub const TOTAL_SUPPLY: Atoms = Atoms(1_500_000_000_000_000);
+
+// `M = 15,000,000 PLAU` and `M < 2^51 < p`; evaluated at compile time, so an
+// overflow or a violated bound fails the build.
+const _: () = assert!(TOTAL_SUPPLY_PLAU * ATOMS_PER_PLAU == TOTAL_SUPPLY.0);
+const _: () = assert!(TOTAL_SUPPLY.0 < (1u64 << 51));
+const _: () = assert!((1u64 << 51) < Mersenne61::P);
+
+/// An integer amount of the single native asset, in atoms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Atoms(pub u64);
+
+impl Atoms {
+    /// Zero atoms.
+    pub const ZERO: Atoms = Atoms(0);
+
+    /// Converts whole PLAU to atoms, or `None` on overflow.
+    pub const fn from_plau(plau: u64) -> Option<Atoms> {
+        match plau.checked_mul(ATOMS_PER_PLAU) {
+            Some(atoms) => Some(Atoms(atoms)),
+            None => None,
+        }
+    }
+
+    /// The raw atom count.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Checked addition.
+    pub const fn checked_add(self, rhs: Atoms) -> Option<Atoms> {
+        match self.0.checked_add(rhs.0) {
+            Some(v) => Some(Atoms(v)),
+            None => None,
+        }
+    }
+
+    /// Checked subtraction.
+    pub const fn checked_sub(self, rhs: Atoms) -> Option<Atoms> {
+        match self.0.checked_sub(rhs.0) {
+            Some(v) => Some(Atoms(v)),
+            None => None,
+        }
+    }
+}
+
+impl fmt::Display for Atoms {
+    /// Formats as PLAU with all eight decimal places, e.g. `10.00000000 PLAU`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}.{:08} PLAU",
+            self.0 / ATOMS_PER_PLAU,
+            self.0 % ATOMS_PER_PLAU
+        )
+    }
+}
+
+/// Integer Fresh Work share weight `w_s` (spec §6.1).
+///
+/// **PoC width:** normatively `w_s = floor(2^640 / Θ_S(s))`, an integer of up
+/// to 640 bits. The PoC narrows it to `u64` so that every product with a slot
+/// counter (D'Hondt) or an atom budget (fee-lot payouts) is exact in `u128`.
+pub type ShareWeight = u64;
+
+// ---------------------------------------------------------------------------
+// Base field F_p, p = 2^61 - 1 (spec §3.1, Table 1)
+// ---------------------------------------------------------------------------
+
+/// An element of the base field `F_p`, `p = 2^61 - 1`, kept canonical in `[0, p)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Mersenne61(u64);
+
+impl Mersenne61 {
+    /// The Mersenne prime `p = 2^61 - 1 = 2,305,843,009,213,693,951`.
+    pub const P: u64 = (1u64 << 61) - 1;
+    /// Additive identity.
+    pub const ZERO: Mersenne61 = Mersenne61(0);
+    /// Multiplicative identity.
+    pub const ONE: Mersenne61 = Mersenne61(1);
+
+    /// Reduces any `u64` into the field.
+    pub const fn new(value: u64) -> Self {
+        Mersenne61(Self::reduce_u128(value as u128))
+    }
+
+    /// Centered lift of a signed integer: negative values map to `p - |v| mod p`.
+    pub const fn from_i64(value: i64) -> Self {
+        let magnitude = Self::new(value.unsigned_abs());
+        if value < 0 {
+            magnitude.neg_const()
+        } else {
+            magnitude
+        }
+    }
+
+    /// The canonical representative in `[0, p)`.
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+
+    /// Reduces any `u128` modulo `p` using `2^61 = 1 (mod p)`.
+    pub const fn reduce_u128(x: u128) -> u64 {
+        let p = Self::P as u128;
+        // x < 2^128  =>  folded < 2^61 + 2^67  =>  refolded < 2^61 + 2^7 < 2p.
+        let folded = (x & p) + (x >> 61);
+        let refolded = ((folded & p) + (folded >> 61)) as u64;
+        if refolded >= Self::P {
+            refolded - Self::P
+        } else {
+            refolded
+        }
+    }
+
+    const fn neg_const(self) -> Self {
+        if self.0 == 0 {
+            self
+        } else {
+            Mersenne61(Self::P - self.0)
+        }
+    }
+}
+
+impl Add for Mersenne61 {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        // Both operands < 2^61, so the sum < 2^62 cannot overflow.
+        Mersenne61::new(self.0 + rhs.0)
+    }
+}
+
+impl AddAssign for Mersenne61 {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
+}
+
+impl Sub for Mersenne61 {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        self + (-rhs)
+    }
+}
+
+impl Neg for Mersenne61 {
+    type Output = Self;
+    fn neg(self) -> Self {
+        self.neg_const()
+    }
+}
+
+impl Mul for Mersenne61 {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self {
+        Mersenne61(Self::reduce_u128(self.0 as u128 * rhs.0 as u128))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Domain-separated hashing (spec §1.4, eq. 1.3) — PLACEHOLDER for SHA3-512
+// ---------------------------------------------------------------------------
+
+/// Digest length of SHA3-512 in bytes.
+pub const DIGEST_LEN: usize = 64;
+
+/// Versioned domain labels fixed by the specification.
+pub mod labels {
+    /// Fresh Work seed, eq. (5.2).
+    pub const FW_INPUT: &str = "FW/INPUT/v2";
+    /// Expansion domain of the left operand `X`, eq. (5.3).
+    pub const FW_A: &str = "FW/A";
+    /// Expansion domain of the right operand `Y`, eq. (5.3).
+    pub const FW_B: &str = "FW/B";
+    /// Commitment to the canonical product `XY`, eq. (5.4).
+    pub const FW_OUTPUT: &str = "FW/OUTPUT/v2";
+    /// Work identifier, which is also the ShareID, eq. (5.4).
+    pub const FW_ID: &str = "FW/ID/v2";
+    /// Identifier of the block an attempt would seal, eq. (5.4).
+    pub const BLOCK: &str = "BLOCK/v2";
+    /// Share lottery value, eq. (5.5).
+    pub const FW_SHARE: &str = "FW/SHARE/v2";
+    /// Seal lottery value, eq. (5.5).
+    pub const FW_SEAL: &str = "FW/SEAL/v2";
+    /// Transaction effect identifier, eq. (7.5).
+    pub const TX_EFFECTS: &str = "TX/EFFECTS/v2";
+    /// Signature context string, eqs. (2.3)–(2.5).
+    pub const PLAU_TX: &str = "PLAU/TX/v2";
+    /// Freivalds challenge domain. The spec requires one domain per round
+    /// (§3.2) but does not name it; this label is assigned by the PoC.
+    pub const FW_FREIVALDS: &str = "FW/FREIVALDS/v2";
+}
+
+/// A 512-bit digest `H_512(Enc(LABEL/v2, f_1, ..., f_k))`.
+///
+/// Ordering is lexicographic over the 64 bytes, which equals the numeric order
+/// of the digest read as a big-endian integer (spec §1.4) and the canonical
+/// 64-byte-string order used for ShareID tie-breaks (spec §6.3).
+///
+/// **PLACEHOLDER:** the compression function is a non-cryptographic mixer.
+/// Replace with SHA3-512 (FIPS 202) before any security claim is made.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DomainSeparatedHash([u8; DIGEST_LEN]);
+
+impl DomainSeparatedHash {
+    /// Hashes `fields` under `label` with the injective encoding of [`DomainHasher`].
+    pub fn new(label: &str, fields: &[&[u8]]) -> Self {
+        let mut hasher = DomainHasher::new(label);
+        for field in fields {
+            hasher.field(field);
+        }
+        hasher.finalize()
+    }
+
+    /// Wraps raw digest bytes.
+    pub const fn from_bytes(bytes: [u8; DIGEST_LEN]) -> Self {
+        DomainSeparatedHash(bytes)
+    }
+
+    /// The digest bytes, big-endian.
+    pub const fn as_bytes(&self) -> &[u8; DIGEST_LEN] {
+        &self.0
+    }
+
+    /// The digest bytes by value; inverse of [`DomainSeparatedHash::from_bytes`].
+    pub const fn to_bytes(&self) -> [u8; DIGEST_LEN] {
+        self.0
+    }
+
+    /// Full lowercase hex encoding (128 characters).
+    pub fn to_hex(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// First `bytes` bytes as hex, for logs and summaries.
+    pub fn short_hex(&self, bytes: usize) -> String {
+        self.0[..bytes.min(DIGEST_LEN)]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
+impl fmt::Debug for DomainSeparatedHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "H512({}..)", self.short_hex(8))
+    }
+}
+
+/// Incremental builder for `H_512(Enc(label, f_1, ..., f_k))`.
+///
+/// `Enc` is injective: the label and every field are prefixed by their byte
+/// length as a big-endian `u64`, and the field count is bound at finalization.
+/// Field order is fixed by each call site, as the spec requires.
+#[derive(Clone)]
+pub struct DomainHasher {
+    sponge: MockSponge,
+    fields: u64,
+}
+
+impl DomainHasher {
+    /// Starts a hash under a versioned domain label.
+    pub fn new(label: &str) -> Self {
+        let mut sponge = MockSponge::new();
+        sponge.absorb(&(label.len() as u64).to_be_bytes());
+        sponge.absorb(label.as_bytes());
+        DomainHasher { sponge, fields: 0 }
+    }
+
+    /// Appends one length-prefixed byte field.
+    pub fn field(&mut self, bytes: &[u8]) -> &mut Self {
+        self.begin_field(bytes.len());
+        self.sponge.absorb(bytes);
+        self
+    }
+
+    /// Appends a `u64` field (8 bytes, big-endian).
+    pub fn field_u64(&mut self, value: u64) -> &mut Self {
+        self.field(&value.to_be_bytes())
+    }
+
+    /// Appends a digest field.
+    pub fn field_digest(&mut self, digest: &DomainSeparatedHash) -> &mut Self {
+        self.field(digest.as_bytes())
+    }
+
+    /// Appends a field of `i8` values, one byte each (two's complement).
+    pub fn field_i8s(&mut self, values: &[i8]) -> &mut Self {
+        self.begin_field(values.len());
+        for &v in values {
+            self.sponge.absorb_byte(v as u8);
+        }
+        self
+    }
+
+    /// Appends a field of `i32` values, four big-endian bytes each.
+    pub fn field_i32s(&mut self, values: &[i32]) -> &mut Self {
+        self.begin_field(values.len() * 4);
+        for &v in values {
+            self.sponge.absorb(&v.to_be_bytes());
+        }
+        self
+    }
+
+    /// Completes the encoding and returns the digest.
+    pub fn finalize(&self) -> DomainSeparatedHash {
+        let mut sponge = self.sponge.clone();
+        sponge.absorb(&self.fields.to_be_bytes());
+        DomainSeparatedHash(sponge.squeeze())
+    }
+
+    fn begin_field(&mut self, byte_len: usize) {
+        self.fields += 1;
+        self.sponge.absorb(&(byte_len as u64).to_be_bytes());
+    }
+}
+
+/// Extendable-output stream bound to a label and a seed.
+///
+/// **PLACEHOLDER** for `SHAKE256(Enc(label, seed))`; output block `i` is
+/// `H_512(Enc(label, seed, i))` of the placeholder hash.
+#[derive(Clone)]
+pub struct MockXof {
+    prefix: DomainHasher,
+    counter: u64,
+    block: [u8; DIGEST_LEN],
+    offset: usize,
+}
+
+impl MockXof {
+    /// Starts a stream for `label` and `seed`.
+    pub fn new(label: &str, seed: &DomainSeparatedHash) -> Self {
+        let mut prefix = DomainHasher::new(label);
+        prefix.field_digest(seed);
+        MockXof {
+            prefix,
+            counter: 0,
+            block: [0; DIGEST_LEN],
+            offset: DIGEST_LEN,
+        }
+    }
+
+    /// Next output byte.
+    pub fn next_byte(&mut self) -> u8 {
+        if self.offset == DIGEST_LEN {
+            let mut block = self.prefix.clone();
+            block.field_u64(self.counter);
+            self.block = *block.finalize().as_bytes();
+            self.counter += 1;
+            self.offset = 0;
+        }
+        let byte = self.block[self.offset];
+        self.offset += 1;
+        byte
+    }
+
+    /// Next eight output bytes as a big-endian `u64`.
+    pub fn next_u64(&mut self) -> u64 {
+        let mut bytes = [0u8; 8];
+        for b in &mut bytes {
+            *b = self.next_byte();
+        }
+        u64::from_be_bytes(bytes)
+    }
+}
+
+const SPONGE_LANES: usize = 8;
+const GOLDEN_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Non-cryptographic 512-bit state used by the hashing placeholders.
+#[derive(Clone)]
+struct MockSponge {
+    lanes: [u64; SPONGE_LANES],
+    buffer: [u8; 8],
+    buffered: usize,
+    absorbed: u64,
+}
+
+impl MockSponge {
+    fn new() -> Self {
+        let mut lanes = [0u64; SPONGE_LANES];
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            *lane = mix64(GOLDEN_GAMMA.wrapping_mul(i as u64 + 1));
+        }
+        MockSponge {
+            lanes,
+            buffer: [0; 8],
+            buffered: 0,
+            absorbed: 0,
+        }
+    }
+
+    fn absorb(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.absorb_byte(b);
+        }
+    }
+
+    fn absorb_byte(&mut self, byte: u8) {
+        self.buffer[self.buffered] = byte;
+        self.buffered += 1;
+        self.absorbed = self.absorbed.wrapping_add(1);
+        if self.buffered == 8 {
+            self.absorb_word(u64::from_le_bytes(self.buffer));
+            self.buffered = 0;
+        }
+    }
+
+    fn absorb_word(&mut self, word: u64) {
+        for i in 0..SPONGE_LANES {
+            let neighbour = self.lanes[(i + SPONGE_LANES - 1) % SPONGE_LANES];
+            self.lanes[i] = mix64(self.lanes[i] ^ word ^ neighbour.rotate_left(17));
+        }
+    }
+
+    fn squeeze(mut self) -> [u8; DIGEST_LEN] {
+        let absorbed = self.absorbed;
+        self.absorb_byte(0x80);
+        while self.buffered != 0 {
+            self.absorb_byte(0);
+        }
+        self.absorb_word(absorbed);
+        for _ in 0..SPONGE_LANES {
+            self.absorb_word(GOLDEN_GAMMA);
+        }
+        let mut out = [0u8; DIGEST_LEN];
+        for (chunk, lane) in out.chunks_exact_mut(8).zip(self.lanes) {
+            chunk.copy_from_slice(&lane.to_be_bytes());
+        }
+        out
+    }
+}
+
+/// SplitMix64 finalizer.
+const fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+// ---------------------------------------------------------------------------
+// Post-quantum object sizes (spec Table 3) and block resources (spec §7.10)
+// ---------------------------------------------------------------------------
+
+/// Genesis-suite object sizes in bytes (spec Table 3).
+pub mod pq_sizes {
+    /// ML-DSA-87 public key.
+    pub const ML_DSA_87_PUBLIC_KEY: u64 = 2_592;
+    /// ML-DSA-87 signature.
+    pub const ML_DSA_87_SIGNATURE: u64 = 4_627;
+    /// SLH-DSA-SHAKE-256s public key.
+    pub const SLH_DSA_SHAKE_256S_PUBLIC_KEY: u64 = 64;
+    /// SLH-DSA-SHAKE-256s signature.
+    pub const SLH_DSA_SHAKE_256S_SIGNATURE: u64 = 29_792;
+    /// ML-KEM-1024 encapsulation key.
+    pub const ML_KEM_1024_ENCAPSULATION_KEY: u64 = 1_568;
+    /// ML-KEM-1024 ciphertext.
+    pub const ML_KEM_1024_CIPHERTEXT: u64 = 1_568;
+}
+
+/// The five-component block resource vector `(B_bytes, B_sig, B_ZK, B_state, B_DA)`
+/// of eq. (7.31). A block is valid only if the sum of its transactions' vectors
+/// is componentwise at most the block limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct BlockResourceVector {
+    /// Serialized bytes, including post-quantum signatures and keys.
+    pub bytes: u64,
+    /// Signature verifications.
+    pub signature_checks: u64,
+    /// Zero-knowledge proof verifications.
+    pub zk_checks: u64,
+    /// State writes.
+    pub state_writes: u64,
+    /// Data-availability payload bytes.
+    pub da_bytes: u64,
+}
+
+impl BlockResourceVector {
+    /// The zero vector.
+    pub const ZERO: BlockResourceVector = BlockResourceVector {
+        bytes: 0,
+        signature_checks: 0,
+        zk_checks: 0,
+        state_writes: 0,
+        da_bytes: 0,
+    };
+
+    /// Componentwise checked sum.
+    pub fn checked_add(&self, other: &Self) -> Option<Self> {
+        Some(BlockResourceVector {
+            bytes: self.bytes.checked_add(other.bytes)?,
+            signature_checks: self.signature_checks.checked_add(other.signature_checks)?,
+            zk_checks: self.zk_checks.checked_add(other.zk_checks)?,
+            state_writes: self.state_writes.checked_add(other.state_writes)?,
+            da_bytes: self.da_bytes.checked_add(other.da_bytes)?,
+        })
+    }
+
+    /// The componentwise order `self ≼ limit`.
+    pub fn fits_within(&self, limit: &Self) -> bool {
+        self.bytes <= limit.bytes
+            && self.signature_checks <= limit.signature_checks
+            && self.zk_checks <= limit.zk_checks
+            && self.state_writes <= limit.state_writes
+            && self.da_bytes <= limit.da_bytes
+    }
+
+    /// Sums transaction vectors and checks the block limit; `None` if any
+    /// component overflows or exceeds its limit.
+    pub fn accumulate<'a>(
+        txs: impl IntoIterator<Item = &'a BlockResourceVector>,
+        limit: &Self,
+    ) -> Option<Self> {
+        let total = txs
+            .into_iter()
+            .try_fold(Self::ZERO, |acc, tx| acc.checked_add(tx))?;
+        total.fits_within(limit).then_some(total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_supply_fits_in_u64_without_overflow() {
+        let computed = TOTAL_SUPPLY_PLAU
+            .checked_mul(ATOMS_PER_PLAU)
+            .expect("15,000,000 PLAU * 10^8 must not overflow u64");
+        assert_eq!(computed, 1_500_000_000_000_000);
+        assert_eq!(Atoms::from_plau(TOTAL_SUPPLY_PLAU), Some(TOTAL_SUPPLY));
+        // Headroom: M < 2^51 < p, so supply sums never alias in F_p.
+        assert!(TOTAL_SUPPLY.get() < 1 << 51);
+        assert!(u128::from(TOTAL_SUPPLY.get()) < u128::from(Mersenne61::P));
+        // Even M summed with itself 4096 times stays inside u64.
+        assert!(TOTAL_SUPPLY.get().checked_mul(4096).is_some());
+    }
+
+    #[test]
+    fn atoms_arithmetic_and_display() {
+        assert_eq!(ATOMS_PER_PLAU, 100_000_000);
+        assert_eq!(Atoms::from_plau(u64::MAX), None);
+        assert_eq!(Atoms(5).checked_sub(Atoms(6)), None);
+        assert_eq!(Atoms(u64::MAX).checked_add(Atoms(1)), None);
+        assert_eq!(Atoms(1_000_000_001).to_string(), "10.00000001 PLAU");
+        assert_eq!(TOTAL_SUPPLY.to_string(), "15000000.00000000 PLAU");
+    }
+
+    #[test]
+    fn mersenne61_constant_and_arithmetic() {
+        assert_eq!(Mersenne61::P, 2_305_843_009_213_693_951);
+        assert_eq!(Mersenne61::new(Mersenne61::P), Mersenne61::ZERO);
+        assert_eq!(Mersenne61::new(Mersenne61::P + 5).value(), 5);
+        assert_eq!(Mersenne61::new(u64::MAX).value(), u64::MAX % Mersenne61::P);
+        let minus_one = Mersenne61::from_i64(-1);
+        assert_eq!(minus_one.value(), Mersenne61::P - 1);
+        assert_eq!(minus_one + Mersenne61::ONE, Mersenne61::ZERO);
+        assert_eq!(minus_one * minus_one, Mersenne61::ONE);
+        assert_eq!(
+            Mersenne61::from_i64(-127) + Mersenne61::new(127),
+            Mersenne61::ZERO
+        );
+        assert_eq!(
+            Mersenne61::new(3) - Mersenne61::new(5),
+            Mersenne61::from_i64(-2)
+        );
+        // Spot-check reduction against plain u128 remainders.
+        for &(a, b) in &[
+            (Mersenne61::P - 1, Mersenne61::P - 2),
+            (1 << 60, 1 << 60),
+            (12345, 67890),
+        ] {
+            let expected = ((a as u128 * b as u128) % Mersenne61::P as u128) as u64;
+            assert_eq!((Mersenne61::new(a) * Mersenne61::new(b)).value(), expected);
+        }
+        assert_eq!(
+            Mersenne61::reduce_u128(u128::MAX),
+            (u128::MAX % Mersenne61::P as u128) as u64
+        );
+    }
+
+    #[test]
+    fn domain_separated_hash_is_deterministic_and_separated() {
+        let a = DomainSeparatedHash::new(labels::FW_SHARE, &[b"work"]);
+        assert_eq!(a, DomainSeparatedHash::new(labels::FW_SHARE, &[b"work"]));
+        assert_ne!(a, DomainSeparatedHash::new(labels::FW_SEAL, &[b"work"]));
+        // Length prefixes make the encoding injective across field boundaries.
+        assert_ne!(
+            DomainSeparatedHash::new(labels::FW_ID, &[b"ab", b"c"]),
+            DomainSeparatedHash::new(labels::FW_ID, &[b"a", b"bc"])
+        );
+        assert_ne!(
+            DomainSeparatedHash::new(labels::FW_ID, &[b""]),
+            DomainSeparatedHash::new(labels::FW_ID, &[])
+        );
+        assert_eq!(a.to_hex().len(), 2 * DIGEST_LEN);
+    }
+
+    #[test]
+    fn xof_is_deterministic_and_seed_bound() {
+        let seed = DomainSeparatedHash::new(labels::FW_INPUT, &[b"x"]);
+        let mut one = MockXof::new(labels::FW_A, &seed);
+        let mut two = MockXof::new(labels::FW_A, &seed);
+        let mut other = MockXof::new(labels::FW_B, &seed);
+        let a: Vec<u8> = (0..200).map(|_| one.next_byte()).collect();
+        let b: Vec<u8> = (0..200).map(|_| two.next_byte()).collect();
+        let c: Vec<u8> = (0..200).map(|_| other.next_byte()).collect();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn block_resource_vector_is_componentwise() {
+        let limit = BlockResourceVector {
+            bytes: 100_000,
+            signature_checks: 10,
+            zk_checks: 2,
+            state_writes: 50,
+            da_bytes: 1 << 20,
+        };
+        let tx = BlockResourceVector {
+            bytes: pq_sizes::ML_DSA_87_SIGNATURE + pq_sizes::ML_DSA_87_PUBLIC_KEY,
+            signature_checks: 1,
+            zk_checks: 0,
+            state_writes: 3,
+            da_bytes: 0,
+        };
+        let total = BlockResourceVector::accumulate([tx; 10].iter(), &limit).unwrap();
+        assert_eq!(total.signature_checks, 10);
+        // An eleventh signature check breaks one component, even though the
+        // other four still have headroom.
+        assert!(BlockResourceVector::accumulate([tx; 11].iter(), &limit).is_none());
+        let zk_heavy = BlockResourceVector {
+            zk_checks: 3,
+            ..BlockResourceVector::ZERO
+        };
+        assert!(!zk_heavy.fits_within(&limit));
+    }
+}
+##### END FILE: primitives/src/lib.rs
+
+################################################################################
+##### BEGIN FILE: work/Cargo.toml | 11 lines | sha256 f2ac56bd414d80276268bf1363a2c9fb4f62927a9af99dfaed3c4dd0a942f4c5
+################################################################################
+[package]
+name = "work"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Module 1: canonical 512x512 INT8 Fresh Work tile and Freivalds verification"
+
+[dependencies]
+primitives = { path = "../primitives" }
+
+[lints]
+workspace = true
+##### END FILE: work/Cargo.toml
+
+################################################################################
+##### BEGIN FILE: work/src/lib.rs | 645 lines | sha256 ddcd22727b45ce82f8553ef0148fd6e640927c41bc3a45b6f22da0cb3d75560f
+################################################################################
+//! Module 1 — the canonical Fresh Work tile and its Freivalds verification.
+//!
+//! The native work unit is the exact integer product `Z = XY` of two
+//! `512 x 512` INT8 matrices with entries in `{-127, ..., 127}` (spec §3.1).
+//! Every entry of `Z` satisfies `|Z_ij| <= 512 * 127^2 = 8,258,048 < 2^23`
+//! (eq. 3.2), so two admissible results that agree modulo `p = 2^61 - 1` are
+//! equal over the integers (eq. 3.3). Correctness is checked by `r_F = 6`
+//! Freivalds rounds over `F_p` (§3.2), whose static error is at most `p^-6`.
+
+use core::fmt;
+
+use primitives::{DomainHasher, DomainSeparatedHash, Mersenne61, MockXof, labels};
+
+/// Tile dimension `n = 512`.
+pub const TILE_DIM: usize = 512;
+/// Entries per tile, `n^2`.
+pub const TILE_ELEMS: usize = TILE_DIM * TILE_DIM;
+/// Smallest admissible INT8 input. `-128` is excluded: `512 * 128^2 = 2^23`
+/// would break the strict bound of eq. (3.2).
+pub const INT8_MIN: i8 = -127;
+/// Largest admissible INT8 input.
+pub const INT8_MAX: i8 = 127;
+/// Maximum absolute value of an accumulated INT32 entry, `512 * 127^2`.
+pub const ACCUMULATION_BOUND: i32 = 8_258_048;
+
+/// Normative number of Freivalds rounds, `r_F = 6`.
+pub const DEFAULT_FREIVALDS_ROUNDS: usize = 6;
+/// Classical multiply-accumulate count of one tile, `n^3 = 2^27` (eq. 3.4).
+pub const CLASSICAL_MACS: u64 = (TILE_DIM as u64) * (TILE_DIM as u64) * (TILE_DIM as u64);
+/// Field multiplications of six Freivalds rounds, `3 r_F n^2 = 4,718,592` (eq. 3.8).
+pub const FREIVALDS_FIELD_MULS: u64 = 3 * DEFAULT_FREIVALDS_ROUNDS as u64 * TILE_ELEMS as u64;
+
+const _: () = assert!(TILE_DIM as i64 * 127 * 127 == ACCUMULATION_BOUND as i64);
+const _: () = assert!((ACCUMULATION_BOUND as i64) < (1 << 23));
+const _: () = assert!(TILE_DIM as i64 * 128 * 128 == 1 << 23);
+const _: () = assert!(CLASSICAL_MACS == 1 << 27);
+const _: () = assert!(FREIVALDS_FIELD_MULS * 256 == 9 * CLASSICAL_MACS);
+
+/// Matrix entry types admitted by the tile domain.
+pub trait TileElement: Copy + Default + Into<i64> {
+    /// Largest admissible absolute value.
+    const MAX_ABS: i64;
+}
+
+impl TileElement for i8 {
+    const MAX_ABS: i64 = INT8_MAX as i64;
+}
+
+impl TileElement for i32 {
+    const MAX_ABS: i64 = ACCUMULATION_BOUND as i64;
+}
+
+/// A `512 x 512` row-major matrix whose entries are always inside the tile domain.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Matrix<T> {
+    data: Box<[T]>,
+}
+
+/// The canonical Work Unit: a `512 x 512` matrix over `{-127, ..., 127}`.
+pub type WorkUnit = Matrix<i8>;
+/// The accumulation target: a `512 x 512` INT32 matrix with `|z| <= 8,258,048`.
+pub type AccumulationTarget = Matrix<i32>;
+
+/// Rejection reasons for matrices outside the tile domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkError {
+    /// The entry count is not `512 * 512`.
+    Dimension {
+        /// Required entry count.
+        expected: usize,
+        /// Supplied entry count.
+        found: usize,
+    },
+    /// An entry lies outside the admissible range.
+    OutOfDomain {
+        /// Row of the offending entry.
+        row: usize,
+        /// Column of the offending entry.
+        col: usize,
+        /// The offending value.
+        value: i64,
+        /// The admissible absolute bound.
+        max_abs: i64,
+    },
+}
+
+impl fmt::Display for WorkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorkError::Dimension { expected, found } => {
+                write!(f, "tile needs {expected} entries, got {found}")
+            }
+            WorkError::OutOfDomain {
+                row,
+                col,
+                value,
+                max_abs,
+            } => write!(
+                f,
+                "entry ({row}, {col}) = {value} is outside [-{max_abs}, {max_abs}]"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkError {}
+
+impl<T: TileElement> Matrix<T> {
+    /// Builds a tile from row-major entries, rejecting wrong sizes and out-of-domain values.
+    pub fn from_vec(data: Vec<T>) -> Result<Self, WorkError> {
+        if data.len() != TILE_ELEMS {
+            return Err(WorkError::Dimension {
+                expected: TILE_ELEMS,
+                found: data.len(),
+            });
+        }
+        if let Some(index) = data.iter().position(|&v| !in_domain(v)) {
+            return Err(out_of_domain(index, data[index]));
+        }
+        Ok(Matrix {
+            data: data.into_boxed_slice(),
+        })
+    }
+
+    /// The all-zero tile.
+    pub fn zeros() -> Self {
+        Matrix {
+            data: vec![T::default(); TILE_ELEMS].into_boxed_slice(),
+        }
+    }
+
+    /// Entry at `(row, col)`. Panics if either index is `>= 512`.
+    pub fn get(&self, row: usize, col: usize) -> T {
+        self.data[index(row, col)]
+    }
+
+    /// Replaces the entry at `(row, col)` if the new value is in the domain.
+    pub fn set(&mut self, row: usize, col: usize, value: T) -> Result<(), WorkError> {
+        let i = index(row, col);
+        if !in_domain(value) {
+            return Err(out_of_domain(i, value));
+        }
+        self.data[i] = value;
+        Ok(())
+    }
+
+    /// Row `row` as a slice.
+    pub fn row(&self, row: usize) -> &[T] {
+        &self.data[row * TILE_DIM..(row + 1) * TILE_DIM]
+    }
+
+    /// All entries, row-major.
+    pub fn as_slice(&self) -> &[T] {
+        &self.data
+    }
+
+    /// Largest absolute entry.
+    pub fn max_abs(&self) -> i64 {
+        self.data.iter().map(|&v| v.into().abs()).max().unwrap_or(0)
+    }
+}
+
+impl Matrix<i8> {
+    /// The identity tile.
+    pub fn identity() -> Self {
+        let mut m = Self::zeros();
+        for i in 0..TILE_DIM {
+            m.data[index(i, i)] = 1;
+        }
+        m
+    }
+
+    /// The exact INT32 product `self * rhs` (`n^3` multiply-accumulates).
+    ///
+    /// No partial sum can leave `[-8,258,048, 8,258,048]`, so the result is in
+    /// the accumulation domain by construction.
+    pub fn product(&self, rhs: &Matrix<i8>) -> Matrix<i32> {
+        let mut out = vec![0i32; TILE_ELEMS];
+        for (out_row, lhs_row) in out
+            .chunks_exact_mut(TILE_DIM)
+            .zip(self.data.chunks_exact(TILE_DIM))
+        {
+            for (&a, rhs_row) in lhs_row.iter().zip(rhs.data.chunks_exact(TILE_DIM)) {
+                if a == 0 {
+                    continue;
+                }
+                let a = i32::from(a);
+                for (o, &b) in out_row.iter_mut().zip(rhs_row) {
+                    *o += a * i32::from(b);
+                }
+            }
+        }
+        Matrix {
+            data: out.into_boxed_slice(),
+        }
+    }
+}
+
+impl<T: TileElement + fmt::Debug> fmt::Debug for Matrix<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Matrix<{}>[{TILE_DIM}x{TILE_DIM}; row0[..4]={:?}]",
+            core::any::type_name::<T>(),
+            &self.data[..4]
+        )
+    }
+}
+
+fn in_domain<T: TileElement>(value: T) -> bool {
+    value.into().abs() <= T::MAX_ABS
+}
+
+fn out_of_domain<T: TileElement>(index: usize, value: T) -> WorkError {
+    WorkError::OutOfDomain {
+        row: index / TILE_DIM,
+        col: index % TILE_DIM,
+        value: value.into(),
+        max_abs: T::MAX_ABS,
+    }
+}
+
+fn index(row: usize, col: usize) -> usize {
+    assert!(row < TILE_DIM && col < TILE_DIM, "tile index out of range");
+    row * TILE_DIM + col
+}
+
+// ---------------------------------------------------------------------------
+// Fresh Work context, seed and instance generation (spec §5.1–§5.2)
+// ---------------------------------------------------------------------------
+
+/// Number of fields bound into the Fresh Work context `x` (eq. 5.1).
+pub const FRESH_WORK_CONTEXT_FIELDS: usize = 16;
+
+/// The sixteen-field Fresh Work context `x`, bound before any computation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshWorkContext {
+    /// Chain domain.
+    pub chain_id: u64,
+    /// Genesis domain.
+    pub genesis_id: DomainSeparatedHash,
+    /// Protocol version.
+    pub protocol_version: u32,
+    /// Active cryptographic suite.
+    pub crypto_suite_id: u32,
+    /// Fresh Work program.
+    pub program_id: DomainSeparatedHash,
+    /// AIR of the Fresh Work proof.
+    pub air_id: DomainSeparatedHash,
+    /// Instance generator version.
+    pub generator_version: u32,
+    /// Parent block.
+    pub parent_canonical_id: DomainSeparatedHash,
+    /// Stable anchor.
+    pub stable_anchor_id: DomainSeparatedHash,
+    /// Height of the attempted block.
+    pub height: u64,
+    /// Miner policy, fixing the beneficiary before work.
+    pub miner_policy_digest: DomainSeparatedHash,
+    /// Payout policy.
+    pub payout_policy_digest: DomainSeparatedHash,
+    /// Attempt nonce.
+    pub attempt_nonce: u64,
+    /// Body root fixed before the attempt.
+    pub body_core_root: DomainSeparatedHash,
+    /// Difficulty context derived from the parent.
+    pub parent_derived_difficulty_context: DomainSeparatedHash,
+    /// Time bucket.
+    pub time_bucket: u64,
+}
+
+impl FreshWorkContext {
+    /// The injective encoding `Enc(x)` of all sixteen fields in normative order.
+    pub fn encode(&self) -> Vec<u8> {
+        let fields: [&[u8]; FRESH_WORK_CONTEXT_FIELDS] = [
+            &self.chain_id.to_be_bytes(),
+            self.genesis_id.as_bytes(),
+            &self.protocol_version.to_be_bytes(),
+            &self.crypto_suite_id.to_be_bytes(),
+            self.program_id.as_bytes(),
+            self.air_id.as_bytes(),
+            &self.generator_version.to_be_bytes(),
+            self.parent_canonical_id.as_bytes(),
+            self.stable_anchor_id.as_bytes(),
+            &self.height.to_be_bytes(),
+            self.miner_policy_digest.as_bytes(),
+            self.payout_policy_digest.as_bytes(),
+            &self.attempt_nonce.to_be_bytes(),
+            self.body_core_root.as_bytes(),
+            self.parent_derived_difficulty_context.as_bytes(),
+            &self.time_bucket.to_be_bytes(),
+        ];
+        let mut out = Vec::new();
+        for field in fields {
+            out.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            out.extend_from_slice(field);
+        }
+        out
+    }
+
+    /// `seed = H_512(Enc(FW/INPUT/v2, x))` (eq. 5.2).
+    pub fn seed(&self) -> DomainSeparatedHash {
+        DomainSeparatedHash::new(labels::FW_INPUT, &[&self.encode()])
+    }
+
+    /// Expands the seed into the two operand tiles `X` and `Y` (eq. 5.3).
+    pub fn instance(&self) -> FreshWorkInstance {
+        let seed = self.seed();
+        FreshWorkInstance {
+            x: expand_seed(labels::FW_A, &seed),
+            y: expand_seed(labels::FW_B, &seed),
+            seed,
+        }
+    }
+}
+
+/// The operands generated from one Fresh Work seed.
+#[derive(Clone, Debug)]
+pub struct FreshWorkInstance {
+    /// The seed both operands were expanded from.
+    pub seed: DomainSeparatedHash,
+    /// Left operand `X`.
+    pub x: WorkUnit,
+    /// Right operand `Y`.
+    pub y: WorkUnit,
+}
+
+/// Expands a seed into a uniform INT8 tile by byte rejection (eq. 5.3):
+/// `Map(b) = b - 127` for `b` in `{0, ..., 254}`, and `b = 255` is rejected,
+/// so entries are exactly uniform on `[-127, 127]`.
+///
+/// The byte stream is the [`MockXof`] placeholder for SHAKE256.
+pub fn expand_seed(label: &str, seed: &DomainSeparatedHash) -> WorkUnit {
+    let mut xof = MockXof::new(label, seed);
+    let mut data = Vec::with_capacity(TILE_ELEMS);
+    while data.len() < TILE_ELEMS {
+        let byte = xof.next_byte();
+        if byte != u8::MAX {
+            data.push((i16::from(byte) - 127) as i8);
+        }
+    }
+    Matrix {
+        data: data.into_boxed_slice(),
+    }
+}
+
+/// Identifiers and lottery values of one evaluated attempt (eqs. 5.4–5.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreshWorkIds {
+    /// `outputRoot = H_512(Enc(FW/OUTPUT/v2, XY))`.
+    pub output_root: DomainSeparatedHash,
+    /// `WorkID = H_512(Enc(FW/ID/v2, x, outputRoot))`; also the ShareID.
+    pub work_id: DomainSeparatedHash,
+    /// `BlockID = H_512(Enc(BLOCK/v2, x, outputRoot))`.
+    pub block_id: DomainSeparatedHash,
+    /// Share lottery value `θ_S = H_512(Enc(FW/SHARE/v2, WorkID))`.
+    pub share_ticket: DomainSeparatedHash,
+    /// Seal lottery value `θ_B = H_512(Enc(FW/SEAL/v2, WorkID))`.
+    pub seal_ticket: DomainSeparatedHash,
+}
+
+impl FreshWorkIds {
+    /// Derives all identifiers from the context and the committed product.
+    /// No witness material enters these maps (Theorem 5.1).
+    pub fn derive(context: &FreshWorkContext, product: &AccumulationTarget) -> Self {
+        let x = context.encode();
+        let output_root = {
+            let mut h = DomainHasher::new(labels::FW_OUTPUT);
+            h.field_i32s(product.as_slice());
+            h.finalize()
+        };
+        let work_id = DomainSeparatedHash::new(labels::FW_ID, &[&x, output_root.as_bytes()]);
+        let block_id = DomainSeparatedHash::new(labels::BLOCK, &[&x, output_root.as_bytes()]);
+        FreshWorkIds {
+            output_root,
+            work_id,
+            block_id,
+            share_ticket: DomainSeparatedHash::new(labels::FW_SHARE, &[work_id.as_bytes()]),
+            seal_ticket: DomainSeparatedHash::new(labels::FW_SEAL, &[work_id.as_bytes()]),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Freivalds verification over F_p (spec §3.2)
+// ---------------------------------------------------------------------------
+
+/// Checks `A(B v) = C v` over `F_p` for `rounds` independent challenge vectors.
+///
+/// The vectors are drawn only after `A`, `B` and `C` are bound into a
+/// Fiat–Shamir transcript, with one domain per round and rejection sampling
+/// to uniform `F_p` elements. Each round costs `3 n^2` field multiplications;
+/// the normative six rounds cost `4,718,592 = (9/256) n^3`.
+///
+/// Returns `false` for `rounds == 0`. Consensus uses [`DEFAULT_FREIVALDS_ROUNDS`].
+/// The matrix types already enforce the tile domains, which is what makes
+/// agreement modulo `p` imply equality over the integers (eq. 3.3).
+///
+/// **PoC status:** the transcript hash and XOF are placeholders (see
+/// [`primitives::DomainSeparatedHash`]); the field arithmetic is exact.
+pub fn verify_freivalds_rounds(
+    a: &Matrix<i8>,
+    b: &Matrix<i8>,
+    c: &Matrix<i32>,
+    rounds: usize,
+) -> bool {
+    if rounds == 0 {
+        return false;
+    }
+    let transcript = {
+        let mut h = DomainHasher::new(labels::FW_FREIVALDS);
+        h.field_i8s(a.as_slice())
+            .field_i8s(b.as_slice())
+            .field_i32s(c.as_slice());
+        h.finalize()
+    };
+    (0..rounds as u64).all(|round| {
+        let v = challenge_vector(&transcript, round);
+        let bv = mat_vec(b, &v);
+        mat_vec(a, &bv) == mat_vec(c, &v)
+    })
+}
+
+/// Uniform challenge `v^(round)` in `F_p^n`: 61-bit draws, rejecting the single
+/// value `p` so every element of `[0, p)` is equally likely.
+fn challenge_vector(transcript: &DomainSeparatedHash, round: u64) -> Vec<Mersenne61> {
+    let mut round_seed = DomainHasher::new(labels::FW_FREIVALDS);
+    round_seed.field_digest(transcript).field_u64(round);
+    let mut xof = MockXof::new(labels::FW_FREIVALDS, &round_seed.finalize());
+    let mut v = Vec::with_capacity(TILE_DIM);
+    while v.len() < TILE_DIM {
+        let candidate = xof.next_u64() & Mersenne61::P;
+        if candidate != Mersenne61::P {
+            v.push(Mersenne61::new(candidate));
+        }
+    }
+    v
+}
+
+fn mat_vec<T: TileElement>(m: &Matrix<T>, v: &[Mersenne61]) -> Vec<Mersenne61> {
+    m.data
+        .chunks_exact(TILE_DIM)
+        .map(|row| signed_dot(row, v))
+        .collect()
+}
+
+/// `sum_k row[k] * v[k]` over `F_p`. Positive and negative terms accumulate
+/// exactly in `u128`: `|row[k]| <= 2^23` and `v[k] < 2^61`, so each sum stays
+/// below `512 * 2^84 = 2^93`.
+fn signed_dot<T: TileElement>(row: &[T], v: &[Mersenne61]) -> Mersenne61 {
+    let (mut positive, mut negative) = (0u128, 0u128);
+    for (&x, y) in row.iter().zip(v) {
+        let x: i64 = x.into();
+        let term = u128::from(x.unsigned_abs()) * u128::from(y.value());
+        if x >= 0 {
+            positive += term;
+        } else {
+            negative += term;
+        }
+    }
+    Mersenne61::new(Mersenne61::reduce_u128(positive))
+        - Mersenne61::new(Mersenne61::reduce_u128(negative))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(nonce: u64) -> FreshWorkContext {
+        let d = |tag: &[u8]| DomainSeparatedHash::new("TEST/CTX/v2", &[tag]);
+        FreshWorkContext {
+            chain_id: 1,
+            genesis_id: d(b"genesis"),
+            protocol_version: 2,
+            crypto_suite_id: 1,
+            program_id: d(b"program"),
+            air_id: d(b"air"),
+            generator_version: 2,
+            parent_canonical_id: d(b"parent"),
+            stable_anchor_id: d(b"anchor"),
+            height: 1,
+            miner_policy_digest: d(b"miner"),
+            payout_policy_digest: d(b"payout"),
+            attempt_nonce: nonce,
+            body_core_root: d(b"body"),
+            parent_derived_difficulty_context: d(b"difficulty"),
+            time_bucket: 0,
+        }
+    }
+
+    #[test]
+    fn accumulation_bound_is_exact_and_strict() {
+        let n: i64 = TILE_DIM as i64;
+        let bound = n * 127 * 127;
+        assert!(bound <= ACCUMULATION_BOUND as i64);
+        assert_eq!(bound, 8_258_048);
+        assert!(bound < 1 << 23);
+        // Admitting -128 would reach 2^23 exactly and break strictness.
+        assert_eq!(n * 128 * 128, 1 << 23);
+        // Any two admissible results differ by < 2^24 < p (eq. 3.3).
+        assert!(2 * bound < 1 << 24);
+        assert!((1i64 << 24) < Mersenne61::P as i64);
+    }
+
+    #[test]
+    fn freivalds_cost_is_nine_256ths_of_classical() {
+        assert_eq!(FREIVALDS_FIELD_MULS, 4_718_592);
+        assert_eq!(CLASSICAL_MACS, 134_217_728);
+        assert_eq!(FREIVALDS_FIELD_MULS * 256, 9 * CLASSICAL_MACS);
+    }
+
+    #[test]
+    fn work_unit_domain_excludes_minus_128() {
+        let mut entries = vec![0i8; TILE_ELEMS];
+        entries[7] = INT8_MIN;
+        entries[8] = INT8_MAX;
+        assert!(WorkUnit::from_vec(entries.clone()).is_ok());
+        entries[9] = i8::MIN;
+        assert_eq!(
+            WorkUnit::from_vec(entries).unwrap_err(),
+            WorkError::OutOfDomain {
+                row: 0,
+                col: 9,
+                value: -128,
+                max_abs: 127
+            }
+        );
+        assert!(matches!(
+            WorkUnit::from_vec(vec![0; 10]),
+            Err(WorkError::Dimension { found: 10, .. })
+        ));
+        let mut m = WorkUnit::zeros();
+        assert!(m.set(511, 511, i8::MIN).is_err());
+        assert_eq!(m.get(511, 511), 0);
+    }
+
+    #[test]
+    fn accumulation_target_domain_is_bounded() {
+        let mut target = AccumulationTarget::zeros();
+        assert!(target.set(0, 0, ACCUMULATION_BOUND).is_ok());
+        assert!(target.set(0, 1, -ACCUMULATION_BOUND).is_ok());
+        assert!(target.set(0, 2, ACCUMULATION_BOUND + 1).is_err());
+        assert!(target.set(0, 3, -ACCUMULATION_BOUND - 1).is_err());
+        assert!(AccumulationTarget::from_vec(vec![1 << 23; TILE_ELEMS]).is_err());
+    }
+
+    #[test]
+    fn seed_expansion_is_deterministic_and_in_domain() {
+        let ctx = context(0);
+        let inst = ctx.instance();
+        assert_eq!(inst.x, expand_seed(labels::FW_A, &ctx.seed()));
+        assert_ne!(inst.x, inst.y, "FW/A and FW/B are separate domains");
+        assert_ne!(
+            inst.x,
+            context(1).instance().x,
+            "the nonce changes the seed"
+        );
+        assert!(
+            inst.x
+                .as_slice()
+                .iter()
+                .all(|&v| (INT8_MIN..=INT8_MAX).contains(&v))
+        );
+        // 262,144 uniform draws hit both ends of the range.
+        assert!(inst.x.as_slice().contains(&INT8_MIN));
+        assert!(inst.x.as_slice().contains(&INT8_MAX));
+    }
+
+    #[test]
+    fn context_binds_sixteen_fields() {
+        let ctx = context(0);
+        assert_eq!(
+            ctx.encode().len(),
+            FRESH_WORK_CONTEXT_FIELDS * 8 + 9 * 64 + 4 * 8 + 3 * 4
+        );
+        let mut moved = ctx.clone();
+        moved.time_bucket = 1;
+        assert_ne!(ctx.seed(), moved.seed());
+    }
+
+    #[test]
+    fn freivalds_accepts_true_product_and_rejects_tampering() {
+        let inst = context(0).instance();
+        let z = inst.x.product(&inst.y);
+        assert!(z.max_abs() <= ACCUMULATION_BOUND as i64);
+        assert!(verify_freivalds_rounds(
+            &inst.x,
+            &inst.y,
+            &z,
+            DEFAULT_FREIVALDS_ROUNDS
+        ));
+
+        // A single entry off by one is caught.
+        let mut tampered = z.clone();
+        let v = tampered.get(300, 17);
+        tampered
+            .set(300, 17, if v > 0 { v - 1 } else { v + 1 })
+            .unwrap();
+        assert!(!verify_freivalds_rounds(
+            &inst.x,
+            &inst.y,
+            &tampered,
+            DEFAULT_FREIVALDS_ROUNDS
+        ));
+
+        // Operand order matters: YX is not XY.
+        assert!(!verify_freivalds_rounds(
+            &inst.y,
+            &inst.x,
+            &z,
+            DEFAULT_FREIVALDS_ROUNDS
+        ));
+        assert!(!verify_freivalds_rounds(&inst.x, &inst.y, &z, 0));
+
+        let ids = FreshWorkIds::derive(&context(0), &z);
+        assert_eq!(ids, FreshWorkIds::derive(&context(0), &z));
+        assert_ne!(ids.work_id, ids.block_id);
+        assert_ne!(ids.share_ticket, ids.seal_ticket);
+        assert_ne!(
+            ids.output_root,
+            FreshWorkIds::derive(&context(0), &tampered).output_root
+        );
+    }
+
+    #[test]
+    fn freivalds_accepts_extreme_admissible_product() {
+        // X = -127 everywhere, Y = 127 everywhere: every entry is exactly -8,258,048.
+        let x = WorkUnit::from_vec(vec![INT8_MIN; TILE_ELEMS]).unwrap();
+        let y = WorkUnit::from_vec(vec![INT8_MAX; TILE_ELEMS]).unwrap();
+        let z = AccumulationTarget::from_vec(vec![-ACCUMULATION_BOUND; TILE_ELEMS]).unwrap();
+        assert!(verify_freivalds_rounds(
+            &x,
+            &y,
+            &z,
+            DEFAULT_FREIVALDS_ROUNDS
+        ));
+        let id = WorkUnit::identity();
+        assert!(verify_freivalds_rounds(
+            &id,
+            &y,
+            &id.product(&y),
+            DEFAULT_FREIVALDS_ROUNDS
+        ));
+    }
+}
+##### END FILE: work/src/lib.rs
+
+################################################################################
+##### BEGIN FILE: scivm/Cargo.toml | 12 lines | sha256 4030df8be42c977ed05a3d176d08b5fff501040326db7b28bf2ee989eff505bf
+################################################################################
+[package]
+name = "scivm"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Module 1 (SciVM): Ozaki-II residue-splitting profile over native INT8 tiles"
+
+[dependencies]
+primitives = { path = "../primitives" }
+work = { path = "../work" }
+
+[lints]
+workspace = true
+##### END FILE: scivm/Cargo.toml
+
+################################################################################
+##### BEGIN FILE: scivm/src/lib.rs | 499 lines | sha256 3355af1b946eff294bb03a1b38e8d76b995005865f96bd8f93dbb5361111b518
+################################################################################
+//! Module 1 (SciVM) — the Ozaki-II numerical profile over native INT8 tiles.
+//!
+//! The Scientific Virtual Machine executes admitted commercial and scientific
+//! tasks with **zero consensus weight** (spec §1.1, eq. 3.23). Dense
+//! high-precision matrix products are carried out by deterministic Ozaki-II
+//! residue splitting (spec §3.6): scaled integer operands are split into
+//! centered residues modulo `r` pairwise-coprime auxiliary moduli
+//! `2 <= q_j <= 255`, multiplied as exact INT8 x INT8 -> INT32 tiles, reduced
+//! modulo each `q_j`, and recombined by centered CRT. The base field `F_p` and
+//! Module 3 are unchanged; auxiliary moduli never replace `p`.
+//!
+//! **PoC status:** the profile, residue map, accumulation and CRT are exact
+//! integer code. The STARK `TraceCheck`, `Scale`/`Unscale` of floating-point
+//! formats and the remaining `Sem` semantics are out of scope.
+
+use core::fmt;
+
+use work::{ACCUMULATION_BOUND, INT8_MAX, INT8_MIN, TILE_DIM};
+
+/// Smallest admissible auxiliary modulus.
+pub const MIN_MODULUS: u32 = 2;
+/// Largest admissible auxiliary modulus; centered residues then fit `[-127, 127]`.
+pub const MAX_MODULUS: u32 = 255;
+/// Contribution of any SciVM task to chain weight, `ΔW_consensus(τ) = 0`.
+pub const CONSENSUS_WEIGHT: u64 = 0;
+/// Largest magnitude at which every integer is exactly representable in `f64`.
+pub const MAX_EXACT_F64_INTEGER: f64 = 9_007_199_254_740_992.0; // 2^53
+/// PoC limit: centered CRT is evaluated in `i128`, so `Q` must stay below `2^127`.
+pub const MAX_RECONSTRUCTION_MODULUS: u128 = 1 << 127;
+
+/// Rounding rule `Rnd` of the target format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RoundingMode {
+    /// IEEE 754 round to nearest, ties to even.
+    #[default]
+    NearestTiesToEven,
+    /// Round toward zero.
+    TowardZero,
+    /// Round toward positive infinity.
+    TowardPositive,
+    /// Round toward negative infinity.
+    TowardNegative,
+}
+
+/// The task-bound numerical profile `Π_num` (eq. 3.20), restricted to the
+/// fields that govern Ozaki-II residue splitting and exact reconstruction.
+///
+/// The profile is immutably bound by the client at admission; two executions
+/// with the same program, inputs, state and profile produce identical outputs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OzakiIIProfile {
+    /// Profile version `ν`, which also fixes the Ozaki-II construction.
+    pub version: u32,
+    /// Auxiliary moduli `q = (q_1, ..., q_r)`: pairwise coprime, each in `[2, 255]`.
+    pub moduli: Vec<u32>,
+    /// Common inner dimension `K` of the operands.
+    pub inner_dim: u64,
+    /// Certified bound `B_X >= max |X~|` on the scaled left operand.
+    pub bound_x: u64,
+    /// Certified bound `B_Y >= max |Y~|` on the scaled right operand.
+    pub bound_y: u64,
+    /// Rounding rule of the output format.
+    pub rounding: RoundingMode,
+}
+
+/// Rejection reasons of the SciVM profile and residue pipeline.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SciVmError {
+    /// `r = 0`: at least one auxiliary modulus is required.
+    NoModuli,
+    /// A modulus lies outside `[2, 255]`.
+    ModulusOutOfRange(u32),
+    /// Two moduli share a factor.
+    ModuliNotCoprime(u32, u32),
+    /// `K = 0`.
+    ZeroInnerDimension,
+    /// An operand is not a finite integer of magnitude at most `2^53`.
+    NonIntegralOperand {
+        /// Position in the input slice.
+        index: usize,
+        /// The offending value.
+        value: f64,
+    },
+    /// An operand exceeds its certified bound `B_X` or `B_Y`.
+    OperandOutOfBound {
+        /// Position in the input slice.
+        index: usize,
+        /// The offending magnitude.
+        magnitude: u64,
+        /// The certified bound.
+        bound: u64,
+    },
+    /// `Q <= 2 B_rec`: the moduli cannot reconstruct the product exactly.
+    InsufficientReconstructionCapacity {
+        /// `Q = prod q_j`.
+        modulus: u128,
+        /// `2 B_rec`.
+        twice_bound: u128,
+    },
+    /// `Q` or `B_rec` exceeds the PoC's `i128` reconstruction range.
+    ReconstructionRangeExceeded,
+    /// Operand slices or residue vectors have inconsistent lengths.
+    LengthMismatch,
+}
+
+impl fmt::Display for SciVmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SciVmError::NoModuli => write!(f, "profile needs at least one modulus"),
+            SciVmError::ModulusOutOfRange(q) => {
+                write!(f, "modulus {q} outside [{MIN_MODULUS}, {MAX_MODULUS}]")
+            }
+            SciVmError::ModuliNotCoprime(a, b) => write!(f, "moduli {a} and {b} are not coprime"),
+            SciVmError::ZeroInnerDimension => write!(f, "inner dimension K must be positive"),
+            SciVmError::NonIntegralOperand { index, value } => {
+                write!(f, "operand {index} = {value} is not an exact integer")
+            }
+            SciVmError::OperandOutOfBound {
+                index,
+                magnitude,
+                bound,
+            } => {
+                write!(
+                    f,
+                    "operand {index} has |x| = {magnitude} > certified bound {bound}"
+                )
+            }
+            SciVmError::InsufficientReconstructionCapacity {
+                modulus,
+                twice_bound,
+            } => {
+                write!(f, "Q = {modulus} <= 2 B_rec = {twice_bound}")
+            }
+            SciVmError::ReconstructionRangeExceeded => {
+                write!(f, "Q or B_rec exceeds the PoC i128 reconstruction range")
+            }
+            SciVmError::LengthMismatch => write!(f, "inconsistent operand or residue lengths"),
+        }
+    }
+}
+
+impl std::error::Error for SciVmError {}
+
+impl OzakiIIProfile {
+    /// Checks the admission conditions of eq. (3.22): `r >= 1`, every
+    /// `2 <= q_j <= 255`, pairwise coprimality, and `Q > 2 B_rec` with
+    /// `B_rec = K B_X B_Y`. Insufficient capacity is a rejection, never a
+    /// silent approximation.
+    pub fn validate(&self) -> Result<(), SciVmError> {
+        validate_moduli(&self.moduli)?;
+        if self.inner_dim == 0 {
+            return Err(SciVmError::ZeroInnerDimension);
+        }
+        let modulus = self.reconstruction_modulus()?;
+        let twice_bound = self
+            .reconstruction_bound()?
+            .checked_mul(2)
+            .ok_or(SciVmError::ReconstructionRangeExceeded)?;
+        if modulus <= twice_bound {
+            return Err(SciVmError::InsufficientReconstructionCapacity {
+                modulus,
+                twice_bound,
+            });
+        }
+        Ok(())
+    }
+
+    /// `Q = prod q_j`, which must stay below [`MAX_RECONSTRUCTION_MODULUS`] in the PoC.
+    pub fn reconstruction_modulus(&self) -> Result<u128, SciVmError> {
+        reconstruction_modulus(&self.moduli)
+    }
+
+    /// `B_rec = K B_X B_Y`, the bound on every entry of the scaled integer product.
+    pub fn reconstruction_bound(&self) -> Result<u128, SciVmError> {
+        u128::from(self.inner_dim)
+            .checked_mul(u128::from(self.bound_x))
+            .and_then(|v| v.checked_mul(u128::from(self.bound_y)))
+            .ok_or(SciVmError::ReconstructionRangeExceeded)
+    }
+
+    /// Exact dot product `sum_k x_k y_k` of scaled integer operands through the
+    /// Ozaki-II path: residue split, INT8 x INT8 -> INT32 accumulation per
+    /// 512-wide tile, reduction modulo each `q_j`, then centered CRT.
+    ///
+    /// This is one entry of the tile product of eq. (3.21); a full matrix
+    /// product repeats it for every output entry.
+    pub fn exact_dot(&self, x: &[f64], y: &[f64]) -> Result<i128, SciVmError> {
+        self.validate()?;
+        if x.len() != y.len() || x.len() as u64 != self.inner_dim {
+            return Err(SciVmError::LengthMismatch);
+        }
+        check_bound(x, self.bound_x)?;
+        check_bound(y, self.bound_y)?;
+        let k = x.len();
+        let rx = try_split_residues(x, &self.moduli)?;
+        let ry = try_split_residues(y, &self.moduli)?;
+
+        let mut assembled = Vec::with_capacity(self.moduli.len());
+        for (j, &q) in self.moduli.iter().enumerate() {
+            let (xj, yj) = (&rx[j * k..(j + 1) * k], &ry[j * k..(j + 1) * k]);
+            let mut acc_mod_q: i64 = 0;
+            for (tile_x, tile_y) in xj.chunks(TILE_DIM).zip(yj.chunks(TILE_DIM)) {
+                // One native tile: at most 512 INT8 products, so the INT32
+                // accumulator stays within ±8,258,048 (eq. 3.22).
+                let tile: i32 = tile_x
+                    .iter()
+                    .zip(tile_y)
+                    .map(|(&a, &b)| i32::from(a) * i32::from(b))
+                    .sum();
+                debug_assert!(tile.abs() <= ACCUMULATION_BOUND);
+                acc_mod_q = (acc_mod_q + i64::from(tile)).rem_euclid(i64::from(q));
+            }
+            assembled.push(acc_mod_q);
+        }
+        crt_centered(&assembled, &self.moduli)
+    }
+}
+
+/// Splits scaled integer operands into centered residues
+/// `cres_q(z) = z - q * floor((z + floor(q/2)) / q)` for every modulus.
+///
+/// The moduli must be **pairwise-coprime integers in `[2, 255]`**, so that each
+/// residue lies in `[-127, 127]`: exactly the native INT8 tile domain, with
+/// `-128` never produced. Operands must be finite integers with `|z| <= 2^53`
+/// (the output of the profile's `Scale` step).
+///
+/// The output is residue-major: entry `j * n + i` is `cres_{q_j}(z_i)` for
+/// `n = scaled_operands.len()`.
+///
+/// # Panics
+///
+/// Panics on invalid moduli or operands; use [`try_split_residues`] to handle
+/// these as errors.
+pub fn split_residues(scaled_operands: &[f64], moduli: &[u32]) -> Vec<i8> {
+    try_split_residues(scaled_operands, moduli).unwrap_or_else(|e| panic!("split_residues: {e}"))
+}
+
+/// Fallible form of [`split_residues`].
+pub fn try_split_residues(scaled_operands: &[f64], moduli: &[u32]) -> Result<Vec<i8>, SciVmError> {
+    validate_moduli(moduli)?;
+    let integers = scaled_operands
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| {
+            exact_integer(value).ok_or(SciVmError::NonIntegralOperand { index, value })
+        })
+        .collect::<Result<Vec<i64>, _>>()?;
+    let mut out = Vec::with_capacity(moduli.len() * integers.len());
+    for &q in moduli {
+        out.extend(integers.iter().map(|&z| centered_residue(z, q)));
+    }
+    Ok(out)
+}
+
+/// `cres_q(z)` for one value; the result lies in `[-floor(q/2), q - 1 - floor(q/2)]`.
+pub fn centered_residue(z: i64, q: u32) -> i8 {
+    let q = i64::from(q);
+    let residue = z - q * (z + q / 2).div_euclid(q);
+    debug_assert!((i64::from(INT8_MIN)..=i64::from(INT8_MAX)).contains(&residue));
+    residue as i8
+}
+
+/// Centered CRT reconstruction `CRT_0`: the unique `Z` in
+/// `[-floor(Q/2), ceil(Q/2) - 1]` with `Z = r_j (mod q_j)` for every `j`.
+pub fn crt_centered(residues: &[i64], moduli: &[u32]) -> Result<i128, SciVmError> {
+    validate_moduli(moduli)?;
+    if residues.len() != moduli.len() {
+        return Err(SciVmError::LengthMismatch);
+    }
+    let modulus = reconstruction_modulus(moduli)?;
+    // Garner-style incremental combination; every intermediate is < Q < 2^127.
+    let (mut value, mut combined) = (0u128, 1u128);
+    for (&r, &q) in residues.iter().zip(moduli) {
+        let q128 = u128::from(q);
+        let target = r.rem_euclid(i64::from(q)) as u128;
+        let current = value % q128;
+        let diff = (target + q128 - current) % q128;
+        let inverse = mod_inverse((combined % q128) as u32, q) as u128;
+        let step = diff * inverse % q128;
+        value += combined * step;
+        combined *= q128;
+    }
+    debug_assert_eq!(combined, modulus);
+    let half_up = modulus - modulus / 2; // ceil(Q/2)
+    Ok(if value >= half_up {
+        value as i128 - modulus as i128
+    } else {
+        value as i128
+    })
+}
+
+fn validate_moduli(moduli: &[u32]) -> Result<(), SciVmError> {
+    if moduli.is_empty() {
+        return Err(SciVmError::NoModuli);
+    }
+    if let Some(&q) = moduli
+        .iter()
+        .find(|q| !(MIN_MODULUS..=MAX_MODULUS).contains(q))
+    {
+        return Err(SciVmError::ModulusOutOfRange(q));
+    }
+    for (i, &a) in moduli.iter().enumerate() {
+        if let Some(&b) = moduli[i + 1..].iter().find(|&&b| gcd(a, b) != 1) {
+            return Err(SciVmError::ModuliNotCoprime(a, b));
+        }
+    }
+    Ok(())
+}
+
+fn reconstruction_modulus(moduli: &[u32]) -> Result<u128, SciVmError> {
+    moduli
+        .iter()
+        .try_fold(1u128, |acc, &q| acc.checked_mul(u128::from(q)))
+        .filter(|&m| m < MAX_RECONSTRUCTION_MODULUS)
+        .ok_or(SciVmError::ReconstructionRangeExceeded)
+}
+
+fn check_bound(values: &[f64], bound: u64) -> Result<(), SciVmError> {
+    for (index, &value) in values.iter().enumerate() {
+        let magnitude = exact_integer(value)
+            .ok_or(SciVmError::NonIntegralOperand { index, value })?
+            .unsigned_abs();
+        if magnitude > bound {
+            return Err(SciVmError::OperandOutOfBound {
+                index,
+                magnitude,
+                bound,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn exact_integer(value: f64) -> Option<i64> {
+    (value.is_finite() && value.fract() == 0.0 && value.abs() <= MAX_EXACT_F64_INTEGER)
+        .then_some(value as i64)
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Inverse of `a` modulo `q`; callers guarantee `gcd(a, q) = 1`.
+fn mod_inverse(a: u32, q: u32) -> u32 {
+    let (mut old_r, mut r) = (i64::from(a), i64::from(q));
+    let (mut old_s, mut s) = (1i64, 0i64);
+    while r != 0 {
+        let quotient = old_r / r;
+        (old_r, r) = (r, old_r - quotient * r);
+        (old_s, s) = (s, old_s - quotient * s);
+    }
+    debug_assert_eq!(old_r, 1, "modulus not coprime");
+    old_s.rem_euclid(i64::from(q)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fourteen pairwise-coprime moduli <= 255; Q is about 2^111.
+    const MODULI: [u32; 14] = [
+        255, 254, 253, 251, 247, 241, 239, 233, 229, 227, 223, 211, 199, 197,
+    ];
+
+    fn profile(inner_dim: u64, bound: u64) -> OzakiIIProfile {
+        OzakiIIProfile {
+            version: 1,
+            moduli: MODULI.to_vec(),
+            inner_dim,
+            bound_x: bound,
+            bound_y: bound,
+            rounding: RoundingMode::NearestTiesToEven,
+        }
+    }
+
+    #[test]
+    fn residues_stay_in_the_int8_tile_domain() {
+        for q in MIN_MODULUS..=MAX_MODULUS {
+            for z in -600i64..600 {
+                let r = centered_residue(z, q);
+                assert!((INT8_MIN..=INT8_MAX).contains(&r), "q={q} z={z} r={r}");
+                assert_eq!((z - i64::from(r)).rem_euclid(i64::from(q)), 0);
+            }
+        }
+        assert_eq!(centered_residue(127, 255), 127);
+        assert_eq!(centered_residue(128, 255), -127);
+        assert_eq!(centered_residue(-1, 2), -1);
+    }
+
+    #[test]
+    fn split_residues_layout_is_residue_major() {
+        let out = split_residues(&[0.0, 300.0, -7.0], &[255, 11]);
+        assert_eq!(out, vec![0, 45, -7, 0, 3, 4]);
+    }
+
+    #[test]
+    fn moduli_must_be_pairwise_coprime_and_in_range() {
+        assert_eq!(try_split_residues(&[1.0], &[]), Err(SciVmError::NoModuli));
+        assert_eq!(
+            try_split_residues(&[1.0], &[6, 9]),
+            Err(SciVmError::ModuliNotCoprime(6, 9))
+        );
+        assert_eq!(
+            try_split_residues(&[1.0], &[256]),
+            Err(SciVmError::ModulusOutOfRange(256))
+        );
+        assert_eq!(
+            try_split_residues(&[1.0], &[1]),
+            Err(SciVmError::ModulusOutOfRange(1))
+        );
+        assert!(try_split_residues(&[1.0], &MODULI).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "not coprime")]
+    fn split_residues_panics_on_shared_factor() {
+        split_residues(&[1.0], &[10, 15]);
+    }
+
+    #[test]
+    fn operands_must_be_exact_integers() {
+        for bad in [0.5, f64::NAN, f64::INFINITY, 2.0 * MAX_EXACT_F64_INTEGER] {
+            assert!(matches!(
+                try_split_residues(&[1.0, bad], &[255]),
+                Err(SciVmError::NonIntegralOperand { index: 1, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn crt_round_trips_every_split() {
+        let values = [
+            0i64,
+            1,
+            -1,
+            123_456_789,
+            -987_654_321_012,
+            9_007_199_254_740_992,
+            -9_007_199_254_740_992,
+        ];
+        let operands: Vec<f64> = values.iter().map(|&v| v as f64).collect();
+        let residues = split_residues(&operands, &MODULI);
+        for (i, &expected) in values.iter().enumerate() {
+            let column: Vec<i64> = (0..MODULI.len())
+                .map(|j| i64::from(residues[j * values.len() + i]))
+                .collect();
+            assert_eq!(
+                crt_centered(&column, &MODULI).unwrap(),
+                i128::from(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn profile_rejects_insufficient_reconstruction_capacity() {
+        assert!(profile(1_000, 1 << 40).validate().is_ok());
+        let small = OzakiIIProfile {
+            moduli: vec![255, 254],
+            ..profile(1_000, 1 << 40)
+        };
+        assert!(matches!(
+            small.validate(),
+            Err(SciVmError::InsufficientReconstructionCapacity { .. })
+        ));
+        assert_eq!(
+            profile(0, 1).validate(),
+            Err(SciVmError::ZeroInnerDimension)
+        );
+        assert_eq!(CONSENSUS_WEIGHT, 0);
+    }
+
+    #[test]
+    fn exact_dot_product_through_residues_matches_integer_product() {
+        // K = 1,000 spans two native tiles (512 + 488); |x|, |y| < 2^40.
+        let k = 1_000usize;
+        let x: Vec<f64> = (0..k)
+            .map(|i| ((i as i64 * 7_919 - 3_000_000) * 131_071) as f64)
+            .collect();
+        let y: Vec<f64> = (0..k)
+            .map(|i| ((5_000_000 - i as i64 * 104_729) * 8_191) as f64)
+            .collect();
+        let expected: i128 = x.iter().zip(&y).map(|(&a, &b)| a as i128 * b as i128).sum();
+        let p = profile(k as u64, 1 << 40);
+        assert_eq!(p.exact_dot(&x, &y).unwrap(), expected);
+        assert!(matches!(
+            p.exact_dot(&x[..10], &y[..10]),
+            Err(SciVmError::LengthMismatch)
+        ));
+        let mut too_big = x.clone();
+        too_big[3] = (1u64 << 41) as f64;
+        assert!(matches!(
+            p.exact_dot(&too_big, &y),
+            Err(SciVmError::OperandOutOfBound { index: 3, .. })
+        ));
+    }
+}
+##### END FILE: scivm/src/lib.rs
 
 ################################################################################
 ##### BEGIN FILE: scheduler/Cargo.toml | 11 lines | sha256 9bc020dcc84a1dd5180b5af65f6c756638c3a39ff50e4ed29176fb98d2e9d974
@@ -225,6 +2920,362 @@ primitives = { path = "../primitives" }
 [lints]
 workspace = true
 ##### END FILE: scheduler/Cargo.toml
+
+################################################################################
+##### BEGIN FILE: scheduler/src/lib.rs | 335 lines | sha256 88c69749b2c6f1f2a67964f3990c6c8c980cafce01e9cd236504c3648180ecec
+################################################################################
+//! Module 4 — deterministic scheduler and sequential D'Hondt allocation.
+//!
+//! The unit of execution entitlement is a discrete, immutable ShareID of
+//! verified mature work — never an address (spec §6.1). Each slot goes to the
+//! eligible ShareID with the largest D'Hondt quotient `w_s / (a_s + 1)`, ties
+//! broken by the smallest ShareID (eq. 6.4). Quotients are compared exactly by
+//! cross-multiplication (eq. 6.5); no floating point is involved.
+//!
+//! Owner labels enter only through bonded capacity `K_i`. Without binding
+//! capacity, an entity's allocation is the sum over its ShareIDs and does not
+//! depend on how they are partitioned into owners or addresses: there is no
+//! aggregation premium (Theorem 6.3).
+//!
+//! **PoC status:** the normative weight `w_s = floor(2^640 / Θ_S(s))` (eq. 6.1)
+//! needs a 640-bit integer. The PoC narrows [`ShareWeight`] to `u64`, which
+//! keeps every cross-product `w_s (a_r + 1)` exact in `u128`.
+
+use core::fmt;
+use std::collections::{BTreeMap, BTreeSet};
+
+use primitives::DomainSeparatedHash;
+pub use primitives::ShareWeight;
+
+/// Beneficiary bound in the Fresh Work context; enters D'Hondt only via capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OwnerId(pub u64);
+
+/// A discrete unit of execution entitlement: one verified mature Fresh Work share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShareID {
+    /// `ShareID = WorkID`, a 64-byte digest compared as a canonical string.
+    pub id: DomainSeparatedHash,
+    /// Integer weight fixed by the consensus target of the parent block.
+    pub weight: ShareWeight,
+    /// Owner, used only to look up bonded lease capacity.
+    pub owner: OwnerId,
+}
+
+/// Concurrent-lease capacity `K_i^free` per owner for one batch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Capacity {
+    /// No binding capacity: every ShareID stays eligible.
+    #[default]
+    Unbounded,
+    /// Free capacity per owner; owners absent from the map have none.
+    PerOwner(BTreeMap<OwnerId, u64>),
+}
+
+/// Rejection reasons when forming a cohort.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchedulerError {
+    /// The same ShareID appears twice (identifiers are unique, eq. 7.23).
+    DuplicateShareId(DomainSeparatedHash),
+    /// A ShareID has zero weight; normative weights are at least `2^128`.
+    ZeroWeight(DomainSeparatedHash),
+}
+
+impl fmt::Display for SchedulerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SchedulerError::DuplicateShareId(id) => write!(f, "duplicate ShareID {id:?}"),
+            SchedulerError::ZeroWeight(id) => write!(f, "ShareID {id:?} has zero weight"),
+        }
+    }
+}
+
+impl std::error::Error for SchedulerError {}
+
+/// Result of one allocation batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Allocation {
+    /// `slots[t]` is the index (into the cohort's shares) of the ShareID that
+    /// receives slot `t`, in canonical lease order.
+    pub slots: Vec<usize>,
+    /// Slots each ShareID received in this batch, indexed like the shares.
+    pub per_share: Vec<u64>,
+}
+
+impl Allocation {
+    /// Number of slots assigned (less than requested only if capacity ran out).
+    pub fn assigned(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+/// A snapshot `S` of mature qualifying ShareIDs with persistent counters `a_s`.
+///
+/// Counters persist across the batches of a cohort, so allocating `N_1` then
+/// `N_2` slots without binding capacity equals allocating `N_1 + N_2` at once.
+#[derive(Clone, Debug)]
+pub struct Cohort {
+    shares: Vec<ShareID>,
+    counters: Vec<u64>,
+}
+
+impl Cohort {
+    /// Forms a cohort, rejecting duplicate ShareIDs and zero weights.
+    pub fn new(shares: Vec<ShareID>) -> Result<Self, SchedulerError> {
+        let mut seen = BTreeSet::new();
+        for share in &shares {
+            if share.weight == 0 {
+                return Err(SchedulerError::ZeroWeight(share.id));
+            }
+            if !seen.insert(share.id) {
+                return Err(SchedulerError::DuplicateShareId(share.id));
+            }
+        }
+        let counters = vec![0; shares.len()];
+        Ok(Cohort { shares, counters })
+    }
+
+    /// The cohort's ShareIDs, in input order.
+    pub fn shares(&self) -> &[ShareID] {
+        &self.shares
+    }
+
+    /// Cumulative slots `a_s` held by each ShareID in this cohort.
+    pub fn counters(&self) -> &[u64] {
+        &self.counters
+    }
+
+    /// Total weight `W = sum w_s`.
+    pub fn total_weight(&self) -> u128 {
+        self.shares.iter().map(|s| u128::from(s.weight)).sum()
+    }
+
+    /// Runs the sequential D'Hondt recursion (eq. 6.4) for up to `slots` steps.
+    ///
+    /// Each step assigns exactly one slot to `argmax w_s / (a_s + 1)` over the
+    /// eligible set `E_t = {s : K_owner(s) > 0}`, ties to the least ShareID,
+    /// then increments that ShareID's counter and decrements its owner's
+    /// capacity. The loop stops when `t = N` or `E_t` is empty.
+    pub fn allocate_batch(&mut self, slots: usize, capacity: &Capacity) -> Allocation {
+        let mut free: Option<BTreeMap<OwnerId, u64>> = match capacity {
+            Capacity::Unbounded => None,
+            Capacity::PerOwner(map) => Some(map.clone()),
+        };
+        let mut allocation = Allocation {
+            slots: Vec::with_capacity(slots),
+            per_share: vec![0; self.shares.len()],
+        };
+        while allocation.slots.len() < slots {
+            let eligible = |s: &ShareID| match &free {
+                None => true,
+                Some(map) => map.get(&s.owner).is_some_and(|&k| k > 0),
+            };
+            let Some(winner) = self.select(eligible) else {
+                break;
+            };
+            self.counters[winner] += 1;
+            allocation.per_share[winner] += 1;
+            allocation.slots.push(winner);
+            if let Some(map) = free.as_mut()
+                && let Some(k) = map.get_mut(&self.shares[winner].owner)
+            {
+                *k -= 1;
+            }
+        }
+        allocation
+    }
+
+    /// Index of the eligible ShareID with the largest quotient, ties to the least ID.
+    fn select(&self, eligible: impl Fn(&ShareID) -> bool) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (s, share) in self.shares.iter().enumerate() {
+            if !eligible(share) {
+                continue;
+            }
+            best = match best {
+                None => Some(s),
+                Some(b) => match self.compare_quotients(s, b) {
+                    core::cmp::Ordering::Greater => Some(s),
+                    core::cmp::Ordering::Less => Some(b),
+                    core::cmp::Ordering::Equal if share.id < self.shares[b].id => Some(s),
+                    core::cmp::Ordering::Equal => Some(b),
+                },
+            };
+        }
+        best
+    }
+
+    /// Exact comparison `w_s/(a_s+1)` vs `w_r/(a_r+1)` as `w_s (a_r+1)` vs `w_r (a_s+1)`.
+    fn compare_quotients(&self, s: usize, r: usize) -> core::cmp::Ordering {
+        let lhs = u128::from(self.shares[s].weight) * (u128::from(self.counters[r]) + 1);
+        let rhs = u128::from(self.shares[r].weight) * (u128::from(self.counters[s]) + 1);
+        lhs.cmp(&rhs)
+    }
+}
+
+/// Allocates `available_slots` to discrete ShareIDs by sequential D'Hondt,
+/// for a fresh cohort without binding capacity.
+///
+/// Quotients are `w_s / (a_s + 1)` and slots are assigned strictly to
+/// individual ShareIDs — never to owners — so splitting or merging holdings
+/// across addresses cannot change any entity's total (no aggregation premium).
+/// Every slot is assigned (Theorem 6.1).
+pub fn dhondt_allocation(
+    shares: &[ShareID],
+    available_slots: usize,
+) -> Result<Allocation, SchedulerError> {
+    Ok(Cohort::new(shares.to_vec())?.allocate_batch(available_slots, &Capacity::Unbounded))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn share(tag: u64, weight: ShareWeight, owner: u64) -> ShareID {
+        ShareID {
+            id: DomainSeparatedHash::new("TEST/SHARE/v2", &[&tag.to_be_bytes()]),
+            weight,
+            owner: OwnerId(owner),
+        }
+    }
+
+    #[test]
+    fn floor_quota_defect_is_avoided() {
+        // Nine equal sources and eight slots: every floor quota is zero
+        // (eq. 6.3), yet D'Hondt assigns all eight.
+        let shares: Vec<ShareID> = (0..9).map(|i| share(i, 1_000, i)).collect();
+        let alloc = dhondt_allocation(&shares, 8).unwrap();
+        assert_eq!(alloc.assigned(), 8);
+        assert_eq!(alloc.per_share.iter().sum::<u64>(), 8);
+        assert!(alloc.per_share.iter().all(|&a| a <= 1));
+        // Ties go to the least ShareIDs, so the largest one is left out.
+        let largest = (0..9).max_by_key(|&i| shares[i].id).unwrap();
+        assert_eq!(alloc.per_share[largest], 0);
+        let mut by_id: Vec<usize> = (0..9).collect();
+        by_id.sort_by_key(|&i| shares[i].id);
+        assert_eq!(alloc.slots, by_id[..8].to_vec());
+    }
+
+    #[test]
+    fn allocation_is_complete_and_within_proportionality_bounds() {
+        let weights = [97u64, 3, 41, 41, 250, 1, 13, 600];
+        let shares: Vec<ShareID> = weights
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| share(i as u64, w, 0))
+            .collect();
+        let total: u128 = weights.iter().map(|&w| u128::from(w)).sum();
+        for n in [1usize, 7, 50, 333, 1_046] {
+            let alloc = dhondt_allocation(&shares, n).unwrap();
+            assert_eq!(alloc.per_share.iter().sum::<u64>(), n as u64, "Theorem 6.1");
+            for (a, &w) in alloc.per_share.iter().zip(&weights) {
+                let (a, w, n, s) = (
+                    u128::from(*a),
+                    u128::from(w),
+                    n as u128,
+                    shares.len() as u128,
+                );
+                // floor(N w / W) <= a_s(N) <= (N + |S|) w / W   (eq. 6.8)
+                assert!(n * w / total <= a);
+                assert!(a * total <= (n + s) * w);
+            }
+        }
+    }
+
+    #[test]
+    fn no_aggregation_premium_without_binding_capacity() {
+        let weights = [500u64, 300, 200, 123, 77];
+        let separate: Vec<ShareID> = weights
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| share(i as u64, w, i as u64))
+            .collect();
+        // The same ShareIDs merged under one owner.
+        let merged: Vec<ShareID> = separate
+            .iter()
+            .map(|s| ShareID {
+                owner: OwnerId(42),
+                ..*s
+            })
+            .collect();
+        let a = dhondt_allocation(&separate, 64).unwrap();
+        let b = dhondt_allocation(&merged, 64).unwrap();
+        assert_eq!(a, b, "owner labels do not enter the allocation");
+        // Entity holding shares 0 and 3: its slots are just the sum over its ShareIDs.
+        assert_eq!(
+            a.per_share[0] + a.per_share[3],
+            b.per_share[0] + b.per_share[3]
+        );
+    }
+
+    #[test]
+    fn counters_persist_across_batches() {
+        let shares: Vec<ShareID> = [5u64, 3, 2]
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| share(i as u64, w, 0))
+            .collect();
+        let mut split = Cohort::new(shares.clone()).unwrap();
+        let first = split.allocate_batch(4, &Capacity::Unbounded);
+        let second = split.allocate_batch(6, &Capacity::Unbounded);
+        let whole = Cohort::new(shares)
+            .unwrap()
+            .allocate_batch(10, &Capacity::Unbounded);
+        let joined: Vec<usize> = first.slots.iter().chain(&second.slots).copied().collect();
+        assert_eq!(joined, whole.slots);
+        assert_eq!(split.counters(), &[5, 3, 2]);
+    }
+
+    #[test]
+    fn binding_capacity_redirects_slots_and_can_exhaust() {
+        let shares = vec![share(0, 1_000, 1), share(1, 10, 2), share(2, 10, 3)];
+        let mut cohort = Cohort::new(shares).unwrap();
+        let capacity = Capacity::PerOwner(BTreeMap::from([(OwnerId(1), 2), (OwnerId(2), 1)]));
+        let alloc = cohort.allocate_batch(10, &capacity);
+        // Owner 1 is capped at two leases; owner 3 has no bonded capacity.
+        assert_eq!(alloc.per_share, vec![2, 1, 0]);
+        assert_eq!(alloc.assigned(), 3, "stops when the eligible set is empty");
+    }
+
+    #[test]
+    fn exact_comparison_does_not_overflow() {
+        let shares = vec![share(0, u64::MAX, 0), share(1, u64::MAX - 1, 0)];
+        let alloc = dhondt_allocation(&shares, 4).unwrap();
+        assert_eq!(alloc.slots, vec![0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn cohort_rejects_duplicates_and_zero_weight() {
+        let s = share(7, 10, 0);
+        assert_eq!(
+            dhondt_allocation(&[s, s], 1),
+            Err(SchedulerError::DuplicateShareId(s.id))
+        );
+        let z = share(8, 0, 0);
+        assert_eq!(
+            dhondt_allocation(&[z], 1),
+            Err(SchedulerError::ZeroWeight(z.id))
+        );
+        assert_eq!(dhondt_allocation(&[], 5).unwrap().assigned(), 0);
+    }
+}
+##### END FILE: scheduler/src/lib.rs
+
+################################################################################
+##### BEGIN FILE: ledger/Cargo.toml | 11 lines | sha256 9ceb5af43ddb447cd5961932125163e4eea86a731fbddd96d4dba9eaa8e59169
+################################################################################
+[package]
+name = "ledger"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Module 5: eight-category supply-conserving state, founder vesting and fee lots"
+
+[dependencies]
+primitives = { path = "../primitives" }
+
+[lints]
+workspace = true
+##### END FILE: ledger/Cargo.toml
 
 ################################################################################
 ##### BEGIN FILE: ledger/src/lib.rs | 1193 lines | sha256 fb6c260bdbe36066b7515b05752651760f0360ea0a6eea296b2a677d9eb744bc
@@ -1423,6 +4474,26 @@ mod tests {
     }
 }
 ##### END FILE: ledger/src/lib.rs
+
+################################################################################
+##### BEGIN FILE: poc/Cargo.toml | 15 lines | sha256 3ca9fae7abbf0b49160c37901ae153b6d0b7410e00cfcc540dbc70694112ec53
+################################################################################
+[package]
+name = "poc"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium proof-of-concept: one mock block transition across all five protocol modules"
+
+[dependencies]
+primitives = { path = "../primitives" }
+work = { path = "../work" }
+scivm = { path = "../scivm" }
+scheduler = { path = "../scheduler" }
+ledger = { path = "../ledger" }
+
+[lints]
+workspace = true
+##### END FILE: poc/Cargo.toml
 
 ################################################################################
 ##### BEGIN FILE: poc/src/main.rs | 485 lines | sha256 a1d6ea45bff876c17ee54ccd1df9f667219dcfd074fb8e99c92b3ee7636cafe2

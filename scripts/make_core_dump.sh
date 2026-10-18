@@ -2,11 +2,13 @@
 # Rebuilds plauthium_core_dump.txt from a local plauthium-workspace checkout.
 #
 #   scripts/make_core_dump.sh <workspace-root> [output-file]
+#   CRATES="primitives work" scripts/make_core_dump.sh <workspace-root> [output-file]
 #
 # Emits the workspace files (Cargo.toml, Cargo.lock, .gitignore) and, for every
-# local crate listed in Cargo.lock, its Cargo.toml and every .rs file under
-# src/ (lib.rs and main.rs first). Expected files that do not exist are listed
-# in the manifest as MISSING, so a partial checkout is visible at a glance.
+# local crate listed in Cargo.lock (or only those named in $CRATES), its
+# Cargo.toml and every .rs file under src/ (lib.rs and main.rs first). Expected
+# files that do not exist are listed in the manifest as MISSING, so a partial
+# checkout is visible at a glance.
 set -euo pipefail
 
 root=${1:?usage: make_core_dump.sh <workspace-root> [output-file]}
@@ -38,6 +40,9 @@ crate_dir() {
 }
 
 all=$(local_crates)
+if [ -n "${CRATES:-}" ]; then
+  all=$(for c in $CRATES; do echo "$c"; done)
+fi
 crates=""
 for c in $preferred; do
   if echo "$all" | grep -qx "$c"; then crates="$crates $c"; fi

@@ -1,6 +1,6 @@
 # Plauthium Testnet Blueprint: multi-node P2P testnet / MVP
 
-Version 0.1 · 2026-10-18 · Normative specification for code generation
+Version 0.1.1 · 2026-10-18 · Normative specification for code generation (implementation errata: Appendix C)
 
 **Inputs**
 
@@ -15,13 +15,14 @@ Version 0.1 · 2026-10-18 · Normative specification for code generation
 
 ### 0.1 State of the inputs
 
-The `plauthium_core_dump.txt` committed next to this file is **partial**: it holds 5 of the 15 expected files (`ledger/src/lib.rs`, `poc/src/main.rs`, `scheduler/Cargo.toml`, `Cargo.lock`, `.gitignore`). Before you hand the dump to the generator, regenerate it from the real workspace:
+`plauthium_core_dump.txt` holds the complete core: all 15 workspace and crate files (`Cargo.toml` and sources of the six core crates, the root `Cargo.toml`, `Cargo.lock` and `.gitignore`), with a sha256 per file. The core itself lives in `plauthium-workspace/` next to this file, together with the testnet crates built from this blueprint. To regenerate the dump:
 
 ```sh
-scripts/make_core_dump.sh /path/to/plauthium-workspace plauthium_core_dump.txt
+CRATES="primitives work scivm scheduler ledger poc" \
+  scripts/make_core_dump.sh plauthium-workspace plauthium_core_dump.txt
 ```
 
-Section 13 lists every core item this specification uses. Each item is marked *confirmed* (visible in dumped source), *observed* (visible only at a PoC call site) or *required* (must exist; see the adapter rules in §13.2).
+Section 13 lists every core item this specification uses. Each item is marked *confirmed* (visible in dumped source), *observed* (visible only at a PoC call site, as written for v0.1) or *required* (must exist; see the adapter rules in §13.2). With the complete core available, every observed item has since been confirmed against the source (Appendix C).
 
 ### 0.2 Normative language
 
@@ -320,7 +321,7 @@ impl Serialize for Digest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WireMessage {
     /* 0 */ Handshake { version: u32, chain_id: u64, best_height: u64, best_block_id: Digest },
-    /* 1 */ GossipBlock(Block),
+    /* 1 */ GossipBlock(Box<Block>),   // boxed in memory only; serde encodes Box<Block> exactly like Block
     /* 2 */ GossipJob(JobTransaction),
     /* 3 */ SyncRequest { from_height: u64 },
     /* 4 */ SyncResponse { blocks: Vec<Block> },
@@ -333,7 +334,7 @@ pub enum WireMessage {
 | `GossipBlock` | a block was accepted locally (mined or relayed) | import it (§8.3). On `Accepted`, relay to all peers except the sender. |
 | `GossipJob` | the mempool accepted a job (RPC or relayed) | insert it into the mempool. On `Ok`, relay to all peers except the sender. |
 | `SyncRequest` | sync driver (§4.7) | reply with `SyncResponse` holding the responder's canonical blocks from `from_height`, ascending and contiguous, at most `MAX_SYNC_BLOCKS`. Stop adding blocks once the encoded size would pass `MAX_SYNC_BYTES` (always at least 1 block). Reply with empty `blocks` if `from_height > tip`, or if `from_height == 0` (genesis is not a block). |
-| `SyncResponse` | answer to `SyncRequest` | import the blocks in order (§4.7). An unsolicited response is a protocol violation. |
+| `SyncResponse` | answer to `SyncRequest` | import the blocks in order (§4.7). A response with no outstanding request is ignored: it may be the late answer to a request that timed out. |
 
 `best_block_id` is the tip's `block_id`, or `genesis_id` at height 0. `best_height` is only a sync hint: fork choice uses weight, never height.
 
@@ -350,6 +351,7 @@ pub enum WireMessage {
 
 * Keep LRU sets of seen `block_id`s (8 192) and `tx_id`s (16 384). Ignore a message whose id was seen recently and do not relay it.
 * Relay only after a positive local result: `ChainEvent::BlockAccepted` for blocks (main chain or side chain), and `MempoolEvent::Accepted` for jobs.
+* Do not relay accepted blocks more than `2 · SYNC_LOOKBACK` below the tip. A node that is syncing would otherwise re-gossip its whole backlog; peers that need old blocks fetch them with `SyncRequest`.
 * An `Orphan` result (unknown parent) is not a fault. Keep the block in the orphan pool and start a sync with the sender.
 
 ### 4.7 Sync algorithm (per peer, at most one outstanding request)
@@ -384,11 +386,14 @@ A block whose parent is *pending* (in Stage A, deferred, or itself parked) is ac
 
 | Event | Action |
 |---|---|
-| Decode error, trailing bytes, oversize frame, unexpected `Handshake` or `SyncResponse` | close, ban the address for 60 s |
+| Undecodable frame, trailing bytes, oversize frame, a first frame that is not a `Handshake`, or a second `Handshake` | close, ban for 60 s |
+| I/O error, connection reset, EOF, or no `Handshake` within `HANDSHAKE_TIMEOUT` | close (no ban: these are not misbehaviour) |
 | `version` or `chain_id` mismatch | close (no ban) |
 | Invalid block (any §6.8 failure other than Duplicate, Orphan, Queued, Deferred or TooDeep) | close, ban for 600 s |
 | Invalid job (mempool rejects it as `Invalid`, not `Duplicate`/`Full`) | count it; at 10 per peer, close and ban for 600 s |
 | More than 10 `SyncRequest` per second from one peer | drop the excess requests |
+
+Bans are keyed by IP address, except for loopback peers, which are keyed by full socket address. On a localhost testnet every peer shares 127.0.0.1, so an IP ban would cut a node off from all the other local nodes.
 
 A genesis mismatch shows up as a permanent Orphan at height 1. If the parent of the peer's block at height 1 is not our `genesis_id`, close the connection with the log reason `genesis mismatch`.
 
@@ -1140,7 +1145,7 @@ Logging uses `tracing` with `RUST_LOG=info` by default. Every accepted block log
 `scripts/local_testnet.sh` (generated):
 
 1. `cargo build --release -p node`.
-2. `plauthium-node genesis --out target/testnet/genesis.json --seal-attempts 16 --target-block-secs 5 --blocks-per-epoch 12`.
+2. `plauthium-node genesis --out target/testnet/genesis.json --seal-attempts 128 --target-block-secs 5 --blocks-per-epoch 12`.
 3. Start three nodes: owners 1–3, P2P ports 30331–30333, RPC ports 8081–8083, full mesh through `--peer`, and data dirs under `target/testnet/n{1,2,3}`.
 4. Print the three dashboard URLs. Ctrl-C stops all three nodes.
 
@@ -1158,12 +1163,12 @@ Logging uses `tracing` with `RUST_LOG=info` by default. Every accepted block log
 6. Fork choice: the heavier branch wins, a tie keeps the tip, and a reorg yields correct `connected`/`disconnected` sets. A reorg deeper than `MAX_REORG_DEPTH` is rejected.
 7. Share rules: outside the window, duplicate `work_id`, wrong owner digest, or wrong `share_target` → invalid.
 
-**Integration test (`node`, `#[tokio::test(flavor = "multi_thread")]`, release profile):** three in-process nodes on 127.0.0.1 with ephemeral ports, with genesis `seal_attempts = 2`, `share_ratio = 2`, `Fixed`, `blocks_per_epoch = 5` and `settle_delay = 1`.
+**Integration test (`node`, `#[tokio::test(flavor = "multi_thread")]`, release profile):** three in-process nodes on 127.0.0.1 with ephemeral ports, with genesis `seal_attempts = 64`, `share_ratio = 2`, `Fixed`, `blocks_per_epoch = 5` and `settle_delay = 1`. With these values one block takes about 1.5 s with three miners, and a foreign block costs about three tile recomputes to verify, so validation keeps up with production (Appendix C, item 1).
 
 | # | Acceptance criterion |
 |---|---|
 | A1 | `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace --release` are green, and the existing core tests are unchanged. |
-| A2 | Every node reaches height ≥ 15. After `set_enabled(false)` on all engines, all tips become identical within 30 s, and the 8 balances are identical. |
+| A2 | Every node reaches height ≥ 15. After `set_enabled(false)` on all engines, all tips become identical and the 8 balances are identical. With mining stopped, two equal-weight tips both survive (a tie keeps the current tip, §6.5), so the test breaks a tie by letting one node mine one more block. |
 | A3 | A job submitted to node 1 after height 10 appears admitted and then settled on node 3. Its `result` equals a direct `i128` dot product. Every block's `total_after == M`. |
 | A4 | Node 3 is stopped, 10 blocks are mined, and node 3 is restarted on the same data dir: it replays `blocks.log` and syncs to the tip. |
 | A5 | Partition {1} and {2, 3}, mine on both sides, then reconnect: all nodes converge on the heavier branch, and the losing branch's jobs return to the mempool. |
@@ -1300,3 +1305,25 @@ Encoded sizes, from the §4–§5 types compiled verbatim:
 * `ShareProof`: 848 bytes.
 
 A full block (32 jobs, 16 shares, plus their leases, receipts and fee transitions) is therefore about 300 KiB, well under `max_block_bytes`.
+
+## Appendix C: Implementation notes (v0.1.1)
+
+These are corrections and refinements found while implementing and testing v0.1 against the real core crates.
+
+1. **Integration-test difficulty.** v0.1 specified `seal_attempts = 2`, `share_ratio = 2`. That makes almost every attempt a share. Three nodes would then produce about 10 blocks per second each, while every foreign block costs up to 17 tile recomputes to verify (one attempt is about 60 ms on one core). Validation could never catch up. The tested values are `seal_attempts = 64`, `share_ratio = 2` (§11).
+2. **`GossipBlock(Box<Block>)` and boxed `ChainCmd::SubmitLocalBlock` / `SubmitLocalShare`.** These keep the enums small in memory (clippy `large_enum_variant`). serde encodes `Box<T>` exactly like `T`, so the wire bytes and the Appendix B vectors are unchanged.
+3. **Ban policy (§4.8).** Connection resets, EOF and handshake timeouts are not misbehaviour and are not banned. Loopback peers are banned by socket address, not IP. A `SyncResponse` without an outstanding request is ignored rather than banned.
+4. **Relay depth (§4.6).** Accepted blocks more than 16 below the tip are not relayed.
+5. **Ties after mining stops (§6.5, §11 A2).** The tie rule is unchanged. Convergence tests break ties with one extra block.
+6. **Core adapter (§13.2 A1).** `DomainSeparatedHash::from_bytes` and `as_bytes` already existed. `to_bytes` (by value) was added on request; it is the only core change.
+7. **`node` is a library plus a binary.** Integration tests can only import a library, so `start_node`, `NodeHandle` and the actor modules live in `node/src/lib.rs`, and `src/main.rs` is the CLI. `NodeHandle::stop` signals shutdown and awaits the ChainState and mempool actors. The ChainState actor flushes and syncs `blocks.log` on exit.
+8. **`build_template` returns `Result`.** If even an empty body cannot be derived, the ChainState actor keeps the previous template and logs the error instead of panicking. Identical templates are not republished, so miners never repeat nonces on unchanged work.
+9. **Miner seal handoff (§8.5).** After sealing, a miner waits up to 2 s for the template built on its block, then keeps mining the old one. Its block may have lost a tie.
+10. **Status reads (§9.3).** `/api/status` reads the mempool size from `watch<MempoolView>`, so it makes no actor round trip.
+11. **§13.1 checked against the full core.** Every *observed* item exists with the expected shape. The §13.3 checks resolved as follows:
+    * `FreshWorkContext.chain_id` is `u64`, while `protocol_version`, `crypto_suite_id` and `generator_version` are `u32` (so `TryFrom` is needed only for those three).
+    * `DomainSeparatedHash` is exactly 64 bytes.
+    * `dhondt_allocation` returns `Allocation { slots: Vec<usize>, per_share: Vec<u64> }`. `slots[i]` indexes the input slice; ties go to the least ShareID; an empty input returns zero slots; zero weights and duplicate ShareIDs are errors.
+    * `Atoms::from_plau` multiplies by 10^8.
+    * `instance()` and `product()` take `&self`.
+    * `OzakiIIProfile` has `version: u32`, `moduli: Vec<u32>`, `inner_dim: u64` and `bound_x`/`bound_y: u64`. `CONSENSUS_WEIGHT` is a `u64`.

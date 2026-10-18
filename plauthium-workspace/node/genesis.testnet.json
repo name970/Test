@@ -1,0 +1,26 @@
+{
+  "name": "plauthium-testnet-0",
+  "chain_id": 1347174740,
+  "genesis_time_bucket": 1792281600,
+  "time_bucket_secs": 1,
+  "target_block_secs": 10,
+  "initial_seal_target": "0x07ffffffffffffffffffffffffffffff",
+  "share_ratio": 4,
+  "difficulty": {
+    "Windowed": {
+      "window": 32
+    }
+  },
+  "blocks_per_epoch": 30,
+  "maturation_delay": 2,
+  "emission_numerator": 1,
+  "emission_denominator": 1000,
+  "anchor_depth": 6,
+  "settle_delay": 2,
+  "share_maturity_depth": 3,
+  "snapshot_window": 60,
+  "share_inclusion_window": 30,
+  "max_jobs_per_block": 32,
+  "max_shares_per_block": 16,
+  "max_block_bytes": 1048576
+}

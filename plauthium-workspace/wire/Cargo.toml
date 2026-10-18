@@ -1,0 +1,15 @@
+[package]
+name = "wire"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Testnet wire protocol, deterministic bincode codec, and normative data structures"
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

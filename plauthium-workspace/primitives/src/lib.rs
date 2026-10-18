@@ -246,6 +246,11 @@ impl DomainSeparatedHash {
         &self.0
     }
 
+    /// The digest bytes by value; inverse of [`DomainSeparatedHash::from_bytes`].
+    pub const fn to_bytes(&self) -> [u8; DIGEST_LEN] {
+        self.0
+    }
+
     /// Full lowercase hex encoding (128 characters).
     pub fn to_hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()

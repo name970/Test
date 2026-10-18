@@ -1,0 +1,16 @@
+[package]
+name = "chain"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Testnet synchronous chain logic: genesis, STF, VerifyFW, difficulty, and BlockTree"
+
+[dependencies]
+primitives = { workspace = true }
+work = { workspace = true }
+scivm = { workspace = true }
+scheduler = { workspace = true }
+ledger = { workspace = true }
+wire = { workspace = true }
+
+[lints]
+workspace = true
