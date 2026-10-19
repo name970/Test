@@ -13603,6 +13603,9 @@ for i in 1 2 3; do
   STARTED=$((STARTED + 1))
 done
 
+# A node exits with status 0 only after a graceful shutdown (Ctrl-C or kill), so that
+# stops the testnet quietly; any other status is a failure.
+NODE_EXIT=1
 nodes_alive() {
   local n=0 pid status
   for pid in "${PIDS[@]}"; do
@@ -13610,13 +13613,18 @@ nodes_alive() {
     if ! kill -0 "$pid" 2>/dev/null; then
       status=0
       wait "$pid" 2>/dev/null || status=$?
-      echo "error: node $n exited (status $status); see its log lines above" >&2
+      if [ "$status" = 0 ]; then
+        echo "Node $n stopped."
+        NODE_EXIT=0
+      else
+        echo "error: node $n exited (status $status); see its log lines above" >&2
+      fi
       return 1
     fi
   done
 }
 sleep 2
-nodes_alive || exit 1
+nodes_alive || exit "$NODE_EXIT"
 
 echo "============================================================"
 echo "Plauthium 3-node local testnet running:"
@@ -13629,7 +13637,7 @@ echo "============================================================"
 while nodes_alive; do
   sleep 1
 done
-exit 1
+exit "$NODE_EXIT"
 }
 
 main "$@"
