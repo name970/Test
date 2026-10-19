@@ -6,54 +6,80 @@
 #   scripts/make_all_in_one.sh [revision] [output-file]     # defaults: HEAD, plauthium_all_in_one.sh
 #
 # Files are read from git at <revision>, so the script reproduces that commit byte for
-# byte. The generator refuses any file the heredoc encoding cannot carry exactly: a line
-# that equals the delimiter, a missing final newline, or a path that needs quoting.
+# byte. The generator refuses anything the heredoc encoding cannot carry exactly: entries
+# other than regular or executable files, NUL or CR bytes, a missing final newline, a line
+# that equals the delimiter, and paths that would need quoting.
 set -euo pipefail
+export LC_ALL=C
+
+out=${2:-plauthium_all_in_one.sh}
+case $out in /*) ;; *) out=$PWD/$out ;; esac
 cd "$(git rev-parse --show-toplevel)"
 
-rev=${1:-HEAD}
-out=${2:-plauthium_all_in_one.sh}
+rev=$(git rev-parse --verify "${1:-HEAD}^{commit}")
+commit=${rev:0:7}
 ws=plauthium-workspace
 delim=EOF
-commit=$(git rev-parse --short "$rev^{commit}")
-branch=$(git rev-parse --abbrev-ref HEAD)
+if git merge-base --is-ancestor "$rev" HEAD && branch=$(git symbolic-ref --short -q HEAD); then
+  source_label="branch $branch, commit $commit"
+else
+  source_label="commit $commit"
+fi
+
+die() { echo "error: $*" >&2; exit 1; }
 
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
   else shasum -a 256 | cut -d' ' -f1; fi
 }
 
-files=$(git ls-tree -r --name-only "$rev" -- "$ws/" | sed "s|^$ws/||" | LC_ALL=C sort)
-[ -n "$files" ] || { echo "error: no files under $ws/ at $rev" >&2; exit 1; }
-
-count=0
+files=()
+execs=()
 bytes=0
-for f in $files; do
-  case "$f" in *[!A-Za-z0-9._/-]*) echo "error: path needs quoting: $f" >&2; exit 1 ;; esac
-  content=$(git show "$rev:$ws/$f"; echo x)
+while IFS= read -r -d '' entry; do
+  path=${entry#*$'\t'}
+  read -r mode type _ <<< "${entry%%$'\t'*}"
+  f=${path#"$ws/"}
+  [ "$type" = blob ] || die "unsupported entry ($mode $type): $path"
+  case $mode in
+    100644) ;;
+    100755) execs+=("$f") ;;
+    *) die "unsupported file mode $mode: $path" ;;
+  esac
+  case $f in *[!A-Za-z0-9._/-]*) die "path needs quoting: $path" ;; esac
+  case /$f in */-*) die "path component starts with '-': $path" ;; esac
+  size=$(git cat-file -s "$rev:$path")
+  [ "$(git cat-file blob "$rev:$path" | tr -cd '\000' | wc -c | tr -d ' ')" = 0 ] ||
+    die "$path contains NUL bytes (binary files are not supported)"
+  content=$(git cat-file blob "$rev:$path"; echo x)
   content=${content%x}
-  [ "${content: -1}" = $'\n' ] || { echo "error: $f does not end with a newline" >&2; exit 1; }
-  if printf '%s' "$content" | grep -qx "$delim"; then
-    echo "error: $f contains a line equal to $delim" >&2; exit 1
+  [ "${#content}" = "$size" ] || die "$path: read ${#content} of $size bytes"
+  case $content in *$'\r'*) die "$path contains a CR byte" ;; esac
+  if [ -n "$content" ]; then
+    [ "${content: -1}" = $'\n' ] || die "$path does not end with a newline"
+    case $'\n'$content in *$'\n'"$delim"$'\n'*) die "$path contains a line equal to $delim" ;; esac
   fi
-  count=$((count + 1))
-  bytes=$((bytes + $(git cat-file -s "$rev:$ws/$f")))
-done
-
-dirs=$(for f in $files; do d=$(dirname "$f"); [ "$d" = . ] || echo "$d"; done | LC_ALL=C sort -u)
-execs=$(git ls-tree -r "$rev" -- "$ws/" | awk '$1 == "100755" { print $4 }' | sed "s|^$ws/||")
+  files+=("$f")
+  bytes=$((bytes + size))
+done < <(git ls-tree -r -z "$rev" -- "$ws/")
+count=${#files[@]}
+[ "$count" -gt 0 ] || die "no files under $ws/ at $rev"
+dirs=$(printf '%s\n' "${files[@]}" | sed -n 's|/[^/]*$||p' | sort -u)
 
 {
   cat <<HEADER
 #!/usr/bin/env bash
+if grep -q "\$(printf '\\r')" "\$0" 2>/dev/null; then printf '%s\\n' "note: converting Windows (CRLF) line endings into \$0.lf" >&2; tr -d '\\r' < "\$0" > "\$0.lf" && exec bash "\$0.lf" "\$@"; exit 1; fi #
+if [ -z "\${BASH_VERSION:-}" ]; then exec bash "\$0" "\$@"; fi #
+#
 # plauthium_all_in_one.sh: the complete Plauthium workspace in one self-extracting script.
 #
 # Contents: the frozen mathematical core (primitives, work, scivm, scheduler, ledger, poc),
 # the testnet crates (wire, chain, node), the embedded explorer (node/static/index.html),
 # the default genesis (node/genesis.testnet.json), all tests, Cargo.lock and the scripts.
-# Source: branch $branch, commit $commit ($count files, $bytes bytes).
+# Source: $source_label ($count files, $bytes bytes).
 #
-# Usage:
+# Usage (save this text as plauthium_all_in_one.sh, then run it with bash):
 #   bash plauthium_all_in_one.sh                       # write ./plauthium-workspace, build, start testnet
 #   bash plauthium_all_in_one.sh DIR                   # same, into DIR
 #   bash plauthium_all_in_one.sh --extract-only [DIR]  # only write and check the files
@@ -65,19 +91,32 @@ execs=$(git ls-tree -r "$rev" -- "$ws/" | awk '$1 == "100755" { print $4 }' | se
 # http://127.0.0.1:808i/ and keeps its data in DIR/target/testnet/ni. Ctrl-C stops all three.
 #
 # Generated by scripts/make_all_in_one.sh; do not edit by hand.
-if [ -z "\${BASH_VERSION:-}" ]; then exec bash "\$0" "\$@"; fi
 set -euo pipefail
 
 # Everything runs inside main(), which is called on the last line. Bash parses the whole
 # function before running any of it, so a truncated copy fails with a syntax error
 # instead of writing half the files.
 main() {
+unset CDPATH
 EXTRACT_ONLY=0
-if [ "\${1:-}" = "--extract-only" ]; then
-  EXTRACT_ONLY=1
+ROOT=
+while [ \$# -gt 0 ]; do
+  case \$1 in
+    --extract-only) EXTRACT_ONLY=1 ;;
+    -h|--help)
+      echo "Usage: bash plauthium_all_in_one.sh [--extract-only] [DIR]"
+      echo "Writes the Plauthium workspace into DIR (default: ./plauthium-workspace), builds"
+      echo "plauthium-node and starts a 3-node local testnet. --extract-only stops after the files."
+      exit 0 ;;
+    -*) echo "error: unknown option: \$1 (try --help)" >&2; exit 2 ;;
+    *)
+      [ -z "\$ROOT" ] || { echo "error: only one DIR may be given" >&2; exit 2; }
+      ROOT=\$1 ;;
+  esac
   shift
-fi
-ROOT=\${1:-plauthium-workspace}
+done
+ROOT=\${ROOT:-plauthium-workspace}
+case \$ROOT in /*) ;; *) ROOT=./\$ROOT ;; esac
 
 mkdir -p "\$ROOT"
 cd "\$ROOT"
@@ -86,55 +125,107 @@ echo "Writing $count files to \$(pwd)"
 HEADER
   for d in $dirs; do echo "mkdir -p $d"; done
   echo
-  for f in $files; do
+  for f in "${files[@]}"; do
     echo "cat << '$delim' > $f"
-    git show "$rev:$ws/$f"
+    git cat-file blob "$rev:$ws/$f"
     echo "$delim"
     echo
   done
-  for f in $execs; do echo "chmod +x $f"; done
-  echo
-  echo "# SHA-256 of every file at commit $commit; catches a truncated or altered copy of this script."
-  echo "SUMS=\$(cat << '$delim'"
-  for f in $files; do echo "$(git show "$rev:$ws/$f" | sha256)  $f"; done
-  echo "$delim"
-  echo ")"
-  cat <<'FOOTER'
-if command -v sha256sum >/dev/null 2>&1; then
-  echo "$SUMS" | sha256sum -c --quiet || { echo "error: file checksums do not match" >&2; exit 1; }
-elif command -v shasum >/dev/null 2>&1; then
-  echo "$SUMS" | shasum -a 256 -c --quiet || { echo "error: file checksums do not match" >&2; exit 1; }
-else
-  echo "note: no sha256sum or shasum found; skipping the checksum check"
-fi
-FOOTER
-  echo "echo \"All $count files written and verified.\""
+  for f in ${execs[@]+"${execs[@]}"}; do echo "chmod +x $f"; done
   cat <<'FOOTER'
 
+# ---------------------------------------------------------------------------------------
+# Check every file against its SHA-256 (catches a truncated or altered copy of this script)
+# ---------------------------------------------------------------------------------------
+sha256_stdin() {
+  case $1 in
+    sha256sum) sha256sum ;;
+    shasum) shasum -a 256 ;;
+    openssl) openssl dgst -sha256 -r ;;
+  esac | cut -d' ' -f1
+}
+hash_tool=
+for tool in sha256sum shasum openssl; do
+  if command -v "$tool" >/dev/null 2>&1 &&
+    [ "$(printf abc | sha256_stdin "$tool" 2>/dev/null)" = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad ]; then
+    hash_tool=$tool
+    break
+  fi
+done
+if [ -z "$hash_tool" ]; then
+  echo "note: no working SHA-256 tool (sha256sum, shasum or openssl) found; files written but not checked"
+else
+  bad=0
+  while read -r sum f; do
+    if [ "$(sha256_stdin "$hash_tool" < "$f")" != "$sum" ]; then
+      echo "error: $f does not match its checksum" >&2
+      bad=1
+    fi
+FOOTER
+  echo "  done << '$delim'"
+  for f in "${files[@]}"; do echo "$(git cat-file blob "$rev:$ws/$f" | sha256)  $f"; done
+  echo "$delim"
+  cat <<'FOOTER'
+  if [ "$bad" = 1 ]; then
+    echo "error: this copy of plauthium_all_in_one.sh is incomplete or altered; download it again" >&2
+    exit 1
+  fi
+FOOTER
+  echo "  echo \"All $count files written and verified ($commit).\""
+  cat <<'FOOTER'
+fi
+
 if [ "$EXTRACT_ONLY" = 1 ]; then
-  echo "Done (--extract-only). To build and start the testnet: cd $(pwd) && scripts/local_testnet.sh"
+  printf 'Done (--extract-only). To build and start the testnet: cd %q && scripts/local_testnet.sh\n' "$(pwd)"
   exit 0
 fi
 
+# ---------------------------------------------------------------------------------------
+# Rust toolchain
+# ---------------------------------------------------------------------------------------
+if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
 command -v cargo >/dev/null 2>&1 || {
-  echo "error: cargo not found. Install Rust 1.88+ from https://rustup.rs and re-run this script." >&2
+  echo "error: cargo not found. Install Rust 1.88 or newer from https://rustup.rs, then run this script again." >&2
   exit 1
 }
+rust_version=$(rustc --version 2>/dev/null | cut -d' ' -f2) || rust_version=
+case $rust_version in
+  [0-9]*.[0-9]*)
+    rust_major=${rust_version%%.*}
+    rust_minor=${rust_version#*.}
+    rust_minor=${rust_minor%%.*}
+    if [ "$rust_major" -lt 1 ] || { [ "$rust_major" -eq 1 ] && [ "$rust_minor" -lt 88 ]; }; then
+      echo "error: Rust 1.88 or newer is required (found $rust_version). Run: rustup update stable" >&2
+      exit 1
+    fi ;;
+  *) echo "note: could not read the Rust version; continuing (Rust 1.88 or newer is required)" ;;
+esac
 
 # ---------------------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------------------
+export CARGO_TARGET_DIR="$PWD/target"
 echo "Building plauthium-node (release)..."
 cargo build --release -p node
 
 # ---------------------------------------------------------------------------------------
-# Start the 3-node local testnet (the same steps as scripts/local_testnet.sh)
+# Start the 3-node local testnet (the same nodes as scripts/local_testnet.sh)
 # ---------------------------------------------------------------------------------------
 BIN="./target/release/plauthium-node"
 TESTNET_DIR="./target/testnet"
 GENESIS_FILE="$TESTNET_DIR/genesis.json"
-mkdir -p "$TESTNET_DIR"
 
+# A testnet that is already running would lose its data to --reset, so refuse to start.
+for port in 30331 30332 30333 8081 8082 8083; do
+  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    echo "error: 127.0.0.1:$port is already in use (is a testnet from an earlier run still running?)" >&2
+    exit 1
+  fi
+done
+
+mkdir -p "$TESTNET_DIR"
 "$BIN" genesis \
   --out "$GENESIS_FILE" \
   --seal-attempts 128 \
@@ -142,16 +233,38 @@ mkdir -p "$TESTNET_DIR"
   --blocks-per-epoch 12
 
 PIDS=()
-cleanup() {
-  trap - INT TERM EXIT
-  echo
-  echo "Stopping local testnet nodes..."
+STARTED=0
+stop_nodes() {
+  local pid alive _
   for pid in ${PIDS[@]+"${PIDS[@]}"}; do
     kill -INT "$pid" 2>/dev/null || true
   done
+  # Give the nodes up to 10 s to flush their block logs, then terminate any that remain.
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    alive=0
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+      if kill -0 "$pid" 2>/dev/null; then alive=1; fi
+    done
+    [ "$alive" = 1 ] || break
+    sleep 0.5
+  done
+  for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
   wait 2>/dev/null || true
 }
-trap cleanup INT TERM EXIT
+cleanup() {
+  trap - INT TERM EXIT
+  if [ "$STARTED" -gt 0 ]; then
+    echo || true
+    echo "Stopping local testnet nodes..." || true
+    stop_nodes
+  fi
+  exit "$1"
+}
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+trap 'cleanup $?' EXIT
 
 for i in 1 2 3; do
   peers=()
@@ -170,7 +283,23 @@ for i in 1 2 3; do
     --mining-threads 1 \
     --reset &
   PIDS+=($!)
+  STARTED=$((STARTED + 1))
 done
+
+nodes_alive() {
+  local n=0 pid status
+  for pid in "${PIDS[@]}"; do
+    n=$((n + 1))
+    if ! kill -0 "$pid" 2>/dev/null; then
+      status=0
+      wait "$pid" 2>/dev/null || status=$?
+      echo "error: node $n exited (status $status); see its log lines above" >&2
+      return 1
+    fi
+  done
+}
+sleep 2
+nodes_alive || exit 1
 
 echo "============================================================"
 echo "Plauthium 3-node local testnet running:"
@@ -180,7 +309,10 @@ echo "  Node 3 explorer: http://127.0.0.1:8083/"
 echo "Jobs become fundable at height 24 (2 x blocks-per-epoch)."
 echo "Press Ctrl-C to stop all nodes."
 echo "============================================================"
-wait
+while nodes_alive; do
+  sleep 1
+done
+exit 1
 }
 
 main "$@"
@@ -188,4 +320,4 @@ FOOTER
 } > "$out"
 chmod +x "$out"
 
-echo "wrote $out ($count files, $bytes bytes of source, $(wc -c < "$out" | tr -d ' ') bytes total, commit $commit)" >&2
+echo "wrote $out ($count files, $bytes bytes of source, $(wc -c < "$out" | tr -d ' ') bytes total, $source_label)" >&2
