@@ -1,7 +1,7 @@
 {
   "name": "plauthium-testnet-0",
   "chain_id": 1347174740,
-  "genesis_time_bucket": 1792281600,
+  "genesis_time_bucket": 1792540800,
   "time_bucket_secs": 1,
   "target_block_secs": 10,
   "initial_seal_target": "0x07ffffffffffffffffffffffffffffff",

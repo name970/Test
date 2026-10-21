@@ -18,6 +18,7 @@ use chain::core_adapter::fw_context_to_core;
 use chain::keys::unsigned;
 use chain::{BlockTree, OwnerKeypair, SignedShare, build_template};
 use futures::{SinkExt, StreamExt};
+use node::chain_actor::{ChainCmd, ImportAck, Origin, Source};
 use node::cli::RunArgs;
 use node::mempool::MempoolCmd;
 use node::{NodeHandle, start_node};
@@ -61,6 +62,7 @@ async fn start(genesis: &GenesisConfig) -> (NodeHandle, PathBuf) {
         peers: vec![],
         mining_threads: 0,
         no_mine: true,
+        mine_when_synced: false,
         verify_threads: Some(2),
         reset: true,
     })
@@ -110,6 +112,17 @@ fn template_on(
     miner: &Arc<OwnerKeypair>,
     pool: &[ShareProof],
 ) -> chain::Template {
+    template_on_at(tree, parent, miner, pool, now_secs())
+}
+
+/// A template whose time bucket is `now` (1-second buckets).
+fn template_on_at(
+    tree: &BlockTree,
+    parent: Digest,
+    miner: &Arc<OwnerKeypair>,
+    pool: &[ShareProof],
+    now: u64,
+) -> chain::Template {
     let view = tree.ancestor_view(parent).unwrap();
     let meta = tree.get_meta(&parent).unwrap();
     let pool: Vec<SignedShare> = pool
@@ -126,9 +139,29 @@ fn template_on(
         &[],
         &pool,
         miner,
-        now_secs(),
+        now,
     )
     .unwrap()
+}
+
+/// `count` blocks on `parent` that pass Stage B but fail Stage A: each claims the work
+/// outputs of another attempt (cheap to make, a full tile to check).
+fn bogus_blocks(
+    tree: &BlockTree,
+    parent: Digest,
+    miner: &Arc<OwnerKeypair>,
+    count: u64,
+) -> Vec<Block> {
+    let tpl = template_on(tree, parent, miner, &[]);
+    let ctx0 = fw_context_to_core(&tpl.context_with_nonce(0)).unwrap();
+    let inst = ctx0.instance();
+    let z0 = inst.x.product(&inst.y);
+    (1..=count)
+        .map(|nonce| {
+            let ctx = fw_context_to_core(&tpl.context_with_nonce(nonce)).unwrap();
+            tpl.seal(nonce, &FreshWorkIds::derive(&ctx, &z0)).unwrap()
+        })
+        .collect()
 }
 
 /// Validates and applies `block` on the local replica.
@@ -144,6 +177,17 @@ struct RawPeer {
 
 impl RawPeer {
     async fn connect(addr: SocketAddr, genesis: &GenesisConfig, tree: &BlockTree) -> Self {
+        Self::connect_claiming(addr, genesis, tree, 0, tree.genesis_id()).await
+    }
+
+    /// Connects with a Handshake that claims this tip.
+    async fn connect_claiming(
+        addr: SocketAddr,
+        genesis: &GenesisConfig,
+        tree: &BlockTree,
+        best_height: u64,
+        best_block_id: Digest,
+    ) -> Self {
         let stream = TcpStream::connect(addr).await.unwrap();
         let codec = LengthDelimitedCodec::builder()
             .length_field_type::<u32>()
@@ -156,8 +200,10 @@ impl RawPeer {
         peer.send(&WireMessage::Handshake {
             version: WIRE_VERSION,
             chain_id: genesis.chain_id,
-            best_height: 0,
-            best_block_id: tree.genesis_id(),
+            genesis_id: tree.genesis_id(),
+            node_nonce: 7,
+            best_height,
+            best_block_id,
         })
         .await;
         let first = peer.framed.next().await.unwrap().unwrap();
@@ -680,4 +726,619 @@ async fn a_flood_of_useless_shares_throttles_the_peer_without_a_ban() {
 
     node.stop().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Status counters of the node.
+fn snapshot(node: &NodeHandle) -> Arc<node::chain_actor::StatusSnapshot> {
+    node.status_rx.borrow().clone()
+}
+
+/// Waits until the chain actor has handled every command sent before this one.
+async fn actor_barrier(node: &NodeHandle) {
+    let (tx, rx) = oneshot::channel();
+    let cmd = ChainCmd::HasBlock {
+        id: Digest::ZERO,
+        reply: tx,
+    };
+    node.chain_tx.send(cmd).await.unwrap();
+    rx.await.unwrap();
+}
+
+/// A peer streaming blocks that pass Stage B but fail Stage A gets at most two of them
+/// verified (the limit per source); the rest wait in its queue or are refused, and are
+/// dropped the moment its first block fails, before any of them starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stage_a_is_limited_per_source_and_dropped_with_its_ban() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let tree = BlockTree::new(genesis.clone()).unwrap();
+    let attacker_key = Arc::new(OwnerKeypair::from_seed(&[15; 32]));
+    let miner = Arc::new(OwnerKeypair::from_seed(&[16; 32]));
+    let peers = || node.peer_manager.peer_count();
+
+    let bogus = bogus_blocks(&tree, tree.tip_id(), &attacker_key, 20);
+    let b1 = mine_next(&tree, &miner);
+    let mut attacker = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    let mut honest = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    wait_until("both peers registered", || peers() == 2).await;
+
+    for block in &bogus {
+        attacker
+            .send(&WireMessage::GossipBlock(Box::new(block.clone())))
+            .await;
+    }
+    wait_until("the attacker banned", || peers() == 1).await;
+    // Its other Stage A task is aborted and its queued blocks dropped...
+    wait_until("its pending blocks dropped", || {
+        let snap = snapshot(&node);
+        snap.verifying_blocks == 0 && snap.queued_blocks == 0
+    })
+    .await;
+    // ...before any of those could start.
+    let snap = snapshot(&node);
+    assert!(
+        snap.stage_a_started <= 2,
+        "{} of the attacker's blocks entered Stage A",
+        snap.stage_a_started
+    );
+    assert_eq!(snap.tip.height, 0);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        snapshot(&node).stage_a_started <= 2,
+        "none of them started later"
+    );
+
+    // Honest blocks are verified at once.
+    honest
+        .send(&WireMessage::GossipBlock(Box::new(b1.clone())))
+        .await;
+    wait_until("block 1 from the honest peer", || {
+        snapshot(&node).tip.id == b1.header.block_id
+    })
+    .await;
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A block delivered first by a peer that then gets banned stays pending when another
+/// peer delivered it too, now on that peer's behalf: honest peers relay a block only
+/// once, so dropping it would lose it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_another_peer_delivered_too_survives_its_first_senders_ban() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let mut tree = BlockTree::new(genesis.clone()).unwrap();
+    let miner = Arc::new(OwnerKeypair::from_seed(&[17; 32]));
+    let owner = Arc::new(OwnerKeypair::from_seed(&[18; 32]));
+    let peers = || node.peer_manager.peer_count();
+
+    let b1 = mine_next(&tree, &miner);
+    let mut bad_share = mine_share(&tree, &owner, 71);
+    bad_share.share_target = Target(u128::MAX - 1);
+    owner.sign_share(&mut bad_share).unwrap();
+    extend(&mut tree, &b1);
+    let b2 = mine_next(&tree, &miner);
+
+    let mut attacker = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    let mut honest = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    wait_until("both peers registered", || peers() == 2).await;
+
+    // Block 2 arrives first from the attacker while block 1 is unknown: it is parked.
+    attacker
+        .send(&WireMessage::GossipBlock(Box::new(b2.clone())))
+        .await;
+    loop {
+        match attacker.recv(Duration::from_secs(30)).await {
+            Some(WireMessage::SyncRequest { .. }) => break,
+            Some(_) => continue,
+            None => panic!("block 2 from the attacker was never processed"),
+        }
+    }
+    // The honest peer relays the same bytes; the sync reply shows it was handled.
+    honest
+        .send(&WireMessage::GossipBlock(Box::new(b2.clone())))
+        .await;
+    honest
+        .send(&WireMessage::SyncRequest { from_height: 1 })
+        .await;
+    loop {
+        match honest.recv(Duration::from_secs(30)).await {
+            Some(WireMessage::SyncResponse { .. }) => break,
+            Some(_) => continue,
+            None => panic!("the honest peer was disconnected"),
+        }
+    }
+    // The attacker is banned for an invalid share; block 2 stays parked for the honest peer.
+    attacker
+        .send(&WireMessage::GossipShare(Box::new(bad_share)))
+        .await;
+    wait_until("the attacker banned", || peers() == 1).await;
+    honest
+        .send(&WireMessage::GossipBlock(Box::new(b1.clone())))
+        .await;
+    wait_until("blocks 1 and 2", || snapshot(&node).tip.height == 2).await;
+    assert_eq!(snapshot(&node).tip.id, b2.header.block_id);
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cancelling a source (as a ban does) aborts its Stage A tasks and drops its queued
+/// blocks without condemning them: the same blocks from another source are accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_source_drops_its_pending_blocks_without_condemning_them() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let tree = BlockTree::new(genesis.clone()).unwrap();
+    let blocks: Vec<Block> = (0..4u8)
+        .map(|i| {
+            let miner = Arc::new(OwnerKeypair::from_seed(&[20 + i; 32]));
+            mine_on(&tree, tree.genesis_id(), &miner, &[])
+        })
+        .collect();
+    let banned = Source::Addr("127.0.0.1:9".parse().unwrap());
+    let other = Source::Addr("127.0.0.1:10".parse().unwrap());
+
+    // All five commands reach the actor's mailbox before any Stage A (a full tile) ends.
+    let mut acks = Vec::new();
+    for block in &blocks {
+        let (tx, rx) = oneshot::channel();
+        let cmd = ChainCmd::ImportBlock {
+            block: Arc::new(block.clone()),
+            origin: Origin::Peer(9_001, banned),
+            ack: Some(tx),
+        };
+        node.chain_tx.send(cmd).await.unwrap();
+        acks.push(rx);
+    }
+    let cmd = ChainCmd::CancelSource {
+        source: banned,
+        ban: Duration::from_secs(60),
+    };
+    node.chain_tx.send(cmd).await.unwrap();
+    for ack in acks {
+        assert_eq!(ack.await.unwrap(), ImportAck::Queued);
+    }
+    actor_barrier(&node).await;
+    let snap = snapshot(&node);
+    assert_eq!(snap.stage_a_started, 2, "two in Stage A, two queued");
+    assert_eq!((snap.verifying_blocks, snap.queued_blocks), (0, 0));
+
+    // Nothing new is admitted from the banned source...
+    let (tx, rx) = oneshot::channel();
+    let cmd = ChainCmd::ImportBlock {
+        block: Arc::new(blocks[0].clone()),
+        origin: Origin::Peer(9_001, banned),
+        ack: Some(tx),
+    };
+    node.chain_tx.send(cmd).await.unwrap();
+    assert_eq!(rx.await.unwrap(), ImportAck::Busy);
+    // ...the aborted blocks were not applied, and another source's copies are accepted.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(snapshot(&node).tip.height, 0);
+    for block in &blocks {
+        let cmd = ChainCmd::ImportBlock {
+            block: Arc::new(block.clone()),
+            origin: Origin::Peer(9_002, other),
+            ack: None,
+        };
+        node.chain_tx.send(cmd).await.unwrap();
+    }
+    for block in &blocks {
+        let id = block.header.block_id;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (tx, rx) = oneshot::channel();
+            node.chain_tx
+                .send(ChainCmd::HasBlock { id, reply: tx })
+                .await
+                .unwrap();
+            if rx.await.unwrap() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a re-sent block was never applied"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sends a Handshake with `genesis_id` (and the node's own nonce if `echo_nonce`) after
+/// reading the node's; returns whether the node keeps the connection.
+async fn handshake_accepted(addr: SocketAddr, genesis_id: Digest, echo_nonce: bool) -> bool {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let codec = LengthDelimitedCodec::builder()
+        .length_field_type::<u32>()
+        .big_endian()
+        .max_frame_length(MAX_FRAME_BYTES)
+        .new_codec();
+    let mut framed = Framed::new(stream, codec);
+    let first = framed.next().await.unwrap().unwrap();
+    let WireMessage::Handshake {
+        chain_id,
+        node_nonce,
+        ..
+    } = codec::decode::<WireMessage>(&first).unwrap()
+    else {
+        panic!("the node did not open with a Handshake");
+    };
+    let ours = WireMessage::Handshake {
+        version: WIRE_VERSION,
+        chain_id,
+        genesis_id,
+        node_nonce: if echo_nonce {
+            node_nonce
+        } else {
+            node_nonce ^ 1
+        },
+        best_height: 0,
+        best_block_id: genesis_id,
+    };
+    framed
+        .send(Bytes::from(codec::encode(&ours).unwrap()))
+        .await
+        .unwrap();
+    matches!(
+        tokio::time::timeout(Duration::from_secs(1), framed.next()).await,
+        Err(_) | Ok(Some(Ok(_)))
+    )
+}
+
+/// The handshake carries the genesis id and a per-process nonce: a node on another
+/// genesis with the same chain_id, or the node itself, is not kept as a peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handshakes_from_another_genesis_or_from_the_node_itself_are_refused() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let genesis_id = BlockTree::new(genesis.clone()).unwrap().genesis_id();
+    let peers = || node.peer_manager.peer_count();
+
+    assert!(!handshake_accepted(node.p2p_addr, Digest([1; 64]), false).await);
+    assert!(!handshake_accepted(node.p2p_addr, genesis_id, true).await);
+    assert_eq!(peers(), 0);
+    assert!(handshake_accepted(node.p2p_addr, genesis_id, false).await);
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `--mine-when-synced`, a node that cannot reach its peers does not mine (a
+/// private fork it could never leave); a node joining a peer that is ahead starts
+/// mining only once it has caught up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mining_waits_for_a_peer_and_for_sync_when_asked_to() {
+    let genesis = test_genesis();
+    let base = std::env::temp_dir().join(format!("plauthium-gate-{}", now_secs_nanos()));
+    std::fs::create_dir_all(&base).unwrap();
+    let genesis_path = base.join("genesis.json");
+    std::fs::write(&genesis_path, serde_json::to_string(&genesis).unwrap()).unwrap();
+    let args = |name: &str, peers: Vec<node::net::PeerAddr>, gated: bool| RunArgs {
+        data_dir: base.join(name),
+        key_file: None,
+        genesis: Some(genesis_path.clone()),
+        p2p_listen: "127.0.0.1:0".parse().unwrap(),
+        rpc_listen: "127.0.0.1:0".parse().unwrap(),
+        peers,
+        mining_threads: 1,
+        no_mine: false,
+        mine_when_synced: gated,
+        verify_threads: Some(2),
+        reset: true,
+    };
+    let height = |n: &NodeHandle| n.status_rx.borrow().tip.height;
+
+    // Its only peer does not exist: it waits instead of mining alone.
+    let unreachable = "127.0.0.1:1".parse::<SocketAddr>().unwrap().into();
+    let alone = start_node(args("alone", vec![unreachable], true))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(height(&alone), 0);
+    assert!(!alone.engine.sync_gate_open());
+    alone.stop().await;
+
+    // A peer that is 30 blocks ahead (and then stops mining: an attempt already under
+    // way may still seal one more block, so wait until its height settles).
+    let ahead = start_node(args("ahead", vec![], false)).await.unwrap();
+    wait_until("the peer at height 30", || height(&ahead) >= 30).await;
+    ahead.engine.set_enabled(false);
+    let mut target = height(&ahead);
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if height(&ahead) == target {
+            break;
+        }
+        target = height(&ahead);
+    }
+
+    // The joining node opens its gate only at the peer's height, then mines on top.
+    let joined = start_node(args("joined", vec![ahead.p2p_addr.into()], true))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !joined.engine.sync_gate_open() {
+        assert!(Instant::now() < deadline, "the gate never opened");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        height(&joined) >= target,
+        "the gate opened at height {} before catching up to {target}",
+        height(&joined)
+    );
+    wait_until("a block mined on top by the joined node", || {
+        let tip = ahead.status_rx.borrow().tip.clone();
+        tip.height > target && tip.miner_key_id == joined.miner_key_id
+    })
+    .await;
+
+    joined.stop().await;
+    ahead.stop().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A peer that claims a height it never delivers holds `--mine-when-synced` back only
+/// until its sync request times out: the claim then drops to what it delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_lying_about_its_height_holds_mining_back_only_briefly() {
+    let genesis = test_genesis();
+    let base = std::env::temp_dir().join(format!("plauthium-liar-{}", now_secs_nanos()));
+    std::fs::create_dir_all(&base).unwrap();
+    let genesis_path = base.join("genesis.json");
+    std::fs::write(&genesis_path, serde_json::to_string(&genesis).unwrap()).unwrap();
+    let node = start_node(RunArgs {
+        data_dir: base.join("gated"),
+        key_file: None,
+        genesis: Some(genesis_path),
+        p2p_listen: "127.0.0.1:0".parse().unwrap(),
+        rpc_listen: "127.0.0.1:0".parse().unwrap(),
+        peers: vec![],
+        mining_threads: 1,
+        no_mine: false,
+        mine_when_synced: true,
+        verify_threads: Some(2),
+        reset: true,
+    })
+    .await
+    .unwrap();
+    let tree = BlockTree::new(genesis.clone()).unwrap();
+
+    let _liar = RawPeer::connect_claiming(
+        node.p2p_addr,
+        &genesis,
+        &tree,
+        1_000_000_000,
+        Digest([5; 64]),
+    )
+    .await;
+    let connected = Instant::now();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        !node.engine.sync_gate_open(),
+        "it first waits for the claimed height"
+    );
+    assert_eq!(node.status_rx.borrow().tip.height, 0);
+    // SYNC_TIMEOUT (30 s) later the claim drops to our tip and mining starts, well before
+    // the one-minute stall rule would open the gate.
+    while node.status_rx.borrow().tip.height == 0 {
+        assert!(
+            connected.elapsed() < Duration::from_secs(50),
+            "the lying peer held mining back past its sync timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Orphans released by their parent count against the deferred limits (8 per source):
+/// a source cannot park future-dated blocks for free and have every one of them kept
+/// once their parent arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn released_orphans_count_against_the_deferred_limits() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let mut tree = BlockTree::new(genesis.clone()).unwrap();
+    let miner = Arc::new(OwnerKeypair::from_seed(&[30; 32]));
+    let attacker_key = Arc::new(OwnerKeypair::from_seed(&[31; 32]));
+    let peers = || node.peer_manager.peer_count();
+
+    let b1 = mine_next(&tree, &miner);
+    extend(&mut tree, &b1);
+    // Twenty children of block 1, 40 s ahead of the clock: past MAX_FUTURE_SECS, so
+    // they are deferred, but within the slack, so they are not refused outright.
+    let tpl = template_on_at(
+        &tree,
+        b1.header.block_id,
+        &attacker_key,
+        &[],
+        now_secs() + 40,
+    );
+    let ctx0 = fw_context_to_core(&tpl.context_with_nonce(0)).unwrap();
+    let inst = ctx0.instance();
+    let z0 = inst.x.product(&inst.y);
+    let children: Vec<Block> = (1..=20u64)
+        .map(|nonce| {
+            let ctx = fw_context_to_core(&tpl.context_with_nonce(nonce)).unwrap();
+            tpl.seal(nonce, &FreshWorkIds::derive(&ctx, &z0)).unwrap()
+        })
+        .collect();
+
+    let mut attacker = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    let mut honest = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    wait_until("both peers registered", || peers() == 2).await;
+    for child in &children {
+        attacker
+            .send(&WireMessage::GossipBlock(Box::new(child.clone())))
+            .await;
+    }
+    attacker
+        .send(&WireMessage::SyncRequest { from_height: 1 })
+        .await;
+    loop {
+        match attacker.recv(Duration::from_secs(30)).await {
+            Some(WireMessage::SyncResponse { .. }) => break,
+            Some(_) => continue,
+            None => panic!("the attacker was disconnected"),
+        }
+    }
+    assert_eq!(
+        snapshot(&node).orphan_count,
+        20,
+        "parked while block 1 is unknown"
+    );
+
+    honest
+        .send(&WireMessage::GossipBlock(Box::new(b1.clone())))
+        .await;
+    // The status is published once more after the released orphans are handled.
+    wait_until("block 1 and its released orphans", || {
+        let snap = snapshot(&node);
+        snap.tip.height == 1 && snap.orphan_count == 0
+    })
+    .await;
+    assert_eq!(
+        snapshot(&node).deferred_blocks,
+        8,
+        "the deferred limit per source"
+    );
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Orphans cost nothing to make (nothing is checked before the parent lookup), so each
+/// source may park at most a sync batch's worth: a flood from one source evicts its own
+/// orphans, not the honest blocks parked behind a missing parent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_orphan_flood_does_not_evict_another_sources_parked_blocks() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let mut tree = BlockTree::new(genesis.clone()).unwrap();
+    let miner = Arc::new(OwnerKeypair::from_seed(&[32; 32]));
+    let peers = || node.peer_manager.peer_count();
+
+    let mut chain = Vec::new();
+    for _ in 0..41 {
+        let block = mine_next(&tree, &miner);
+        extend(&mut tree, &block);
+        chain.push(block);
+    }
+    // Fake orphans: a real block under random parent and block ids (not at height 1,
+    // where an orphan means another genesis and closes the connection).
+    let fakes: Vec<Block> = (0..300u32)
+        .map(|i| {
+            let mut fake = chain[5].clone();
+            let mut id = [0xEE; 64];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            fake.header.context.parent_canonical_id = Digest(id);
+            id[4] = 0x01;
+            fake.header.block_id = Digest(id);
+            fake
+        })
+        .collect();
+
+    let genesis_tree = BlockTree::new(genesis.clone()).unwrap();
+    let mut honest = RawPeer::connect(node.p2p_addr, &genesis, &genesis_tree).await;
+    let mut flooder = RawPeer::connect(node.p2p_addr, &genesis, &genesis_tree).await;
+    wait_until("both peers registered", || peers() == 2).await;
+    // Blocks 2..41 arrive before block 1: all forty are parked.
+    for block in &chain[1..] {
+        honest
+            .send(&WireMessage::GossipBlock(Box::new(block.clone())))
+            .await;
+    }
+    for fake in &fakes {
+        flooder
+            .send(&WireMessage::GossipBlock(Box::new(fake.clone())))
+            .await;
+    }
+    flooder
+        .send(&WireMessage::SyncRequest { from_height: 1 })
+        .await;
+    loop {
+        match flooder.recv(Duration::from_secs(30)).await {
+            Some(WireMessage::SyncResponse { .. }) => break,
+            Some(_) => continue,
+            None => panic!("the flooder was disconnected"),
+        }
+    }
+    honest
+        .send(&WireMessage::GossipBlock(Box::new(chain[0].clone())))
+        .await;
+    wait_until("all 41 honest blocks", || snapshot(&node).tip.height == 41).await;
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A peer that answers a sync request with blocks from another height says nothing
+/// about the height it claimed: the claim drops at once, and a node waiting for it to
+/// catch up starts mining without waiting for a timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_off_height_sync_answer_drops_the_claimed_height() {
+    let genesis = test_genesis();
+    let base = std::env::temp_dir().join(format!("plauthium-offheight-{}", now_secs_nanos()));
+    std::fs::create_dir_all(&base).unwrap();
+    let genesis_path = base.join("genesis.json");
+    std::fs::write(&genesis_path, serde_json::to_string(&genesis).unwrap()).unwrap();
+    let node = start_node(RunArgs {
+        data_dir: base.join("gated"),
+        key_file: None,
+        genesis: Some(genesis_path),
+        p2p_listen: "127.0.0.1:0".parse().unwrap(),
+        rpc_listen: "127.0.0.1:0".parse().unwrap(),
+        peers: vec![],
+        mining_threads: 1,
+        no_mine: false,
+        mine_when_synced: true,
+        verify_threads: Some(2),
+        reset: true,
+    })
+    .await
+    .unwrap();
+    let mut tree = BlockTree::new(genesis.clone()).unwrap();
+    let miner = Arc::new(OwnerKeypair::from_seed(&[33; 32]));
+    let b1 = mine_next(&tree, &miner);
+    extend(&mut tree, &b1);
+    let b2 = mine_next(&tree, &miner);
+    let genesis_tree = BlockTree::new(genesis.clone()).unwrap();
+
+    let mut liar = RawPeer::connect_claiming(
+        node.p2p_addr,
+        &genesis,
+        &genesis_tree,
+        1_000_000_000,
+        Digest([6; 64]),
+    )
+    .await;
+    let connected = Instant::now();
+    // Every request is answered with block 2, whatever height it asks for.
+    let answer = tokio::spawn(async move {
+        while let Some(msg) = liar.recv(Duration::from_secs(60)).await {
+            if let WireMessage::SyncRequest { .. } = msg {
+                liar.send(&WireMessage::SyncResponse {
+                    blocks: vec![b2.clone()],
+                })
+                .await;
+            }
+        }
+    });
+    while node.status_rx.borrow().tip.height == 0 {
+        assert!(
+            connected.elapsed() < Duration::from_secs(15),
+            "the off-height answer did not drop the claimed height"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    answer.abort();
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&base);
 }

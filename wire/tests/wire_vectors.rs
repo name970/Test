@@ -210,6 +210,8 @@ fn appendix_b_encoded_sizes_and_round_trips() {
         WireMessage::Handshake {
             version: 1,
             chain_id: 0x504C_4154,
+            genesis_id: sample_digest(61),
+            node_nonce: 99,
             best_height: 42,
             best_block_id: sample_digest(60),
         },

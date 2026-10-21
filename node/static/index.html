@@ -243,6 +243,7 @@ tr.flash-row { animation: rowflash 1.2s ease; }
     <span>Rate: <b id="h-rate">0.0</b> att/s (E[seal]=<b id="h-exp">-</b>)</span>
     <span>Mempool: <b id="h-mempool">0</b></span>
     <span>Share pool: <b id="h-sharepool">0</b></span>
+    <span>Verifying: <b id="h-verifying">0</b> (+<b id="h-queued">0</b> queued)</span>
   </div>
 </header>
 
@@ -638,6 +639,10 @@ tr.flash-row { animation: rowflash 1.2s ease; }
       document.getElementById("h-exp").textContent = st.tip.expected_attempts_per_seal;
       document.getElementById("h-mempool").textContent = st.mempool.size;
       document.getElementById("h-sharepool").textContent = st.mining.share_pool;
+      document.getElementById("h-verifying").textContent = st.verification.verifying_blocks;
+      document.getElementById("h-queued").textContent = st.verification.queued_blocks;
+      document.getElementById("h-rate").title = st.mining.waiting_for_sync
+        ? "Mining waits until this node is connected and caught up" : "";
       document.getElementById("s-cw").textContent = st.commercial_consensus_weight;
 
       renderLedger(st.ledger);

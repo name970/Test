@@ -5,6 +5,7 @@
 //! never awaits another actor (§8.2).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,11 +16,12 @@ use chain::{
 };
 use ledger::StateCategory;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, info, warn};
 use wire::{
-    Block, Digest, GenesisConfig, MAX_FUTURE_SECS, MAX_SYNC_BLOCKS, MAX_SYNC_BYTES, ORPHAN_LIMIT,
-    ShareProof, codec,
+    Block, Digest, FwContext, GenesisConfig, MAX_FUTURE_SECS, MAX_SYNC_BLOCKS, MAX_SYNC_BYTES,
+    ORPHAN_LIMIT, ShareProof, Target, codec,
 };
 
 use crate::mempool::MempoolView;
@@ -29,8 +31,35 @@ use crate::store::BlockLogWriter;
 /// Maximum gossiped shares awaiting their work check (one tile recomputation each),
 /// parked or running. Parked shares count too, so releasing them never exceeds it.
 const SHARE_CHECK_LIMIT: usize = 64;
-/// Per peer: shares parked or awaiting their work check. Honest gossip stays far below.
-const SHARE_PEER_LIMIT: usize = 8;
+/// Per source: shares parked or awaiting their work check. Honest gossip stays far below.
+const SHARE_SOURCE_LIMIT: usize = 8;
+
+/// Blocks from one source (see [`Source`]) in Stage A at once. Honest peers relay
+/// verified blocks one at a time and a sync batch is verified block after block
+/// (children wait, parked), so this only bounds how much one address can make us
+/// recompute before its first invalid block gets it banned.
+const STAGE_A_SOURCE_LIMIT: usize = 2;
+/// Blocks in Stage A at once, from all sources.
+const STAGE_A_LIMIT: usize = 16;
+/// Per source: blocks that passed Stage B and wait for a Stage A slot.
+const STAGE_A_QUEUE_SOURCE_LIMIT: usize = 8;
+/// Blocks waiting for a Stage A slot, from all sources.
+const STAGE_A_QUEUE_LIMIT: usize = 64;
+/// Per source: blocks kept for a retry because their time_bucket is in the future.
+const DEFERRED_SOURCE_LIMIT: usize = 8;
+/// Blocks kept for a retry because their time_bucket is in the future, in total.
+const DEFERRED_LIMIT: usize = 64;
+/// Per source: blocks parked until their parent arrives (of `ORPHAN_LIMIT` in total).
+/// A sync batch parks all but its first block, so a source may hold a full batch.
+const ORPHAN_SOURCE_LIMIT: usize = MAX_SYNC_BLOCKS;
+/// A block further ahead than `MAX_FUTURE_SECS` plus this is not kept for a retry.
+const DEFERRED_SLACK_SECS: u64 = 60;
+/// Other sources remembered per pending block: if the source that delivered it first
+/// is banned, the block stays pending on behalf of one of them.
+const CO_SENDERS: usize = 3;
+/// Ban for a peer that sent an invalid block or share (§4.8). Net bans the source for
+/// this long, and the chain actor admits nothing new from it meanwhile.
+pub const INVALID_BAN: Duration = Duration::from_secs(600);
 
 /// A pending share's slot: (owner key id, work_id). Keyed by owner too because only
 /// the work check ties a work_id to its owner: a validly signed claim to another
@@ -40,6 +69,36 @@ type ShareSlot = (Digest, Digest);
 /// Identifier of a connected peer.
 pub type PeerId = u64;
 
+/// Where a peer connects from. Bans, and the limits on what may await verification,
+/// apply per source: an IP address (for IPv6 its /64 prefix, which one host commonly
+/// holds whole), or the full socket address for loopback peers, so that the nodes of a
+/// local testnet stay apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Source {
+    /// A remote IP address (IPv6: the /64 prefix).
+    Ip(IpAddr),
+    /// A loopback socket address.
+    Addr(SocketAddr),
+}
+
+impl Source {
+    /// The source of a connection from `addr`.
+    pub fn of(addr: SocketAddr) -> Self {
+        let ip = match addr.ip() {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            v4 => v4,
+        };
+        match ip {
+            ip if ip.is_loopback() => Self::Addr(addr),
+            IpAddr::V6(v6) => {
+                let [a, b, c, d, ..] = v6.segments();
+                Self::Ip(IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0)))
+            }
+            v4 => Self::Ip(v4),
+        }
+    }
+}
+
 /// Origin of a block or transaction (§8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
@@ -47,10 +106,20 @@ pub enum Origin {
     Local,
     /// Submitted through the RPC.
     Rpc,
-    /// Received from a peer.
-    Peer(PeerId),
+    /// Received from a peer, connected from a source.
+    Peer(PeerId, Source),
     /// Replayed from `blocks.log`.
     Disk,
+}
+
+impl Origin {
+    /// The source of a peer origin.
+    pub fn source(&self) -> Option<Source> {
+        match self {
+            Origin::Peer(_, source) => Some(*source),
+            _ => None,
+        }
+    }
 }
 
 /// Immediate acknowledgment of `ChainCmd::ImportBlock`, sent before Stage A runs (§8.2).
@@ -68,6 +137,11 @@ pub enum ImportAck {
     Invalid(String),
     /// Forks deeper than `MAX_REORG_DEPTH`.
     TooDeep,
+    /// Refused for now: too many blocks from this source (or in total) await
+    /// verification. Not remembered, so a copy can be imported later.
+    Busy,
+    /// Its time_bucket is too far in the future even to keep for a retry. Not remembered.
+    TooEarly,
 }
 
 /// Immediate acknowledgment of `ChainCmd::ImportShare`, sent before the work check runs.
@@ -78,7 +152,9 @@ pub enum ShareAck {
     /// Waiting for its parent block, which is being verified. The share is dropped
     /// without penalty if that block turns out invalid, so it may be relayed again.
     Parked,
-    /// Already pooled, registered, in flight, parked or rejected before.
+    /// These exact bytes already await verification (another peer relayed them first).
+    Pending,
+    /// Already pooled, registered or rejected, or the share is pending under other bytes.
     Duplicate,
     /// Of no use here (stale, unknown parent, ...); the sender is not penalized.
     Ignored(&'static str),
@@ -112,23 +188,37 @@ pub enum ChainCmd {
     },
     /// Internal: the work check of a gossiped share finished.
     ShareVerified {
+        /// Identifies this check among the slot's checks.
+        ticket: u64,
         /// The share's (owner key id, work_id).
         slot: (Digest, Digest),
         /// The share's relay id.
         relay_id: Digest,
         /// Where it came from.
         origin: Origin,
-        /// The verified share, or why it was rejected.
-        result: Result<Box<SignedShare>, String>,
+        /// The verified share, or why it was not.
+        result: Result<Box<SignedShare>, CheckFailure>,
     },
     /// Internal: Stage A finished for a block.
     WorkVerified {
+        /// Identifies this Stage A task among the block's.
+        ticket: u64,
         /// The verified block.
         block: Arc<Block>,
         /// Where it came from.
         origin: Origin,
         /// Verification outcome.
         result: Result<(), WorkError>,
+    },
+    /// Drops what a banned source sent that still awaits verification: its Stage A
+    /// tasks and share work checks are aborted and its queued, parked and deferred
+    /// blocks and parked shares dropped, except blocks another source delivered too.
+    /// Nothing new is admitted from it until the ban ends.
+    CancelSource {
+        /// The banned source.
+        source: Source,
+        /// How long it is banned.
+        ban: Duration,
     },
     /// Canonical blocks from `from_height` within the `SyncResponse` limits (§4.4).
     GetCanonicalRange {
@@ -256,12 +346,87 @@ pub struct StatusSnapshot {
     pub orphan_count: usize,
     /// Verified shares waiting for a block (own and gossiped).
     pub share_pool: usize,
+    /// Blocks in Stage A.
+    pub verifying_blocks: usize,
+    /// Blocks that passed Stage B and wait for a Stage A slot.
+    pub queued_blocks: usize,
+    /// Blocks kept for a retry because their time_bucket is ahead of the local clock.
+    pub deferred_blocks: usize,
+    /// Blocks that entered Stage A since the node started.
+    pub stage_a_started: u64,
+}
+
+/// Counters of the import pipeline shown in the status snapshot.
+#[derive(Clone, Copy, Debug, Default)]
+struct PipelineCounts {
+    orphans: usize,
+    share_pool: usize,
+    verifying_blocks: usize,
+    queued_blocks: usize,
+    deferred_blocks: usize,
+    stage_a_started: u64,
+}
+
+/// How a block reaches the import pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// It just arrived.
+    Fresh,
+    /// It was parked until its parent arrived. The orphan limit bounded it, so the Stage A
+    /// queue limits do not refuse it, but it counts against the deferred limits.
+    Parked,
+    /// It was deferred and is due now; it was already counted against every limit.
+    Retry,
+}
+
+/// A block in Stage A. `origin` is the source it is verified for, `also` the other
+/// sources that delivered the same bytes (see [`CO_SENDERS`]).
+struct StageA {
+    ticket: u64,
+    block_id: Digest,
+    origin: Origin,
+    also: Vec<Origin>,
+    task: AbortHandle,
+}
+
+/// A block that passed Stage B and waits for a Stage A slot.
+struct QueuedBlock {
+    block: Arc<Block>,
+    relay_id: Digest,
+    origin: Origin,
+    also: Vec<Origin>,
+}
+
+/// Why a share's work check did not produce a verified share.
+#[derive(Debug)]
+pub enum CheckFailure {
+    /// The share is invalid; its sender is penalized.
+    Invalid(String),
+    /// The check could not run (a task panicked or was cancelled); no one is penalized.
+    Internal(String),
+}
+
+/// A gossiped share's work check in flight.
+struct ShareCheckTask {
+    ticket: u64,
+    origin: Origin,
+    relay_id: Digest,
+    task: AbortHandle,
+}
+
+/// Where a parked block sits: in `parked_by_parent[parent]`, sent by `source`.
+struct ParkedRef {
+    relay_id: Digest,
+    block_id: Digest,
+    parent: Digest,
+    source: Option<Source>,
 }
 
 struct ParkedBlock {
     block: Arc<Block>,
     relay_id: Digest,
     origin: Origin,
+    also: Vec<Origin>,
 }
 
 /// A gossiped share whose signature verified, waiting for its parent's Stage A.
@@ -277,6 +442,7 @@ struct DeferredEntry {
     block: Arc<Block>,
     relay_id: Digest,
     origin: Origin,
+    also: Vec<Origin>,
     expires_at: Instant,
 }
 
@@ -340,15 +506,22 @@ pub struct ChainActor {
     // take a slot, so a forged copy cannot shadow the genuine share, and re-signed
     // copies of a pending share (ML-DSA signing is randomized) are dropped before
     // costing a verification.
-    share_checks: HashMap<ShareSlot, Origin>,
+    share_checks: HashMap<ShareSlot, ShareCheckTask>,
     parked_shares: VecDeque<ParkedShare>, // oldest first
     invalid_shares: LruIdCache,           // relay ids
     // Blocks awaiting validation are deduplicated by relay id (`chain::block_relay_id`),
     // not by block_id: a copy with a forged signature or body shares the honest block_id
     // and must not shadow, or get cached as invalid in place of, the genuine block.
-    in_flight: HashMap<Digest, Digest>, // relay_id -> block_id
+    // Each source has at most STAGE_A_SOURCE_LIMIT blocks in Stage A; the rest wait in
+    // stage_a_queue, oldest first, and are started as slots free up.
+    in_flight: HashMap<Digest, StageA>, // by relay_id
+    stage_a_queue: VecDeque<QueuedBlock>,
+    stage_a_started: u64,
+    next_ticket: u64,
+    // Sources whose work was cancelled (banned), until their ban ends.
+    banned: HashMap<Source, Instant>,
     parked_by_parent: HashMap<Digest, Vec<ParkedBlock>>,
-    parked_order: VecDeque<(Digest, Digest, Digest)>, // (relay_id, block_id, parent_id), oldest first
+    parked_order: VecDeque<ParkedRef>, // oldest first
     deferred: Vec<DeferredEntry>,
     invalid_lru: LruIdCache, // relay ids
 }
@@ -371,7 +544,7 @@ impl ChainActor {
         let share_verify_sem =
             Arc::new(Semaphore::new((verify_sem.available_permits() / 2).max(1)));
         let start_instant = Instant::now();
-        let status = build_status_snapshot(&tree, &miner, start_instant, 0, 0);
+        let status = build_status_snapshot(&tree, &miner, start_instant, PipelineCounts::default());
         let (status_tx, status_rx) = watch::channel(Arc::new(status));
         let mut actor = Self {
             tree,
@@ -392,6 +565,10 @@ impl ChainActor {
             parked_shares: VecDeque::new(),
             invalid_shares: LruIdCache::new(4_096),
             in_flight: HashMap::new(),
+            stage_a_queue: VecDeque::new(),
+            stage_a_started: 0,
+            next_ticket: 0,
+            banned: HashMap::new(),
             parked_by_parent: HashMap::new(),
             parked_order: VecDeque::new(),
             deferred: Vec::new(),
@@ -505,22 +682,36 @@ impl ChainActor {
                 }
             }
             ChainCmd::ShareVerified {
+                ticket,
                 slot,
                 relay_id,
                 origin,
                 result,
             } => {
-                self.share_checks.remove(&slot);
+                if self
+                    .share_checks
+                    .get(&slot)
+                    .is_some_and(|c| c.ticket == ticket)
+                {
+                    self.share_checks.remove(&slot);
+                }
                 match result {
                     Ok(signed) => return self.admit_share(*signed, origin),
-                    Err(reason) => self.reject_share(relay_id, origin, reason),
+                    Err(CheckFailure::Invalid(reason)) => {
+                        self.reject_share(relay_id, origin, reason)
+                    }
+                    Err(CheckFailure::Internal(e)) => {
+                        warn!(error = %e, "Share work check could not run; share dropped")
+                    }
                 }
             }
             ChainCmd::WorkVerified {
+                ticket,
                 block,
                 origin,
                 result,
-            } => self.handle_work_verified(block, origin, result),
+            } => self.handle_work_verified(ticket, block, origin, result),
+            ChainCmd::CancelSource { source, ban } => self.cancel_source(source, ban),
             ChainCmd::GetCanonicalRange { from_height, reply } => {
                 let _ = reply.send(self.canonical_range(from_height));
             }
@@ -575,10 +766,19 @@ impl ChainActor {
         blocks
     }
 
+    /// Whether a block with this block_id passed Stage B and is in, or waits for, Stage A.
+    fn is_in_stage_a(&self, block_id: &Digest) -> bool {
+        self.in_flight.values().any(|s| s.block_id == *block_id)
+            || self
+                .stage_a_queue
+                .iter()
+                .any(|q| q.block.header.block_id == *block_id)
+    }
+
     /// Whether a block with this block_id awaits validation (a parent check).
     fn is_pending_block(&self, block_id: &Digest) -> bool {
-        self.in_flight.values().any(|b| b == block_id)
-            || self.parked_order.iter().any(|(_, b, _)| b == block_id)
+        self.is_in_stage_a(block_id)
+            || self.parked_order.iter().any(|r| r.block_id == *block_id)
             || self
                 .deferred
                 .iter()
@@ -588,20 +788,40 @@ impl ChainActor {
     /// Whether these exact block bytes await validation.
     fn is_pending_relay(&self, relay_id: &Digest) -> bool {
         self.in_flight.contains_key(relay_id)
-            || self.parked_order.iter().any(|(r, _, _)| r == relay_id)
+            || self.stage_a_queue.iter().any(|q| q.relay_id == *relay_id)
+            || self.parked_order.iter().any(|r| r.relay_id == *relay_id)
             || self.deferred.iter().any(|d| d.relay_id == *relay_id)
     }
 
+    /// Imports a block that just arrived (from a peer, the miner or disk).
     fn import_block(&mut self, block: Arc<Block>, origin: Origin) -> ImportAck {
+        self.admit_block(block, origin, Vec::new(), Admission::Fresh)
+    }
+
+    /// The import pipeline (§6.8). `also` lists other sources that delivered the same
+    /// bytes; `how` says whether this node held the block already (see [`Admission`]).
+    fn admit_block(
+        &mut self,
+        block: Arc<Block>,
+        origin: Origin,
+        also: Vec<Origin>,
+        how: Admission,
+    ) -> ImportAck {
         let block_id = block.header.block_id;
         let relay_id = match block_relay_id(&block) {
             Ok(id) => id,
             Err(e) => return ImportAck::Invalid(format!("unencodable header: {e}")),
         };
-        if self.tree.has_block(&block_id)
-            || self.is_pending_relay(&relay_id)
-            || self.invalid_lru.contains(&relay_id)
-        {
+        // Until net closes its connections, a banned source may still deliver blocks;
+        // and its blocks released by a parent in the same turn it was banned are dropped.
+        if self.is_banned(origin) {
+            return ImportAck::Busy;
+        }
+        if self.is_pending_relay(&relay_id) {
+            self.note_co_sender(&relay_id, origin);
+            return ImportAck::Duplicate;
+        }
+        if self.tree.has_block(&block_id) || self.invalid_lru.contains(&relay_id) {
             return ImportAck::Duplicate;
         }
 
@@ -609,30 +829,43 @@ impl ChainActor {
             Ok(()) => {
                 if matches!(origin, Origin::Local | Origin::Disk) {
                     self.finalize_block(block, origin);
+                    ImportAck::Queued
                 } else {
-                    self.in_flight.insert(relay_id, block_id);
-                    self.spawn_stage_a(block, origin);
+                    let entry = QueuedBlock {
+                        block,
+                        relay_id,
+                        origin,
+                        also,
+                    };
+                    self.queue_stage_a(entry, how == Admission::Fresh)
                 }
-                ImportAck::Queued
             }
             Err(TreeError::Duplicate) => ImportAck::Duplicate,
             Err(TreeError::Orphan { parent }) => {
                 let parent_pending = self.is_pending_block(&parent);
-                self.park(parent, block, relay_id, origin);
+                let entry = ParkedBlock {
+                    block,
+                    relay_id,
+                    origin,
+                    also,
+                };
+                self.park(parent, entry);
+                self.publish_status();
                 if parent_pending {
                     ImportAck::Queued
                 } else {
                     ImportAck::Orphan
                 }
             }
-            Err(TreeError::Deferred { .. }) => {
-                self.deferred.push(DeferredEntry {
+            Err(TreeError::Deferred { time_bucket }) => {
+                let entry = DeferredEntry {
                     block,
                     relay_id,
                     origin,
+                    also,
                     expires_at: Instant::now() + Duration::from_secs(600),
-                });
-                ImportAck::Deferred
+                };
+                self.defer(entry, time_bucket, how != Admission::Retry)
             }
             Err(TreeError::TooDeep) => ImportAck::TooDeep,
             Err(TreeError::Invalid(reason)) => {
@@ -642,8 +875,76 @@ impl ChainActor {
         }
     }
 
+    /// Whether `origin` is a peer whose source is banned.
+    fn is_banned(&self, origin: Origin) -> bool {
+        origin
+            .source()
+            .and_then(|s| self.banned.get(&s))
+            .is_some_and(|until| *until > Instant::now())
+    }
+
+    /// Records that `origin` delivered bytes already pending for another source, so the
+    /// block stays pending if that source is banned.
+    fn note_co_sender(&mut self, relay_id: &Digest, origin: Origin) {
+        let Some(source) = origin.source() else {
+            return;
+        };
+        let add = |owner: Origin, also: &mut Vec<Origin>| {
+            if owner.source() != Some(source)
+                && also.len() < CO_SENDERS
+                && !also.iter().any(|o| o.source() == Some(source))
+            {
+                also.push(origin);
+            }
+        };
+        if let Some(s) = self.in_flight.get_mut(relay_id) {
+            add(s.origin, &mut s.also);
+        } else if let Some(q) = self
+            .stage_a_queue
+            .iter_mut()
+            .find(|q| q.relay_id == *relay_id)
+        {
+            add(q.origin, &mut q.also);
+        } else if let Some(d) = self.deferred.iter_mut().find(|d| d.relay_id == *relay_id) {
+            add(d.origin, &mut d.also);
+        } else if let Some(c) = self
+            .parked_by_parent
+            .values_mut()
+            .flat_map(|list| list.iter_mut())
+            .find(|c| c.relay_id == *relay_id)
+        {
+            add(c.origin, &mut c.also);
+        }
+    }
+
+    /// Keeps a block whose time_bucket is ahead of our clock for a retry, unless it is
+    /// too far ahead or, when `limited`, too many are kept already.
+    fn defer(&mut self, entry: DeferredEntry, time_bucket: u64, limited: bool) -> ImportAck {
+        let genesis = self.tree.genesis();
+        let latest = (unix_now_secs() / genesis.time_bucket_secs)
+            .saturating_add((MAX_FUTURE_SECS + DEFERRED_SLACK_SECS) / genesis.time_bucket_secs);
+        if time_bucket > latest {
+            return ImportAck::TooEarly;
+        }
+        if limited {
+            let source = entry.origin.source();
+            let from_source = self
+                .deferred
+                .iter()
+                .filter(|d| d.origin.source() == source)
+                .count();
+            if self.deferred.len() >= DEFERRED_LIMIT || from_source >= DEFERRED_SOURCE_LIMIT {
+                return ImportAck::Busy;
+            }
+        }
+        self.deferred.push(entry);
+        ImportAck::Deferred
+    }
+
     /// Caches the rejected block's relay id (never its block_id, which an invalid copy
-    /// of an honest block can share) and reports the rejection.
+    /// of an honest block can share) and reports the rejection. A peer that sent an
+    /// invalid block gets its source banned, so everything else from that source that
+    /// awaits verification is dropped at once, before any more of it can start.
     fn reject(&mut self, block_id: Digest, relay_id: Digest, origin: Origin, reason: String) {
         debug!(id = ?block_id, ?origin, %reason, "Rejected block");
         self.invalid_lru.insert(relay_id);
@@ -652,6 +953,9 @@ impl ChainActor {
             origin,
             reason,
         });
+        if let Some(source) = origin.source() {
+            self.cancel_source(source, INVALID_BAN);
+        }
     }
 
     /// Admits a gossiped share for verification, cheapest checks first: dedupe, the
@@ -664,6 +968,14 @@ impl ChainActor {
             Ok(id) => id,
             Err(e) => return ShareAck::Invalid(format!("unencodable share: {e}")),
         };
+        if self.is_banned(origin) {
+            return ShareAck::Ignored("the sender is banned");
+        }
+        if self.share_checks.values().any(|c| c.relay_id == relay_id)
+            || self.parked_shares.iter().any(|p| p.relay_id == relay_id)
+        {
+            return ShareAck::Pending;
+        }
         // The pool holds work-checked shares only, so a work_id there is settled.
         let slot = (owner_key_id(&share.owner_key), share.work_id);
         if self.share_pool.contains(&share.work_id)
@@ -678,9 +990,7 @@ impl ChainActor {
             // Shares follow their parent closely: wait if it is in Stage A, so it has
             // passed Stage B. A parked orphan block's id is unauthenticated and does not
             // qualify.
-            ShareCheck::UnknownParent(parent) if self.in_flight.values().any(|b| *b == parent) => {
-                Some(parent)
-            }
+            ShareCheck::UnknownParent(parent) if self.is_in_stage_a(&parent) => Some(parent),
             ShareCheck::UnknownParent(_) => return ShareAck::Ignored("share parent is unknown"),
             ShareCheck::Ignore(why) => return ShareAck::Ignored(why),
             ShareCheck::Invalid(reason) => {
@@ -689,7 +999,7 @@ impl ChainActor {
             }
         };
         if self.share_checks.len() + self.parked_shares.len() >= SHARE_CHECK_LIMIT
-            || self.peer_share_load(origin) >= SHARE_PEER_LIMIT
+            || self.source_share_load(origin) >= SHARE_SOURCE_LIMIT
         {
             return ShareAck::Ignored("too many shares awaiting verification");
         }
@@ -719,13 +1029,17 @@ impl ChainActor {
         }
     }
 
-    /// Shares from `origin` that are parked or awaiting their work check.
-    fn peer_share_load(&self, origin: Origin) -> usize {
-        self.share_checks.values().filter(|o| **o == origin).count()
+    /// Shares from `origin`'s source that are parked or awaiting their work check.
+    fn source_share_load(&self, origin: Origin) -> usize {
+        let source = origin.source();
+        self.share_checks
+            .values()
+            .filter(|c| c.origin.source() == source)
+            .count()
             + self
                 .parked_shares
                 .iter()
-                .filter(|p| p.origin == origin)
+                .filter(|p| p.origin.source() == source)
                 .count()
     }
 
@@ -737,13 +1051,18 @@ impl ChainActor {
         relay_id: Digest,
         origin: Origin,
     ) {
-        self.share_checks.insert(slot, origin);
+        let ticket = self.take_ticket();
         let sem = self.share_verify_sem.clone();
         let tx = self.self_tx.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = async {
-                let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
+                let permit = sem
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| CheckFailure::Internal(e.to_string()))?;
                 tokio::task::spawn_blocking(move || {
+                    // Held until the tile is done, even if this check is cancelled.
+                    let _permit = permit;
                     let proof = signed.proof();
                     verify_fresh_work(
                         &proof.context,
@@ -751,15 +1070,16 @@ impl ChainActor {
                         proof.share_target,
                         Lottery::Share,
                     )
-                    .map_err(|e| format!("share VerifyFW failed: {e}"))?;
+                    .map_err(|e| CheckFailure::Invalid(format!("share VerifyFW failed: {e}")))?;
                     Ok(signed)
                 })
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|e| CheckFailure::Internal(e.to_string()))?
             }
             .await;
             let _ = tx
                 .send(ChainCmd::ShareVerified {
+                    ticket,
                     slot,
                     relay_id,
                     origin,
@@ -767,6 +1087,15 @@ impl ChainActor {
                 })
                 .await;
         });
+        self.share_checks.insert(
+            slot,
+            ShareCheckTask {
+                ticket,
+                origin,
+                relay_id,
+                task: task.abort_handle(),
+            },
+        );
     }
 
     /// Pools a verified share that is still useful and announces it for relay.
@@ -791,12 +1120,16 @@ impl ChainActor {
         true
     }
 
+    /// Like [`Self::reject`], for shares.
     fn reject_share(&mut self, relay_id: Digest, origin: Origin, reason: String) {
         debug!(?origin, %reason, "Rejected share");
         self.invalid_shares.insert(relay_id);
         let _ = self
             .event_tx
             .send(ChainEvent::ShareRejected { origin, reason });
+        if let Some(source) = origin.source() {
+            self.cancel_source(source, INVALID_BAN);
+        }
     }
 
     /// Resumes the shares parked for `parent`, now that it is in the tree: the no-work
@@ -808,7 +1141,10 @@ impl ChainActor {
             .partition(|p| p.parent == parent);
         self.parked_shares = waiting;
         for p in ready {
-            if self.share_pool.contains(&p.slot.1) || self.share_checks.contains_key(&p.slot) {
+            if self.share_pool.contains(&p.slot.1)
+                || self.share_checks.contains_key(&p.slot)
+                || self.is_banned(p.origin)
+            {
                 continue;
             }
             match self.tree.check_gossip_share(p.signed.proof()) {
@@ -837,23 +1173,136 @@ impl ChainActor {
             .prune(min_height, |work_id| tip_state.shares.contains_key(work_id));
     }
 
-    fn spawn_stage_a(&self, block: Arc<Block>, origin: Origin) {
+    fn take_ticket(&mut self) -> u64 {
+        self.next_ticket += 1;
+        self.next_ticket
+    }
+
+    /// Starts Stage A for a peer's block that passed Stage B, or queues it while its
+    /// source (or everyone) has the most blocks in Stage A. A block that just arrived is
+    /// refused when its source has the most blocks queued, or when the queue is full and
+    /// no source holds a larger share of it.
+    fn queue_stage_a(&mut self, entry: QueuedBlock, fresh: bool) -> ImportAck {
+        if self.has_stage_a_slot(entry.origin) {
+            self.start_stage_a(entry);
+            return ImportAck::Queued;
+        }
+        if fresh {
+            let source = entry.origin.source();
+            let queued = self
+                .stage_a_queue
+                .iter()
+                .filter(|q| q.origin.source() == source)
+                .count();
+            if queued >= STAGE_A_QUEUE_SOURCE_LIMIT
+                || (self.stage_a_queue.len() >= STAGE_A_QUEUE_LIMIT
+                    && !self.evict_queued_for(queued))
+            {
+                debug!(id = ?entry.block.header.block_id, origin = ?entry.origin, "Too many blocks awaiting verification");
+                return ImportAck::Busy;
+            }
+        }
+        self.stage_a_queue.push_back(entry);
+        self.publish_status();
+        ImportAck::Queued
+    }
+
+    /// Makes room in the full queue for a block whose source has `queued` blocks in it,
+    /// by dropping the newest block of the source holding the most, if that is clearly
+    /// more. Returns whether room was made.
+    fn evict_queued_for(&mut self, queued: usize) -> bool {
+        let mut counts: HashMap<Option<Source>, usize> = HashMap::new();
+        for q in &self.stage_a_queue {
+            *counts.entry(q.origin.source()).or_default() += 1;
+        }
+        let Some((&heaviest, &most)) = counts.iter().max_by_key(|&(_, n)| *n) else {
+            return false;
+        };
+        if most <= queued + 1 {
+            return false;
+        }
+        let Some(pos) = self
+            .stage_a_queue
+            .iter()
+            .rposition(|q| q.origin.source() == heaviest)
+        else {
+            return false;
+        };
+        if let Some(evicted) = self.stage_a_queue.remove(pos) {
+            debug!(id = ?evicted.block.header.block_id, origin = ?evicted.origin, "Evicted a queued block for another source's");
+            self.drop_parked_shares_unless_pending(evicted.block.header.block_id);
+        }
+        true
+    }
+
+    fn has_stage_a_slot(&self, origin: Origin) -> bool {
+        let source = origin.source();
+        self.in_flight.len() < STAGE_A_LIMIT
+            && self
+                .in_flight
+                .values()
+                .filter(|s| s.origin.source() == source)
+                .count()
+                < STAGE_A_SOURCE_LIMIT
+    }
+
+    fn start_stage_a(&mut self, entry: QueuedBlock) {
+        let ticket = self.take_ticket();
+        let QueuedBlock {
+            block,
+            relay_id,
+            origin,
+            also,
+        } = entry;
+        let block_id = block.header.block_id;
         let sem = self.verify_sem.clone();
         let tx = self.self_tx.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = verify_block_parallel(&block, &sem).await;
             let _ = tx
                 .send(ChainCmd::WorkVerified {
+                    ticket,
                     block,
                     origin,
                     result,
                 })
                 .await;
         });
+        self.in_flight.insert(
+            relay_id,
+            StageA {
+                ticket,
+                block_id,
+                origin,
+                also,
+                task: task.abort_handle(),
+            },
+        );
+        self.stage_a_started += 1;
+        self.publish_status();
+    }
+
+    /// Starts queued blocks, oldest first, while the limits allow.
+    fn start_queued_stage_a(&mut self) {
+        let mut i = 0;
+        while i < self.stage_a_queue.len() && self.in_flight.len() < STAGE_A_LIMIT {
+            if !self.has_stage_a_slot(self.stage_a_queue[i].origin) {
+                i += 1;
+                continue;
+            }
+            let Some(q) = self.stage_a_queue.remove(i) else {
+                break;
+            };
+            // Another copy may have been applied meanwhile.
+            if !self.tree.has_block(&q.block.header.block_id) {
+                self.start_stage_a(q);
+            }
+        }
     }
 
     fn handle_work_verified(
         &mut self,
+        ticket: u64,
         block: Arc<Block>,
         origin: Origin,
         result: Result<(), WorkError>,
@@ -862,9 +1311,30 @@ impl ChainActor {
         let Ok(relay_id) = block_relay_id(&block) else {
             return;
         };
-        self.in_flight.remove(&relay_id);
+        // The block may be verified for another source by now (its first sender was
+        // banned). A result that arrives after its task was cancelled (it was already
+        // on its way) is still used, but must not end another copy's Stage A.
+        let origin = match self.in_flight.get(&relay_id) {
+            Some(s) if s.ticket == ticket => self
+                .in_flight
+                .remove(&relay_id)
+                .map_or(origin, |s| s.origin),
+            _ => origin,
+        };
         match result {
-            Ok(()) => self.finalize_block(block, origin),
+            Ok(()) => {
+                self.finalize_block(block, origin);
+                if self.tree.has_block(&block_id)
+                    && let Some(other) = self.in_flight.remove(&relay_id)
+                {
+                    other.task.abort();
+                }
+            }
+            // Not a verdict on the block: nobody is penalized and nothing is cached.
+            Err(WorkError::Internal(e)) => {
+                warn!(id = ?block_id, error = %e, "Stage A could not run; block dropped");
+                self.drop_parked_shares_unless_pending(block_id);
+            }
             // A Stage A failure shows these bytes are bad, not that no valid block has
             // this block_id (the claims checked here are not all bound by it), so
             // children parked under the block_id stay parked for the genuine parent.
@@ -878,15 +1348,121 @@ impl ChainActor {
                 self.drop_parked_shares_unless_pending(block_id);
             }
         }
+        self.start_queued_stage_a();
+        self.publish_status();
     }
 
     /// Drops, without penalty, the shares parked for `block_id` unless another copy
-    /// of that block is still in Stage A. A block id is unauthenticated until Stage A
-    /// passes, so shares parked behind a block that fails it may name a fabricated one.
+    /// of that block is still in (or waiting for) Stage A. A block id is unauthenticated
+    /// until Stage A passes, so shares parked behind a block that fails it may name a
+    /// fabricated one.
     fn drop_parked_shares_unless_pending(&mut self, block_id: Digest) {
-        if !self.in_flight.values().any(|b| *b == block_id) {
+        if !self.is_in_stage_a(&block_id) {
             self.parked_shares.retain(|p| p.parent != block_id);
         }
+    }
+
+    /// Drops what `source` sent that still awaits verification: its Stage A tasks and
+    /// share work checks are aborted (a tile already computing finishes, and its result
+    /// is discarded), and its queued, parked and deferred blocks and parked shares are
+    /// dropped. A block another source delivered too stays pending for that source,
+    /// keeping its place (a running Stage A goes on). Nothing is condemned: an honest
+    /// copy of what was dropped can still be imported.
+    fn cancel_source(&mut self, source: Source, ban: Duration) {
+        let now = Instant::now();
+        self.banned.retain(|_, until| *until > now);
+        let until = now + ban;
+        let entry = self.banned.entry(source).or_insert(until);
+        *entry = (*entry).max(until);
+        let theirs = |o: &Origin| o.source() == Some(source);
+        // Keeps an entry by moving it to a co-sender; false if none is left.
+        let hand_over = |origin: &mut Origin, also: &mut Vec<Origin>| {
+            also.retain(|o| !theirs(o));
+            if theirs(origin) {
+                if also.is_empty() {
+                    return false;
+                }
+                *origin = also.remove(0);
+            }
+            true
+        };
+        let mut dropped = Vec::new();
+        let mut dropped_ids = Vec::new();
+        self.in_flight.retain(|relay_id, s| {
+            let keep = hand_over(&mut s.origin, &mut s.also);
+            if !keep {
+                s.task.abort();
+                dropped.push(*relay_id);
+                dropped_ids.push(s.block_id);
+            }
+            keep
+        });
+        self.stage_a_queue.retain_mut(|q| {
+            let keep = hand_over(&mut q.origin, &mut q.also);
+            if !keep {
+                dropped.push(q.relay_id);
+                dropped_ids.push(q.block.header.block_id);
+            }
+            keep
+        });
+        self.deferred.retain_mut(|d| {
+            let keep = hand_over(&mut d.origin, &mut d.also);
+            if !keep {
+                dropped.push(d.relay_id);
+            }
+            keep
+        });
+        let parked_before = dropped.len();
+        for list in self.parked_by_parent.values_mut() {
+            list.retain_mut(|c| {
+                let keep = hand_over(&mut c.origin, &mut c.also);
+                if !keep {
+                    dropped.push(c.relay_id);
+                }
+                keep
+            });
+        }
+        if dropped.len() > parked_before {
+            let gone: HashSet<Digest> = dropped[parked_before..].iter().copied().collect();
+            self.parked_by_parent.retain(|_, list| !list.is_empty());
+            self.parked_order.retain(|r| !gone.contains(&r.relay_id));
+        }
+        // Parked blocks handed over now count for their new source.
+        let senders: HashMap<Digest, Option<Source>> = self
+            .parked_by_parent
+            .values()
+            .flatten()
+            .map(|c| (c.relay_id, c.origin.source()))
+            .collect();
+        for r in &mut self.parked_order {
+            if let Some(source) = senders.get(&r.relay_id) {
+                r.source = *source;
+            }
+        }
+        let shares_before = self.share_checks.len() + self.parked_shares.len();
+        self.share_checks.retain(|_, c| {
+            if theirs(&c.origin) {
+                c.task.abort();
+                return false;
+            }
+            true
+        });
+        self.parked_shares.retain(|p| !theirs(&p.origin));
+        let dropped_shares = shares_before - self.share_checks.len() - self.parked_shares.len();
+        for block_id in dropped_ids {
+            self.drop_parked_shares_unless_pending(block_id);
+        }
+        if dropped.is_empty() && dropped_shares == 0 {
+            return;
+        }
+        info!(
+            ?source,
+            blocks = dropped.len(),
+            shares = dropped_shares,
+            "Dropped the pending verification work of a banned source"
+        );
+        self.start_queued_stage_a();
+        self.publish_status();
     }
 
     fn finalize_block(&mut self, block: Arc<Block>, origin: Origin) {
@@ -924,7 +1500,8 @@ impl ChainActor {
                 }
                 // Re-submit the parked blocks and shares whose parent is this block (§8.3).
                 for child in self.take_parked_children(block_id) {
-                    let _ = self.import_block(child.block, child.origin);
+                    let _ =
+                        self.admit_block(child.block, child.origin, child.also, Admission::Parked);
                 }
                 self.release_parked_shares(block_id);
             }
@@ -945,34 +1522,59 @@ impl ChainActor {
         }
     }
 
-    fn park(&mut self, parent: Digest, block: Arc<Block>, relay_id: Digest, origin: Origin) {
-        while self.parked_order.len() >= ORPHAN_LIMIT {
-            let Some((old_relay, _, old_parent)) = self.parked_order.pop_front() else {
-                break;
+    /// Parks a block until its parent arrives. Orphans cost nothing to make, so when its
+    /// source has parked its share the source's own oldest one makes room, and when the
+    /// orphan set is full, the oldest one of the source holding the most does.
+    fn park(&mut self, parent: Digest, entry: ParkedBlock) {
+        let source = entry.origin.source();
+        let mut counts: HashMap<Option<Source>, usize> = HashMap::new();
+        for r in &self.parked_order {
+            *counts.entry(r.source).or_default() += 1;
+        }
+        let own = counts.get(&source).copied().unwrap_or(0);
+        if own >= ORPHAN_SOURCE_LIMIT {
+            self.evict_parked(source);
+        } else if self.parked_order.len() >= ORPHAN_LIMIT {
+            let most = counts.values().copied().max().unwrap_or(0);
+            let heaviest = if own == most {
+                source
+            } else {
+                counts
+                    .iter()
+                    .find(|&(_, n)| *n == most)
+                    .map_or(source, |(s, _)| *s)
             };
-            if let Some(list) = self.parked_by_parent.get_mut(&old_parent) {
-                list.retain(|e| e.relay_id != old_relay);
-                if list.is_empty() {
-                    self.parked_by_parent.remove(&old_parent);
-                }
+            self.evict_parked(heaviest);
+        }
+        self.parked_order.push_back(ParkedRef {
+            relay_id: entry.relay_id,
+            block_id: entry.block.header.block_id,
+            parent,
+            source,
+        });
+        self.parked_by_parent.entry(parent).or_default().push(entry);
+    }
+
+    /// Drops the oldest parked block of `source`.
+    fn evict_parked(&mut self, source: Option<Source>) {
+        let Some(pos) = self.parked_order.iter().position(|r| r.source == source) else {
+            return;
+        };
+        let Some(old) = self.parked_order.remove(pos) else {
+            return;
+        };
+        if let Some(list) = self.parked_by_parent.get_mut(&old.parent) {
+            list.retain(|e| e.relay_id != old.relay_id);
+            if list.is_empty() {
+                self.parked_by_parent.remove(&old.parent);
             }
         }
-        self.parked_order
-            .push_back((relay_id, block.header.block_id, parent));
-        self.parked_by_parent
-            .entry(parent)
-            .or_default()
-            .push(ParkedBlock {
-                block,
-                relay_id,
-                origin,
-            });
     }
 
     fn take_parked_children(&mut self, parent: Digest) -> Vec<ParkedBlock> {
         let children = self.parked_by_parent.remove(&parent).unwrap_or_default();
         if !children.is_empty() {
-            self.parked_order.retain(|(_, _, p)| *p != parent);
+            self.parked_order.retain(|r| r.parent != parent);
         }
         children
     }
@@ -999,18 +1601,20 @@ impl ChainActor {
             .partition(|e| e.block.header.context.time_bucket <= ready_bucket);
         self.deferred = waiting;
         for entry in ready {
-            let _ = self.import_block(entry.block, entry.origin);
+            let _ = self.admit_block(entry.block, entry.origin, entry.also, Admission::Retry);
         }
     }
 
     fn publish_status(&self) {
-        let snap = build_status_snapshot(
-            &self.tree,
-            &self.miner,
-            self.start_instant,
-            self.parked_order.len(),
-            self.share_pool.len(),
-        );
+        let counts = PipelineCounts {
+            orphans: self.parked_order.len(),
+            share_pool: self.share_pool.len(),
+            verifying_blocks: self.in_flight.len(),
+            queued_blocks: self.stage_a_queue.len(),
+            deferred_blocks: self.deferred.len(),
+            stage_a_started: self.stage_a_started,
+        };
+        let snap = build_status_snapshot(&self.tree, &self.miner, self.start_instant, counts);
         let _ = self.status_tx.send(Arc::new(snap));
     }
 
@@ -1053,55 +1657,67 @@ impl ChainActor {
 
 async fn verify_block_parallel(block: &Arc<Block>, sem: &Arc<Semaphore>) -> Result<(), WorkError> {
     // Signatures first: about 0.5 ms each, so a forged block is rejected before any of
-    // its tiles (tens of ms each) is recomputed.
-    {
-        let _permit = sem
-            .acquire()
-            .await
-            .map_err(|e| WorkError::Internal(e.to_string()))?;
-        let signed = block.clone();
-        tokio::task::spawn_blocking(move || BlockTree::verify_signatures(&signed))
-            .await
-            .map_err(|e| WorkError::Internal(e.to_string()))??;
-    }
+    // its tiles (tens of ms each) is recomputed. Each permit moves into its blocking
+    // task: work that is already computing keeps its CPU slot until it finishes, even
+    // if this Stage A is aborted.
+    let permit = sem
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| WorkError::Internal(e.to_string()))?;
+    let signed = block.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        BlockTree::verify_signatures(&signed)
+    })
+    .await
+    .map_err(|e| WorkError::Internal(e.to_string()))??;
 
-    let mut jobs = vec![(
+    // Then the header's tile alone: the seal is the work that is costly to fake, so a
+    // block's share tiles are only recomputed once its seal is known to be genuine.
+    let header_tile = (
         block.header.context.clone(),
         ClaimedWork::from_header(&block.header),
         block.header.seal_target,
         Lottery::Seal,
-    )];
-    jobs.extend(block.body.shares.iter().map(|sh| {
+    );
+    let share_tiles = block.body.shares.iter().map(|sh| {
         (
             sh.context.clone(),
             ClaimedWork::from_share(sh),
             sh.share_target,
             Lottery::Share,
         )
-    }));
+    });
+    verify_tiles(std::iter::once(header_tile), sem).await?;
+    verify_tiles(share_tiles, sem).await
+}
 
-    let handles: Vec<_> = jobs
-        .into_iter()
-        .map(|(ctx, claimed, target, lottery)| {
-            let sem = sem.clone();
-            tokio::spawn(async move {
-                let _permit = sem
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| WorkError::Internal(e.to_string()))?;
-                tokio::task::spawn_blocking(move || {
-                    verify_fresh_work(&ctx, &claimed, target, lottery)
-                })
+/// Recomputes tiles in parallel, each under a permit of `sem`.
+async fn verify_tiles(
+    jobs: impl Iterator<Item = (FwContext, ClaimedWork, Target, Lottery)>,
+    sem: &Arc<Semaphore>,
+) -> Result<(), WorkError> {
+    let mut tiles = JoinSet::new();
+    for (ctx, claimed, target, lottery) in jobs {
+        let sem = sem.clone();
+        tiles.spawn(async move {
+            let permit = sem
+                .acquire_owned()
                 .await
-                .map_err(|e| WorkError::Internal(e.to_string()))?
+                .map_err(|e| WorkError::Internal(e.to_string()))?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                verify_fresh_work(&ctx, &claimed, target, lottery)
             })
-        })
-        .collect();
-
-    for handle in handles {
-        handle
             .await
-            .map_err(|e| WorkError::Internal(e.to_string()))??;
+            .map_err(|e| WorkError::Internal(e.to_string()))?
+        });
+    }
+    // The first failure returns, and dropping `tiles` aborts the tiles still waiting
+    // for a permit; aborting the Stage A task does the same.
+    while let Some(joined) = tiles.join_next().await {
+        joined.map_err(|e| WorkError::Internal(e.to_string()))??;
     }
     Ok(())
 }
@@ -1110,8 +1726,7 @@ fn build_status_snapshot(
     tree: &BlockTree,
     miner: &OwnerKeypair,
     start_instant: Instant,
-    orphan_count: usize,
-    share_pool: usize,
+    counts: PipelineCounts,
 ) -> StatusSnapshot {
     let state = tree.tip_state();
     let ledger = &state.ledger;
@@ -1136,7 +1751,11 @@ fn build_status_snapshot(
         locked_fees: ledger.locked_fees().len(),
         pending_payout: state.pending_payout,
         open_jobs: state.open_jobs.len(),
-        orphan_count,
-        share_pool,
+        orphan_count: counts.orphans,
+        share_pool: counts.share_pool,
+        verifying_blocks: counts.verifying_blocks,
+        queued_blocks: counts.queued_blocks,
+        deferred_blocks: counts.deferred_blocks,
+        stage_a_started: counts.stage_a_started,
     }
 }

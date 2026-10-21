@@ -104,6 +104,10 @@ pub struct MempoolActor {
     fifo: VecDeque<PooledEntry>,
     by_tx_id: HashSet<Digest>,
     by_job_id: HashMap<u64, Digest>,
+    // Jobs on the canonical chain that have not expired, by tx_id and by job_id, with
+    // their expiry height (as the STF keeps them): a copy submitted again is a duplicate.
+    included_tx: HashMap<Digest, u64>,
+    included_jobs: HashMap<u64, u64>,
 }
 
 fn rejection_code(err: &JobValidationError) -> &'static str {
@@ -135,6 +139,8 @@ impl MempoolActor {
             fifo: VecDeque::new(),
             by_tx_id: HashSet::new(),
             by_job_id: HashMap::new(),
+            included_tx: HashMap::new(),
+            included_jobs: HashMap::new(),
         }
     }
 
@@ -189,7 +195,10 @@ impl MempoolActor {
         // Duplicates first: a re-signed or forged copy of a pooled job has the same
         // tx_id, and rejecting it costs one hash instead of a full validation.
         if let Ok((tx_id, job_id)) = compute_job_ids(&tx)
-            && (self.by_tx_id.contains(&tx_id) || self.by_job_id.contains_key(&job_id))
+            && (self.by_tx_id.contains(&tx_id)
+                || self.by_job_id.contains_key(&job_id)
+                || self.included_tx.contains_key(&tx_id)
+                || self.included_jobs.contains_key(&job_id))
         {
             return Err(MempoolReject::Duplicate);
         }
@@ -257,6 +266,24 @@ impl MempoolActor {
             .filter_map(|tx| compute_job_ids(tx).ok().map(|(id, _)| id))
             .collect();
         let next_height = tip_height + 1;
+
+        // Track the unexpired jobs of the canonical chain: the abandoned branch's leave,
+        // the new branch's join.
+        for tx in disconnected.iter().flat_map(|blk| &blk.body.jobs) {
+            if let Ok((tx_id, job_id)) = compute_job_ids(tx) {
+                self.included_tx.remove(&tx_id);
+                self.included_jobs.remove(&job_id);
+            }
+        }
+        for tx in connected.iter().flat_map(|blk| &blk.body.jobs) {
+            if let Ok((tx_id, job_id)) = compute_job_ids(tx) {
+                self.included_tx.insert(tx_id, tx.expiry_height);
+                self.included_jobs.insert(job_id, tx.expiry_height);
+            }
+        }
+        self.included_tx.retain(|_, expiry| *expiry >= next_height);
+        self.included_jobs
+            .retain(|_, expiry| *expiry >= next_height);
 
         // Remove txs included by the new branch, and txs that expired.
         self.remove_where(|e| connected_txs.contains(&e.tx_id) || e.tx.expiry_height < next_height);

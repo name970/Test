@@ -19,6 +19,9 @@ use crate::chain_actor::ChainCmd;
 pub struct ConsensusEngine {
     threads: usize,
     enabled: AtomicBool,
+    /// Closed while `--mine-when-synced` waits for peers and sync; miners run only while
+    /// both `enabled` and this hold.
+    sync_gate: AtomicBool,
     shutdown: AtomicBool,
     attempts: AtomicU64,
     shares_found: AtomicU64,
@@ -27,16 +30,19 @@ pub struct ConsensusEngine {
 }
 
 impl ConsensusEngine {
-    /// Spawns `threads` OS miner threads and the EWMA rate task (§8.5).
+    /// Spawns `threads` OS miner threads and the EWMA rate task (§8.5). With
+    /// `gated`, the miners wait until [`Self::set_sync_gate`] opens the sync gate.
     pub fn spawn(
         threads: usize,
         initially_enabled: bool,
+        gated: bool,
         templates: watch::Receiver<Option<Arc<Template>>>,
         chain_tx: mpsc::Sender<ChainCmd>,
     ) -> std::io::Result<Arc<Self>> {
         let engine = Arc::new(Self {
             threads,
             enabled: AtomicBool::new(initially_enabled && threads > 0),
+            sync_gate: AtomicBool::new(!gated),
             shutdown: AtomicBool::new(false),
             attempts: AtomicU64::new(0),
             shares_found: AtomicU64::new(0),
@@ -87,9 +93,19 @@ impl ConsensusEngine {
         }
     }
 
-    /// Whether the miners are running.
+    /// Whether mining is enabled (it may still wait for the sync gate).
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Opens or closes the sync gate (`--mine-when-synced`).
+    pub fn set_sync_gate(&self, open: bool) {
+        self.sync_gate.store(open, Ordering::Relaxed);
+    }
+
+    /// Whether the sync gate lets the miners run.
+    pub fn sync_gate_open(&self) -> bool {
+        self.sync_gate.load(Ordering::Relaxed)
     }
 
     /// Number of miner threads.
@@ -136,7 +152,7 @@ fn miner_thread_loop(
     let mut nonce = thread_idx as u64;
     let mut sealed_at: Option<Instant> = None;
     while !engine.shutdown.load(Ordering::Relaxed) {
-        if !engine.enabled.load(Ordering::Relaxed) {
+        if !engine.enabled.load(Ordering::Relaxed) || !engine.sync_gate.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }

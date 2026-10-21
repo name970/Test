@@ -103,6 +103,7 @@ struct StatusResponse {
     node: NodeInfoDto,
     tip: TipInfoDto,
     mining: MiningInfoDto,
+    verification: VerificationInfoDto,
     mempool: MempoolInfoDto,
     ledger: LedgerInfoDto,
     commercial_consensus_weight: u64,
@@ -147,6 +148,22 @@ struct MiningInfoDto {
     seals_found: u64,
     /// Verified shares (own and gossiped) waiting for a block.
     share_pool: usize,
+    /// `--mine-when-synced`: mining is enabled but waits for peers and sync.
+    waiting_for_sync: bool,
+}
+
+#[derive(Serialize)]
+struct VerificationInfoDto {
+    /// Blocks in Stage A (signatures and tile recomputation).
+    verifying_blocks: usize,
+    /// Blocks waiting for a Stage A slot.
+    queued_blocks: usize,
+    /// Blocks kept for a retry because their time bucket is ahead of the local clock.
+    deferred_blocks: usize,
+    /// Blocks that entered Stage A since the node started.
+    stage_a_started: u64,
+    /// Blocks parked until their parent arrives.
+    orphans: usize,
 }
 
 #[derive(Serialize)]
@@ -221,6 +238,14 @@ async fn handle_status(State(state): State<RpcState>) -> Json<StatusResponse> {
             shares_found: state.engine.shares_found(),
             seals_found: state.engine.seals_found(),
             share_pool: snap.share_pool,
+            waiting_for_sync: state.engine.is_enabled() && !state.engine.sync_gate_open(),
+        },
+        verification: VerificationInfoDto {
+            verifying_blocks: snap.verifying_blocks,
+            queued_blocks: snap.queued_blocks,
+            deferred_blocks: snap.deferred_blocks,
+            stage_a_started: snap.stage_a_started,
+            orphans: snap.orphan_count,
         },
         mempool: MempoolInfoDto { size: mempool_size },
         ledger: LedgerInfoDto {

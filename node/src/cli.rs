@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::net::PeerAddr;
+
 const KNOWN_GAPS_HELP: &str = "\
 KNOWN TESTNET GAPS (blueprint §1.2; gaps 1, 2 and 4 are closed in v1):
   3. VerifyFW by recomputation: validators recompute 512x512 INT8 tiles (no Circle STARK, no P-DAL).
@@ -36,6 +38,8 @@ pub enum Command {
     Genesis(GenesisArgs),
     /// Run a Plauthium testnet node.
     Run(RunArgs),
+    /// Create the miner key if it does not exist yet, then print its identity.
+    Key(KeyArgs),
 }
 
 /// Difficulty adjustment mode for `genesis`.
@@ -79,6 +83,17 @@ pub struct GenesisArgs {
     pub settle_delay: u64,
 }
 
+/// Arguments of `plauthium-node key`.
+#[derive(Clone, Debug, Args)]
+pub struct KeyArgs {
+    /// Node data directory (holds the miner key by default).
+    #[arg(long)]
+    pub data_dir: PathBuf,
+    /// ML-DSA-87 miner key file (default: <DATA_DIR>/miner_key.bin).
+    #[arg(long)]
+    pub key_file: Option<PathBuf>,
+}
+
 /// Arguments of `plauthium-node run`.
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
@@ -99,15 +114,22 @@ pub struct RunArgs {
     /// HTTP listen address for the JSON RPC and web explorer.
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub rpc_listen: SocketAddr,
-    /// Static peer socket addresses (may be passed multiple times).
+    /// Static peer, as IP:port or host:port (may be passed multiple times). Host names
+    /// are resolved again before every connection attempt.
     #[arg(long = "peer")]
-    pub peers: Vec<SocketAddr>,
+    pub peers: Vec<PeerAddr>,
     /// Number of OS threads for Fresh Work tile mining.
     #[arg(long, default_value_t = 1)]
     pub mining_threads: usize,
     /// Disable block mining on this node.
     #[arg(long, default_value_t = false)]
     pub no_mine: bool,
+    /// Start mining only once connected to a peer and caught up with the best height
+    /// peers report (or once the tip has not moved for a minute while connected), and
+    /// pause again whenever no peer is connected, so a node that cannot reach the
+    /// network does not mine a private fork.
+    #[arg(long, default_value_t = false)]
+    pub mine_when_synced: bool,
     /// Number of concurrent Stage A verification tasks (default: CPUs / 2). Gossiped
     /// shares get half as many again (at least one) for their work checks.
     #[arg(long)]

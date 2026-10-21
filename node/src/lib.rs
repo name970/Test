@@ -18,15 +18,15 @@ pub mod store;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 use wire::{DifficultyMode, Digest, GenesisConfig, Target};
 
 use crate::chain_actor::{ChainActor, ChainCmd, ChainEvent, StatusSnapshot};
-use crate::cli::{DifficultyArg, GenesisArgs, RunArgs};
+use crate::cli::{DifficultyArg, GenesisArgs, KeyArgs, RunArgs};
 use crate::engine::ConsensusEngine;
 use crate::mempool::{MempoolActor, MempoolCmd, MempoolEvent, MempoolView};
 use crate::net::PeerManager;
@@ -59,6 +59,8 @@ pub struct NodeHandle {
     pub peer_manager: Arc<PeerManager>,
     shutdown_tx: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    /// Held until the node is dropped: no second node can use the data directory.
+    _data_dir_lock: std::fs::File,
 }
 
 impl NodeHandle {
@@ -120,6 +122,18 @@ pub fn run_genesis_cmd(args: GenesisArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// `plauthium-node key`: loads the miner key, creating it first if it does not exist,
+/// and prints where it is and the identity it gives the node.
+pub fn run_key_cmd(args: KeyArgs) -> Result<(), NodeError> {
+    let key_path = keystore::key_path(&args.data_dir, args.key_file.as_deref());
+    let (key, created) = keystore::load_or_create(&key_path)?;
+    println!("key_file: {}", key_path.display());
+    println!("status: {}", if created { "created" } else { "loaded" });
+    println!("key_id: {}", key.key_id().to_hex());
+    println!("owner_id: {}", key.owner_id());
+    Ok(())
+}
+
 /// Loads the genesis file named by `--genesis`, or the embedded default.
 pub fn load_genesis(args: &RunArgs) -> Result<GenesisConfig, NodeError> {
     let genesis: GenesisConfig = match &args.genesis {
@@ -130,20 +144,91 @@ pub fn load_genesis(args: &RunArgs) -> Result<GenesisConfig, NodeError> {
     Ok(genesis)
 }
 
+/// Grace period before warning that no peer is connected, and the interval between
+/// such warnings.
+const NO_PEER_GRACE: Duration = Duration::from_secs(30);
+const NO_PEER_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+/// With `--mine-when-synced`, mining also starts once the tip has not moved for this
+/// long while a peer is connected: a peer may claim a height it cannot deliver.
+const SYNC_STALL: Duration = Duration::from_secs(60);
+
+/// Watches the connection to the network. A node with static peers warns while none is
+/// connected. With `--mine-when-synced` (`gated`) it also opens the mining gate once a
+/// peer is connected and the node has caught up with the best height peers report, or
+/// syncing has stalled; the gate then stays open until no peer is left.
+fn spawn_peer_watch(
+    engine: Arc<ConsensusEngine>,
+    peers: Arc<PeerManager>,
+    status_rx: watch::Receiver<Arc<StatusSnapshot>>,
+    mut shutdown: watch::Receiver<bool>,
+    gated: bool,
+    has_static_peers: bool,
+) {
+    if !gated && !has_static_peers {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut alone_since = Instant::now();
+        let mut last_warning: Option<Instant> = None;
+        let mut progress = (status_rx.borrow().tip.height, Instant::now());
+        loop {
+            let tip = status_rx.borrow().tip.height;
+            if tip != progress.0 {
+                progress = (tip, Instant::now());
+            }
+            let connected = peers.peer_count() > 0;
+            if connected {
+                alone_since = Instant::now();
+            } else {
+                // Only time spent connected without progress counts as a stalled sync.
+                progress = (tip, Instant::now());
+                if has_static_peers
+                    && alone_since.elapsed() >= NO_PEER_GRACE
+                    && last_warning.is_none_or(|t| t.elapsed() >= NO_PEER_WARNING_INTERVAL)
+                {
+                    warn!(
+                        mining_paused = gated,
+                        "No peer connected; check the --peer addresses and the network"
+                    );
+                    last_warning = Some(Instant::now());
+                }
+            }
+            if gated {
+                let caught_up = peers.best_peer_height().is_some_and(|best| tip >= best);
+                let stalled = progress.1.elapsed() >= SYNC_STALL;
+                let open = connected && (engine.sync_gate_open() || caught_up || stalled);
+                if open != engine.sync_gate_open() {
+                    engine.set_sync_gate(open);
+                    if open {
+                        info!(height = tip, "Connected and caught up; mining");
+                    } else {
+                        info!("No peer connected; mining paused until the node is caught up again");
+                    }
+                }
+            }
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                res = shutdown.changed() => {
+                    if res.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Starts all actors, P2P networking, the ConsensusEngine and the Axum RPC for one node.
 pub async fn start_node(args: RunArgs) -> Result<NodeHandle, NodeError> {
     let profile_check = chain::testnet_ozaki_profile().validate();
     profile_check.map_err(|e| format!("TESTNET_PROFILE validation failed: {e}"))?;
     let genesis = load_genesis(&args)?;
 
-    let key_path = args
-        .key_file
-        .clone()
-        .unwrap_or_else(|| args.data_dir.join(keystore::KEY_FILE_NAME));
-    if args.reset && args.data_dir.exists() {
+    let key_path = keystore::key_path(&args.data_dir, args.key_file.as_deref());
+    let data_dir_lock = keystore::lock_data_dir(&args.data_dir)?;
+    if args.reset {
         keystore::reset_data_dir(&args.data_dir, &key_path)?;
     }
-    std::fs::create_dir_all(&args.data_dir)?;
     let (miner, created) = keystore::load_or_create(&key_path)?;
     let miner = Arc::new(miner);
     info!(
@@ -183,9 +268,11 @@ pub async fn start_node(args: RunArgs) -> Result<NodeHandle, NodeError> {
     chain_actor.replay_disk_blocks(disk_blocks);
 
     let mining_threads = if args.no_mine { 0 } else { args.mining_threads };
+    let gated = args.mine_when_synced && mining_threads > 0;
     let engine = ConsensusEngine::spawn(
         mining_threads,
         mining_threads > 0,
+        gated,
         template_rx,
         chain_tx.clone(),
     )?;
@@ -214,6 +301,14 @@ pub async fn start_node(args: RunArgs) -> Result<NodeHandle, NodeError> {
     )
     .await?;
     let p2p_addr = peer_manager.local_addr();
+    spawn_peer_watch(
+        engine.clone(),
+        peer_manager.clone(),
+        status_rx.clone(),
+        shutdown_rx.clone(),
+        gated,
+        !args.peers.is_empty(),
+    );
 
     let rpc_addr = spawn_rpc_server(
         args.rpc_listen,
@@ -239,5 +334,6 @@ pub async fn start_node(args: RunArgs) -> Result<NodeHandle, NodeError> {
         peer_manager,
         shutdown_tx,
         tasks,
+        _data_dir_lock: data_dir_lock,
     })
 }

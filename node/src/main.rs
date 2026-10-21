@@ -18,6 +18,7 @@ async fn main() -> Result<(), NodeError> {
 
     match Cli::parse().command {
         Command::Genesis(args) => node::run_genesis_cmd(args)?,
+        Command::Key(args) => node::run_key_cmd(args)?,
         Command::Run(args) => {
             let handle = node::start_node(args).await?;
             info!(

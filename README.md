@@ -1,4 +1,4 @@
-# Plauthium workspace: core + multi-node P2P testnet (v1 in progress)
+# Plauthium workspace: core + Public Testnet v1
 
 Rust workspace for the Plauthium post-quantum layer-1. The six core crates are a frozen,
 tested mathematical core that follows the *Plauthium Technical Specification*. Three
@@ -7,12 +7,13 @@ testnet crates wrap it into a multi-node P2P network, as specified in
 and every public item is documented.
 
 ```sh
-cargo test --workspace --release   # 75 tests, including the 3-node integration test (~2 min)
+cargo test --workspace --release   # 88 tests, including the 3-node integration test (~2-3 min)
 cargo run -p poc                   # core: mock block transition + ASCII summary
-scripts/local_testnet.sh           # 3 mining nodes on localhost with live explorers
+scripts/testnet.sh                 # join the public testnet, or start a local 3-node testnet
 ```
 
 Run the tests in release mode. Every block involves at least one real 512×512 tile product.
+The workspace needs Rust 1.89 or newer.
 
 ## Crates
 
@@ -24,27 +25,30 @@ Run the tests in release mode. Every block involves at least one real 512×512 t
 | `scheduler`  | §6.1–6.5  | `ShareID`, sequential D'Hondt (`w_s/(a_s+1)` by exact cross-multiplication, ties to least ShareID), owner capacity, persistent cohort counters |
 | `ledger`     | §7.1–7.8  | 8 disjoint `StateCategory` balances, atomic zero-sum deltas, `FounderVesting` (1,460 daily tranches × 720 blocks), `FeeLot` with ceiling budgets, floor payouts and segregated dust |
 | `poc`        | —         | Binary that runs Genesis → Fresh Work → D'Hondt → Base Fee lock/maturation/payout |
-| `wire`       | blueprint §3–§5 | The six P2P messages (incl. `GossipShare`), block/job/share types, `Digest`/`Target`, fixed-width ML-DSA-87 `PublicKey`/`Signature`, the bincode 1.3.3 codec (fixed-width little-endian, trailing bytes rejected), protocol constants |
+| `wire`       | blueprint §3–§5 | The six P2P messages (incl. `GossipShare`; the `Handshake` carries the genesis id and a node nonce), block/job/share types, `Digest`/`Target`, fixed-width ML-DSA-87 `PublicKey`/`Signature`, the bincode 1.3.3 codec (fixed-width little-endian, trailing bytes rejected), protocol constants |
 | `chain`      | blueprint §6–§7 | Genesis validation, Stage A (signatures, then VerifyFW by recomputing the tile) and Stage B (context checks), windowed retarget, `apply_body` (the state transition on `ledger::Ledger`), D'Hondt leases, templates, `BlockTree` with heaviest-seal-weight fork choice, ML-DSA-87 owner keys (`chain::keys`) |
-| `node`       | blueprint §8–§10 | `plauthium-node`: ChainState / Mempool actors, multi-threaded ConsensusEngine, length-delimited TCP PeerManager with sync, append-only `blocks.log`, persistent miner key, share pool with `GossipShare` relay, axum JSON RPC and the embedded explorer |
+| `node`       | blueprint §8–§10 | `plauthium-node`: ChainState / Mempool actors, multi-threaded ConsensusEngine, length-delimited TCP PeerManager with sync, append-only `blocks.log`, persistent miner key, share pool with `GossipShare` relay, Stage A limits per source, host-name bootnodes, axum JSON RPC and the embedded explorer |
 
-## Local 3-node testnet
+## Running a node
 
-```sh
-scripts/local_testnet.sh
-```
+`bash plauthium_all_in_one.sh` writes the workspace, builds `plauthium-node` and asks
+which of three to run. `scripts/testnet.sh` does the same from a checkout, and
+`--join`, `--verify` and `--local` choose without asking (also in the bundle):
 
-The script builds the release binary and writes `target/testnet/genesis.json`
-(`--seal-attempts 128 --target-block-secs 5 --blocks-per-epoch 12`). It then starts three
-fully meshed mining nodes. Their explorers are at:
+- **a) `--join`**: one node on Public Testnet v1 that mines once it is connected and
+  caught up (`--mine-when-synced`).
+- **b) `--verify`**: the same node without mining (`--no-mine`): it syncs, verifies and
+  relays.
+- **c) `--local`**: a local dev testnet of three fully meshed mining nodes with a fresh
+  genesis (`--seal-attempts 128 --target-block-secs 5 --blocks-per-epoch 12`) and
+  explorers at <http://127.0.0.1:8081/>, <http://127.0.0.1:8082/> and
+  <http://127.0.0.1:8083/>. Node `i` peers on `127.0.0.1:3034i` and keeps its data in
+  `target/testnet/n<i>`; every run resets the chain data.
 
-- Node 1: <http://127.0.0.1:8081/>
-- Node 2: <http://127.0.0.1:8082/>
-- Node 3: <http://127.0.0.1:8083/>
-
-On its first run each node generates an ML-DSA-87 miner key in
-`target/testnet/n<i>/miner_key.bin` and loads it on every later run. `--reset` wipes the
-chain data but keeps the key, so a node keeps its identity across restarts.
+Every node creates its ML-DSA-87 miner key on its first run and loads it on every later
+run; the launcher shows the key file and owner id before starting
+(`plauthium-node key --data-dir DIR` does the same by hand). `--reset` wipes the chain
+data but keeps the key. Ctrl-C stops the nodes gracefully.
 
 Each explorer shows the 8 ledger categories with a live `Σ = M` check, the block feed and a
 job-submission form. Jobs become fundable once the first epoch reward is paid into `U`, at
@@ -62,6 +66,89 @@ curl -s localhost:8081/api/submit_job -H 'content-type: application/json' \
 Other endpoints: `GET /api/status` and `GET /api/blocks?limit=20&before=<height>`. Run
 `plauthium-node --help`, `plauthium-node genesis --help` and `plauthium-node run --help` for
 the CLI.
+
+## Public Testnet v1
+
+All nodes built from this source share one genesis: `node/genesis.testnet.json`,
+embedded in the binary, with `genesis_time_bucket` fixed at `1792540800`
+(2026-10-21T00:00:00Z, the v1 launch). Its genesis id is
+
+```text
+2804064dac4e30a4cb47aa0d87c4da05427c6bcdb8d1d5aa45a1fd69c3677d5cd8d441d3beb877317277096139b6205287472d078dedea8e525be60ee5f5114e
+```
+
+and `node/tests/public_testnet.rs` fails if it changes. Retargeting never reads the
+genesis time (its windows start at height `2 · window`), so a genesis in the past is
+safe. `WIRE_VERSION` 4 puts the genesis id in the `Handshake`: a node on another genesis
+(a local dev chain shares the `chain_id`) is not kept as a peer, and its dialer backs off
+for 10 minutes.
+
+Modes a and b dial the bootnodes `seed1.plauthium.network:30333` and
+`seed2.plauthium.network:30333`. `--peer` takes `host:port` as well as `IP:port`, and
+names are resolved again before every connection attempt. The node's key is
+`~/.local/share/plauthium/miner_key.bin` and its chain data
+`~/.local/share/plauthium/testnet-v1` (under `$XDG_DATA_HOME` if set), outside the
+workspace, so `cargo clean` or a fresh copy of the bundle keeps the identity. A node locks
+its data directory, so a second node on it refuses to start. Environment variables override the defaults:
+`PLAUTHIUM_BOOTNODES`, `PLAUTHIUM_HOME`, `PLAUTHIUM_P2P_LISTEN` (default
+`0.0.0.0:30333`; forward the port to accept inbound peers), `PLAUTHIUM_RPC_LISTEN`
+(default `127.0.0.1:8080`; keep it local, since `/api/submit_job` pays with the miner
+key), `PLAUTHIUM_MINING_THREADS` and `PLAUTHIUM_RESET=1`.
+
+`--mine-when-synced` keeps a node that cannot reach the network from mining a private
+fork it could never leave: it mines only while a peer is connected, once its tip has
+reached the best height its peers report, or once its tip has not moved for a minute
+while connected. A peer's claimed height drops to what it delivers when a sync request to
+it goes unanswered, or its answer is empty, starts at another height or brings nothing
+new; gossip raises it to at most one block past our tip. So a peer cannot hold the gate
+closed by claiming a height it does not have. A node with peers configured warns every minute while none is
+connected.
+
+**Bootnode operators.** The seed names must resolve to the bootnodes before the bundle is
+published. A bootnode is mode a with its own name left out: the first one runs with
+`PLAUTHIUM_BOOTNODES=` (empty, so it mines alone from genesis), and every other one lists
+the bootnodes already running. A bootnode that does list itself drops the connection to
+itself (the `Handshake` nonce), even behind 1:1 NAT.
+
+## Verification limits (v1)
+
+Stage B (context checks) needs no work, so a peer could otherwise make a node recompute
+tiles for free. Limits apply per **source**: an IP address, the /64 prefix for IPv6, or
+the full address for loopback peers (local testnets). Bans and the inbound cap of 16
+connections are per source too.
+
+- **Stage A slots:** at most 2 blocks of a source in Stage A, 16 in total. A block that
+  passes Stage B beyond that waits in a FIFO queue: at most 8 per source and 64 in total.
+  A newly arrived block over these limits gets `Busy`: not remembered, nobody penalized,
+  and net asks that peer again 2 s later. When the queue is full, the newest entry of the
+  source holding the most (clearly more than the newcomer's) makes room. Parked children
+  and deferred blocks released for verification are not refused.
+- **Order:** signatures, then the header's tile, then the share tiles. A block's share
+  tiles are only recomputed once its seal is known to be genuine work.
+- **Cancellation:** when a block or share of a source fails verification, the chain actor
+  bans the source on the spot: its other Stage A tasks are aborted (a tile already
+  computing finishes, as it cannot be interrupted, and its result is discarded) and its
+  queued, parked and deferred blocks, share checks and parked shares are dropped. Nothing
+  new from it is admitted until the ban ends; net closes its connections and sends the
+  same cancellation for bans of its own (protocol violations). Semaphore permits stay with
+  the computation, so aborted work never lets more tiles run than `--verify-threads`.
+- **Second senders:** each pending block remembers up to 3 other sources that delivered
+  the same bytes. A block whose first sender is banned stays pending (a running Stage A
+  goes on) for one of them, since honest peers relay a block only once.
+- **Settled only:** net remembers a block or share as seen only once it is accepted or
+  rejected, so copies of pending ones still reach the chain actor (a cheap duplicate
+  check, which records the second sender).
+- **Parked orphans** (parent not yet known; they cost nothing to make): at most 64 per
+  source, a full sync batch, and 256 in total. A source over its share evicts its own
+  oldest orphan; a full set evicts the oldest of the source holding the most.
+- **Deferred blocks** (time bucket ahead of the local clock): at most 8 per source and 64
+  in total, and none more than 75 s ahead. Orphans released by their parent count too.
+- **Errors** of the verification machinery itself (a panicked or cancelled task) drop the
+  block or share without penalizing anyone.
+- **Jobs:** the mempool also refuses a copy of a job that is already on the canonical
+  chain (until it expires), so replaying old jobs cannot fill it.
+
+The RPC reports these counters under `verification` in `GET /api/status`.
 
 ## Owner identity (v1)
 
@@ -109,7 +196,7 @@ cheapest first:
 2. No-work checks (`BlockTree::check_gossip_share`): context constants, owner binding,
    height, anchor and target on the share's own branch, inclusion window, not yet
    registered.
-3. Limits on shares awaiting their work check: 8 per peer, 64 in total.
+3. Limits on shares awaiting their work check: 8 per source, 64 in total.
 4. The ML-DSA-87 signature, checked on the spot.
 5. Its tile, recomputed off the chain actor on a separate, smaller verification budget,
    so a block's Stage A never queues behind share gossip.
@@ -121,9 +208,9 @@ can still deliver them. Useless shares (ignored for any reason, including the li
 or duplicates under a new encoding) are budgeted at 256 a minute per peer; past that, the
 peer's shares are dropped unread until the minute is up. The peer is throttled, not banned,
 since an honest peer that is syncing sends many such shares. A peer that sends an invalid
-share is banned, even if it disconnected first, and a ban closes every connection under its
-key (the IP for remote peers). Inbound connections are limited to 16 per remote IP, and a
-dialer backs off unless the remote side completes the handshake.
+share is banned, even if it disconnected first, and a ban closes every connection from its
+source (see [Verification limits](#verification-limits-v1)). A dialer backs off unless the
+connection lasts a minute, so a peer that drops it at once is not redialed every second.
 
 Templates include only fully verified shares, and `validate_genesis` requires every block
 to fit a full set of `max_shares_per_block` shares plus 16 KiB of headroom. The pool is

@@ -2,6 +2,8 @@
 name = "node"
 version = "0.1.0"
 edition = "2024"
+# File::try_lock (the data directory lock).
+rust-version = "1.89"
 description = "Plauthium Testnet multi-node P2P daemon, ConsensusEngine, Axum RPC, and Web Explorer"
 
 [lib]

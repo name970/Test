@@ -13,7 +13,8 @@ use chain::OwnerKeypair;
 use chain::keys::unsigned;
 use node::chain_actor::{ChainCmd, Origin};
 use node::cli::RunArgs;
-use node::mempool::MempoolCmd;
+use node::mempool::{MempoolCmd, MempoolReject};
+use node::net::PeerAddr;
 use node::{NodeHandle, start_node};
 use primitives::TOTAL_SUPPLY;
 use serde_json::Value;
@@ -53,7 +54,7 @@ async fn start(
     dir: &Path,
     index: u64,
     genesis: &Path,
-    peers: Vec<SocketAddr>,
+    peers: Vec<PeerAddr>,
     mine: bool,
     reset: bool,
 ) -> NodeHandle {
@@ -66,6 +67,7 @@ async fn start(
         peers,
         mining_threads: 1,
         no_mine: !mine,
+        mine_when_synced: false,
         verify_threads: Some(2),
         reset,
     })
@@ -171,12 +173,18 @@ async fn acceptance_criteria_a2_to_a6() {
     std::fs::write(&genesis_path, genesis_json).unwrap();
 
     let n1 = start(&base_dir, 1, &genesis_path, vec![], true, true).await;
-    let n2 = start(&base_dir, 2, &genesis_path, vec![n1.p2p_addr], true, true).await;
+    // Node 2 names node 1 by host name, as nodes name the public bootnodes.
+    let n1_by_name = format!("localhost:{}", n1.p2p_addr.port()).parse().unwrap();
+    let n2 = start(&base_dir, 2, &genesis_path, vec![n1_by_name], true, true).await;
+    wait_until("node 2 to reach node 1 by host name", || {
+        n1.peer_manager.peer_count() == 1 && n2.peer_manager.peer_count() == 1
+    })
+    .await;
     let n3 = start(
         &base_dir,
         3,
         &genesis_path,
-        vec![n1.p2p_addr, n2.p2p_addr],
+        vec![n1.p2p_addr.into(), n2.p2p_addr.into()],
         true,
         true,
     )
@@ -215,6 +223,18 @@ async fn acceptance_criteria_a2_to_a6() {
         "payload": { "type": "exact_dot", "xs": xs, "ys": ys }
     })
     .to_string();
+    // The RPC sets expiry_height = tip + window, which is part of the job's identity, so
+    // the tip must not move between the two submissions: pause mining until it settles.
+    for n in [&n1, &n2, &n3] {
+        n.engine.set_enabled(false);
+    }
+    let mut settled = (height(&n1), Instant::now());
+    while settled.1.elapsed() < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if height(&n1) != settled.0 {
+            settled = (height(&n1), Instant::now());
+        }
+    }
     let (code, resp) = http(n1.rpc_addr, "POST", "/api/submit_job", Some(&body)).await;
     assert_eq!(code, 202, "{resp}");
     let resp: Value = serde_json::from_str(&resp).unwrap();
@@ -225,6 +245,9 @@ async fn acceptance_criteria_a2_to_a6() {
     let job_id = resp["job_id"].as_str().unwrap().to_string();
     let (code, _) = http(n1.rpc_addr, "POST", "/api/submit_job", Some(&body)).await;
     assert_eq!(code, 409, "resubmitting the same job is a duplicate");
+    for n in [&n1, &n2, &n3] {
+        n.engine.set_enabled(true);
+    }
 
     let supply = TOTAL_SUPPLY.get().to_string();
     let deadline = Instant::now() + PHASE_TIMEOUT;
@@ -264,6 +287,32 @@ async fn acceptance_criteria_a2_to_a6() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
     assert!(settled_at >= 11);
+    // Once on the chain (and out of the mempool), a copy of the job (replayed by a peer,
+    // say) is still a duplicate: it cannot take mempool space until it expires.
+    let (tx, rx) = oneshot::channel();
+    let cmd = ChainCmd::GetCanonicalRange {
+        from_height: 1,
+        reply: tx,
+    };
+    n1.chain_tx.send(cmd).await.unwrap();
+    let included = rx
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|b| b.body.jobs.clone())
+        .find(|j| chain::compute_job_ids(j).map(|(_, id)| id.to_string()) == Ok(job_id.clone()))
+        .expect("the job is on the canonical chain");
+    let (tx, rx) = oneshot::channel();
+    let cmd = MempoolCmd::Insert {
+        tx: included,
+        origin: Origin::Rpc,
+        reply: tx,
+    };
+    n1.mempool_tx.send(cmd).await.unwrap();
+    assert!(
+        matches!(rx.await.unwrap(), Err(MempoolReject::Duplicate)),
+        "an included job is a duplicate"
+    );
 
     // A2: stop mining; tips and the 8 balances converge.
     converge(&[&n1, &n2, &n3], &n1).await;
@@ -316,6 +365,9 @@ async fn acceptance_criteria_a2_to_a6() {
     }
     let st = status_json(&n3).await;
     assert!(st["mining"]["share_pool"].is_u64());
+    assert_eq!(st["mining"]["waiting_for_sync"], Value::Bool(false));
+    assert!(st["verification"]["stage_a_started"].as_u64().unwrap() > 0);
+    assert!(st["verification"]["queued_blocks"].is_u64());
 
     // A4: stop node 3, mine 10 blocks on nodes 1 and 2, restart node 3 on its data dir.
     let pre_stop_h = height(&n3);
@@ -339,7 +391,7 @@ async fn acceptance_criteria_a2_to_a6() {
         &base_dir,
         3,
         &genesis_path,
-        vec![n1.p2p_addr, n2.p2p_addr],
+        vec![n1.p2p_addr.into(), n2.p2p_addr.into()],
         false,
         false,
     )

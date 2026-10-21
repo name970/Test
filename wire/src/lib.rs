@@ -16,8 +16,8 @@ pub mod consts {
     use core::time::Duration;
 
     /// P2P protocol version in `Handshake` (2: ML-DSA-87 keys and signatures on the wire;
-    /// 3: `GossipShare`).
-    pub const WIRE_VERSION: u32 = 3;
+    /// 3: `GossipShare`; 4: `genesis_id` and `node_nonce` in `Handshake`).
+    pub const WIRE_VERSION: u32 = 4;
     /// `protocol_version` context field (core `*/v2` labels).
     pub const CORE_PROTOCOL_VERSION: u64 = 2;
     /// `crypto_suite_id` 1: SHA3-512 and SHAKE256 (FIPS 202) with ML-DSA-87 (FIPS 204).
@@ -953,6 +953,11 @@ pub enum WireMessage {
         version: u32,
         /// Must equal the receiver's `genesis.chain_id`.
         chain_id: u64,
+        /// Must equal the receiver's `genesis_id`: chains that share a `chain_id` (a local
+        /// dev genesis and the public one) do not connect (v4).
+        genesis_id: Digest,
+        /// Random per node process: a node that receives its own nonce dialed itself (v4).
+        node_nonce: u64,
         /// Sender's tip height (sync hint only).
         best_height: u64,
         /// Sender's tip `block_id`, or `genesis_id` at height 0.
@@ -992,15 +997,20 @@ mod tests {
         let hs = WireMessage::Handshake {
             version: 1,
             chain_id: 0x504C_4154,
+            genesis_id: Digest([0xab; DIGEST_LEN]),
+            node_nonce: 0x0102_0304_0506_0708,
             best_height: 7,
             best_block_id: Digest(seq),
         };
         let encoded_hs = codec::encode(&hs).unwrap();
-        assert_eq!(encoded_hs.len(), 88);
+        assert_eq!(encoded_hs.len(), 160);
         let expected_hs_hex = concat!(
             "00000000",
             "01000000",
             "54414c5000000000",
+            "abababababababababababababababababababababababababababababababab",
+            "abababababababababababababababababababababababababababababababab",
+            "0807060504030201",
             "0700000000000000",
             "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
             "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"

@@ -4,7 +4,7 @@
 //! `PLAU/MLDSA87/v1\n || seed`. The full key pair is re-derived from the seed on load.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chain::OwnerKeypair;
 use chain::keys::SEED_LEN;
@@ -14,11 +14,19 @@ use crate::NodeError;
 /// Default key file name inside `--data-dir`.
 pub const KEY_FILE_NAME: &str = "miner_key.bin";
 
+/// Lock file a running node holds in its data directory.
+pub const LOCK_FILE_NAME: &str = "LOCK";
+
 /// Versioned header of the key file.
 const KEY_FILE_MAGIC: &[u8; 16] = b"PLAU/MLDSA87/v1\n";
 
 /// Total key file length: magic plus seed.
 const KEY_FILE_LEN: usize = KEY_FILE_MAGIC.len() + SEED_LEN;
+
+/// The key file to use: `key_file` if given, else `miner_key.bin` in `data_dir`.
+pub fn key_path(data_dir: &Path, key_file: Option<&Path>) -> PathBuf {
+    key_file.map_or_else(|| data_dir.join(KEY_FILE_NAME), Path::to_path_buf)
+}
 
 /// Loads the miner key from `path`, or generates one and saves it there if the file
 /// does not exist. Returns the key pair and whether it was created.
@@ -108,30 +116,55 @@ fn publish_key_file(path: &Path, seed: &[u8; SEED_LEN]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `--reset`: deletes everything in `data_dir` except the key file at `key_path`, so
-/// the node keeps its identity across resets.
+/// Locks `data_dir` (creating it if needed) for as long as the returned file stays
+/// open: two nodes on one data directory would corrupt each other's `blocks.log`.
+pub fn lock_data_dir(data_dir: &Path) -> Result<std::fs::File, NodeError> {
+    std::fs::create_dir_all(data_dir)?;
+    let path = data_dir.join(LOCK_FILE_NAME);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "data directory {} is in use by another plauthium-node",
+            data_dir.display()
+        )
+        .into()),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(format!("cannot lock {}: {e}", path.display()).into())
+        }
+    }
+}
+
+/// `--reset`: deletes everything in `data_dir` except the key file at `key_path` (so
+/// the node keeps its identity across resets) and the lock file.
 ///
 /// Directories on the way to the key file are emptied instead of deleted. Symlinks
 /// are never followed: one leading to the key file or to a directory holding it is
 /// kept, any other is removed as a link.
 pub fn reset_data_dir(data_dir: &Path, key_path: &Path) -> Result<(), NodeError> {
-    let keep = key_path.canonicalize().ok();
-    clear_dir(data_dir, keep.as_deref())?;
+    let keep: Vec<PathBuf> = [key_path.to_path_buf(), data_dir.join(LOCK_FILE_NAME)]
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+    clear_dir(data_dir, &keep)?;
     Ok(())
 }
 
-fn clear_dir(dir: &Path, keep: Option<&Path>) -> std::io::Result<()> {
+fn clear_dir(dir: &Path, keep: &[PathBuf]) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?; // does not follow symlinks
-        if let Some(keep) = keep
-            && let Ok(canonical) = path.canonicalize()
-            && keep.starts_with(&canonical)
+        if let Ok(canonical) = path.canonicalize()
+            && keep.iter().any(|k| k.starts_with(&canonical))
         {
-            // The key file itself, or a directory or symlink on the way to it.
-            if file_type.is_dir() && canonical != keep {
-                clear_dir(&path, Some(keep))?;
+            // A kept file itself, or a directory or symlink on the way to one.
+            if file_type.is_dir() && !keep.contains(&canonical) {
+                clear_dir(&path, keep)?;
             }
             continue;
         }
@@ -181,12 +214,18 @@ mod tests {
         assert_eq!(loaded.key_id(), created.key_id());
         assert_eq!(loaded.public_key(), created.public_key());
 
-        // --reset wipes the chain data but keeps the key.
+        // --reset wipes the chain data but keeps the key and the lock file.
         std::fs::write(dir.join("blocks.log"), b"chain data").unwrap();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let lock = lock_data_dir(&dir).unwrap();
         reset_data_dir(&dir, &key_path).unwrap();
         assert!(!dir.join("blocks.log").exists());
         assert!(!dir.join("sub").exists());
+        assert!(dir.join(LOCK_FILE_NAME).exists());
+        // While it is locked, a second node cannot use the directory.
+        assert!(lock_data_dir(&dir).is_err());
+        drop(lock);
+        drop(lock_data_dir(&dir).unwrap());
         let (after_reset, was_new) = load_or_create(&key_path).unwrap();
         assert!(!was_new);
         assert_eq!(after_reset.key_id(), created.key_id());
