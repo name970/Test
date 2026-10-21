@@ -175,13 +175,21 @@ fn miner_thread_loop(
         } else if seal {
             // The header share rule (§6.7) covers a sealing attempt; no ShareProof.
             engine.seals_found.fetch_add(1, Ordering::Relaxed);
-            let _ =
-                chain_tx.blocking_send(ChainCmd::SubmitLocalBlock(Box::new(tpl.seal(nonce, &ids))));
+            match tpl.seal(nonce, &ids) {
+                Ok(block) => {
+                    let _ = chain_tx.blocking_send(ChainCmd::SubmitLocalBlock(Box::new(block)));
+                }
+                Err(e) => error!(error = %e, "Could not sign a sealed block"),
+            }
             sealed_at = Some(Instant::now());
         } else if share {
             engine.shares_found.fetch_add(1, Ordering::Relaxed);
-            let _ = chain_tx
-                .blocking_send(ChainCmd::SubmitLocalShare(Box::new(tpl.share(nonce, &ids))));
+            match tpl.share(nonce, &ids) {
+                Ok(proof) => {
+                    let _ = chain_tx.blocking_send(ChainCmd::SubmitLocalShare(Box::new(proof)));
+                }
+                Err(e) => error!(error = %e, "Could not sign a share proof"),
+            }
         }
         nonce = nonce.wrapping_add(stride);
     }

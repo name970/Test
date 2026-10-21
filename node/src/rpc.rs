@@ -10,7 +10,8 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chain::{BlockSummary, compute_client_digest};
+use chain::keys::unsigned;
+use chain::{BlockSummary, OwnerKeypair, owner_key_id};
 use ledger::StateCategory;
 use primitives::TOTAL_SUPPLY;
 use scivm::CONSENSUS_WEIGHT;
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 use wire::{
-    CategoryDelta, DOT_LEN, Digest, FeeTransition, JobPayload, JobTransaction, WIRE_VERSION,
+    CategoryDelta, DOT_LEN, FeeTransition, JobPayload, JobTransaction, PublicKey, WIRE_VERSION,
 };
 
 use crate::chain_actor::{ChainCmd, Origin, StatusSnapshot};
@@ -36,6 +37,7 @@ struct RpcState {
     mempool_tx: mpsc::Sender<MempoolCmd>,
     engine: Arc<ConsensusEngine>,
     peer_manager: Arc<PeerManager>,
+    signer: Arc<OwnerKeypair>,
 }
 
 /// Spawns the Axum HTTP server and returns the bound local address (§9.1).
@@ -48,6 +50,7 @@ pub async fn spawn_rpc_server(
     mempool_tx: mpsc::Sender<MempoolCmd>,
     engine: Arc<ConsensusEngine>,
     peer_manager: Arc<PeerManager>,
+    signer: Arc<OwnerKeypair>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> std::io::Result<SocketAddr> {
     let state = RpcState {
@@ -57,6 +60,7 @@ pub async fn spawn_rpc_server(
         mempool_tx,
         engine,
         peer_manager,
+        signer,
     };
     let app = Router::new()
         .route("/", get(handle_index))
@@ -117,6 +121,7 @@ struct ChainInfoDto {
 #[derive(Serialize)]
 struct NodeInfoDto {
     owner_id: String,
+    owner_key_id: String,
     peers: usize,
     uptime_secs: u64,
 }
@@ -193,6 +198,7 @@ async fn handle_status(State(state): State<RpcState>) -> Json<StatusResponse> {
         },
         node: NodeInfoDto {
             owner_id: snap.owner_id.to_string(),
+            owner_key_id: snap.miner_key_id.to_hex(),
             peers: state.peer_manager.peer_count(),
             uptime_secs: snap.start_instant.elapsed().as_secs(),
         },
@@ -361,7 +367,7 @@ fn summary_to_dto(s: BlockSummary) -> BlockSummaryDto {
         block_id: s.block_id.to_hex(),
         parent_id: s.parent_id.to_hex(),
         anchor_id: s.anchor_id.to_hex(),
-        miner_owner: s.miner_owner.to_string(),
+        miner_owner: s.miner_key_id.to_hex(),
         time_bucket: s.time_bucket,
         attempt_nonce: s.attempt_nonce.to_string(),
         epoch: s.epoch,
@@ -374,7 +380,7 @@ fn summary_to_dto(s: BlockSummary) -> BlockSummaryDto {
             .map(|j| JobDto {
                 job_id: j.job_id.to_string(),
                 tx_id: j.tx_id.to_hex(),
-                executor_owner: j.executor_owner.to_string(),
+                executor_owner: j.executor_owner.to_hex(),
                 deposit: j.deposit.to_string(),
                 queue_fee: j.queue_fee.to_string(),
                 base_fee: j.base_fee.to_string(),
@@ -386,7 +392,7 @@ fn summary_to_dto(s: BlockSummary) -> BlockSummaryDto {
             .map(|r| ReceiptDto {
                 job_id: r.job_id.to_string(),
                 result: r.result.to_string(),
-                executor_owner: r.executor_owner.to_string(),
+                executor_owner: r.executor_owner.to_hex(),
                 admitted_at: r.admitted_at,
             })
             .collect(),
@@ -395,7 +401,7 @@ fn summary_to_dto(s: BlockSummary) -> BlockSummaryDto {
             .into_iter()
             .map(|sh| ShareDto {
                 work_id: sh.work_id.to_hex(),
-                owner: sh.owner.to_string(),
+                owner: sh.owner.to_hex(),
                 height: sh.height,
                 weight: sh.weight.to_string(),
             })
@@ -411,9 +417,9 @@ fn summary_to_dto(s: BlockSummary) -> BlockSummaryDto {
 // POST /api/submit_job (§9.5)
 // ---------------------------------------------------------------------------
 
+/// The job is signed with this node's ML-DSA-87 key, which becomes its `client_key`.
 #[derive(Deserialize)]
 struct SubmitJobRequest {
-    client: Option<String>,
     queue_fee: Option<String>,
     base_fee: Option<String>,
     v_exec: Option<String>,
@@ -436,6 +442,7 @@ struct SubmitJobPayloadDto {
 struct SubmitJobResponse {
     tx_id: String,
     job_id: String,
+    client_key_id: String,
     deposit: String,
     total_charge: String,
     expected_result: String,
@@ -509,13 +516,12 @@ fn to_operands(values: &[i64]) -> Result<Vec<f64>, ApiError> {
         .collect()
 }
 
-fn build_job(req: SubmitJobRequest, tip_height: u64) -> Result<JobTransaction, ApiError> {
-    let client = match req.client.as_deref() {
-        Some(txt) if !txt.is_empty() => {
-            compute_client_digest(txt).map_err(ApiError::bad_request)?
-        }
-        _ => Digest::ZERO,
-    };
+/// Builds the job for `client_key` from the request, still unsigned.
+fn build_job(
+    req: SubmitJobRequest,
+    tip_height: u64,
+    client_key: PublicKey,
+) -> Result<JobTransaction, ApiError> {
     // Defaults: the worked budget of WP (7.17), with 1 PLAU = 10^8 atoms.
     let queue_fee = parse_u64_field(req.queue_fee, 100_000_000, "queue_fee")?;
     let base_fee = parse_u64_field(req.base_fee, 1_000_000_000, "base_fee")?;
@@ -551,7 +557,7 @@ fn build_job(req: SubmitJobRequest, tip_height: u64) -> Result<JobTransaction, A
         )));
     }
     Ok(JobTransaction {
-        client,
+        client_key,
         queue_fee,
         base_fee,
         v_exec,
@@ -563,6 +569,7 @@ fn build_job(req: SubmitJobRequest, tip_height: u64) -> Result<JobTransaction, A
             xs: to_operands(&req.payload.xs)?,
             ys: to_operands(&req.payload.ys)?,
         },
+        signature: unsigned(),
     })
 }
 
@@ -570,9 +577,21 @@ async fn handle_submit_job(
     State(state): State<RpcState>,
     Json(req): Json<SubmitJobRequest>,
 ) -> Result<(StatusCode, Json<SubmitJobResponse>), ApiError> {
-    let tip_height = state.status_rx.borrow().tip.height;
-    let tx = build_job(req, tip_height)?;
+    let (tip_height, genesis_id) = {
+        let snap = state.status_rx.borrow();
+        (snap.tip.height, snap.genesis_id)
+    };
+    let mut tx = build_job(req, tip_height, state.signer.public_key().clone())?;
+    let signer = state.signer.clone();
+    let tx =
+        tokio::task::spawn_blocking(move || signer.sign_job(&mut tx, &genesis_id).map(|()| tx))
+            .await
+            .map_err(|e| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+            })?
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e))?;
     let expiry_height = tx.expiry_height;
+    let client_key_id = owner_key_id(&tx.client_key);
 
     let unavailable = |what: &str| {
         ApiError::new(
@@ -614,6 +633,7 @@ async fn handle_submit_job(
         Json(SubmitJobResponse {
             tx_id: ok.tx_id.to_hex(),
             job_id: ok.job_id.to_string(),
+            client_key_id: client_key_id.to_hex(),
             deposit: ok.deposit.to_string(),
             total_charge: ok.total_charge.to_string(),
             expected_result: ok.expected_result.to_string(),

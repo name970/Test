@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chain::{
-    BlockMeta, BlockSummary, BlockTree, ClaimedWork, Lottery, Template, TreeError, WorkError,
-    build_template, verify_fresh_work,
+    BlockMeta, BlockSummary, BlockTree, ClaimedWork, Lottery, OwnerKeypair, Template, TreeError,
+    WorkError, block_relay_id, build_template, verify_fresh_work,
 };
 use ledger::StateCategory;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
@@ -139,8 +139,8 @@ pub enum ChainEvent {
     },
     /// The canonical tip changed.
     TipChanged {
-        /// New tip.
-        tip: BlockMeta,
+        /// New tip (boxed: it carries the 64-byte miner key id).
+        tip: Box<BlockMeta>,
         /// Blocks that joined the canonical chain, ascending.
         connected: Vec<Arc<Block>>,
         /// Blocks that left it, old tip first.
@@ -163,7 +163,9 @@ pub struct StatusSnapshot {
     pub target_block_secs: u64,
     /// `genesis.max_jobs_per_block`.
     pub max_jobs_per_block: u64,
-    /// This node's owner id.
+    /// Key id of this node's ML-DSA-87 miner key.
+    pub miner_key_id: Digest,
+    /// The 64-bit `OwnerId` derived from `miner_key_id`.
     pub owner_id: u64,
     /// When the actor started.
     pub start_instant: Instant,
@@ -193,11 +195,13 @@ pub struct StatusSnapshot {
 
 struct ParkedBlock {
     block: Arc<Block>,
+    relay_id: Digest,
     origin: Origin,
 }
 
 struct DeferredEntry {
     block: Arc<Block>,
+    relay_id: Digest,
     origin: Origin,
     expires_at: Instant,
 }
@@ -243,7 +247,7 @@ fn unix_now_secs() -> u64 {
 /// Asynchronous ChainState actor (§8.3).
 pub struct ChainActor {
     tree: BlockTree,
-    owner_id: u64,
+    miner: Arc<OwnerKeypair>,
     log_writer: BlockLogWriter,
     self_tx: mpsc::Sender<ChainCmd>,
     cmd_rx: mpsc::Receiver<ChainCmd>,
@@ -255,11 +259,14 @@ pub struct ChainActor {
     start_instant: Instant,
     template_gen: u64,
     own_shares: Vec<ShareProof>,
-    in_flight: HashSet<Digest>,
+    // Blocks awaiting validation are deduplicated by relay id (`chain::block_relay_id`),
+    // not by block_id: a copy with a forged signature shares the honest block_id and
+    // must not shadow, or get cached as invalid in place of, the genuine block.
+    in_flight: HashMap<Digest, Digest>, // relay_id -> block_id
     parked_by_parent: HashMap<Digest, Vec<ParkedBlock>>,
-    parked_order: VecDeque<(Digest, Digest)>, // (block_id, parent_id), oldest first
+    parked_order: VecDeque<(Digest, Digest, Digest)>, // (relay_id, block_id, parent_id), oldest first
     deferred: Vec<DeferredEntry>,
-    invalid_lru: LruIdCache,
+    invalid_lru: LruIdCache, // relay ids
 }
 
 impl ChainActor {
@@ -267,7 +274,7 @@ impl ChainActor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         genesis: GenesisConfig,
-        owner_id: u64,
+        miner: Arc<OwnerKeypair>,
         log_writer: BlockLogWriter,
         self_tx: mpsc::Sender<ChainCmd>,
         cmd_rx: mpsc::Receiver<ChainCmd>,
@@ -278,11 +285,11 @@ impl ChainActor {
     ) -> Result<(Self, watch::Receiver<Arc<StatusSnapshot>>), String> {
         let tree = BlockTree::new(genesis)?;
         let start_instant = Instant::now();
-        let status = build_status_snapshot(&tree, owner_id, start_instant, 0);
+        let status = build_status_snapshot(&tree, &miner, start_instant, 0);
         let (status_tx, status_rx) = watch::channel(Arc::new(status));
         let mut actor = Self {
             tree,
-            owner_id,
+            miner,
             log_writer,
             self_tx,
             cmd_rx,
@@ -294,7 +301,7 @@ impl ChainActor {
             start_instant,
             template_gen: 0,
             own_shares: Vec::new(),
-            in_flight: HashSet::new(),
+            in_flight: HashMap::new(),
             parked_by_parent: HashMap::new(),
             parked_order: VecDeque::new(),
             deferred: Vec::new(),
@@ -304,7 +311,9 @@ impl ChainActor {
         Ok((actor, status_rx))
     }
 
-    /// Replays persisted blocks at startup (`Origin::Disk`: Stage A skipped, §8.7).
+    /// Replays persisted blocks at startup (`Origin::Disk`, §8.7). Stage A is skipped, so
+    /// tiles are not recomputed, but `apply_verified_block` still verifies the miner and
+    /// share signatures before any owner enters the state.
     pub fn replay_disk_blocks(&mut self, blocks: Vec<Block>) {
         let total = blocks.len();
         let mut applied = 0usize;
@@ -456,17 +465,32 @@ impl ChainActor {
         blocks
     }
 
-    fn is_pending(&self, id: &Digest) -> bool {
-        self.in_flight.contains(id)
-            || self.parked_order.iter().any(|(b, _)| b == id)
-            || self.deferred.iter().any(|d| d.block.header.block_id == *id)
+    /// Whether a block with this block_id awaits validation (a parent check).
+    fn is_pending_block(&self, block_id: &Digest) -> bool {
+        self.in_flight.values().any(|b| b == block_id)
+            || self.parked_order.iter().any(|(_, b, _)| b == block_id)
+            || self
+                .deferred
+                .iter()
+                .any(|d| d.block.header.block_id == *block_id)
+    }
+
+    /// Whether these exact block bytes await validation.
+    fn is_pending_relay(&self, relay_id: &Digest) -> bool {
+        self.in_flight.contains_key(relay_id)
+            || self.parked_order.iter().any(|(r, _, _)| r == relay_id)
+            || self.deferred.iter().any(|d| d.relay_id == *relay_id)
     }
 
     fn import_block(&mut self, block: Arc<Block>, origin: Origin) -> ImportAck {
         let block_id = block.header.block_id;
+        let relay_id = match block_relay_id(&block.header) {
+            Ok(id) => id,
+            Err(e) => return ImportAck::Invalid(format!("unencodable header: {e}")),
+        };
         if self.tree.has_block(&block_id)
-            || self.is_pending(&block_id)
-            || self.invalid_lru.contains(&block_id)
+            || self.is_pending_relay(&relay_id)
+            || self.invalid_lru.contains(&relay_id)
         {
             return ImportAck::Duplicate;
         }
@@ -476,15 +500,15 @@ impl ChainActor {
                 if matches!(origin, Origin::Local | Origin::Disk) {
                     self.finalize_block(block, origin);
                 } else {
-                    self.in_flight.insert(block_id);
+                    self.in_flight.insert(relay_id, block_id);
                     self.spawn_stage_a(block, origin);
                 }
                 ImportAck::Queued
             }
             Err(TreeError::Duplicate) => ImportAck::Duplicate,
             Err(TreeError::Orphan { parent }) => {
-                let parent_pending = self.is_pending(&parent);
-                self.park(parent, block, origin);
+                let parent_pending = self.is_pending_block(&parent);
+                self.park(parent, block, relay_id, origin);
                 if parent_pending {
                     ImportAck::Queued
                 } else {
@@ -494,6 +518,7 @@ impl ChainActor {
             Err(TreeError::Deferred { .. }) => {
                 self.deferred.push(DeferredEntry {
                     block,
+                    relay_id,
                     origin,
                     expires_at: Instant::now() + Duration::from_secs(600),
                 });
@@ -501,15 +526,17 @@ impl ChainActor {
             }
             Err(TreeError::TooDeep) => ImportAck::TooDeep,
             Err(TreeError::Invalid(reason)) => {
-                self.reject(block_id, origin, reason.clone());
+                self.reject(block_id, relay_id, origin, reason.clone());
                 ImportAck::Invalid(reason)
             }
         }
     }
 
-    fn reject(&mut self, block_id: Digest, origin: Origin, reason: String) {
+    /// Caches the rejected block's relay id (never its block_id, which an invalid copy
+    /// of an honest block can share) and reports the rejection.
+    fn reject(&mut self, block_id: Digest, relay_id: Digest, origin: Origin, reason: String) {
         debug!(id = ?block_id, ?origin, %reason, "Rejected block");
-        self.invalid_lru.insert(block_id);
+        self.invalid_lru.insert(relay_id);
         let _ = self.event_tx.send(ChainEvent::BlockRejected {
             block_id,
             origin,
@@ -539,13 +566,21 @@ impl ChainActor {
         result: Result<(), WorkError>,
     ) {
         let block_id = block.header.block_id;
-        self.in_flight.remove(&block_id);
+        let Ok(relay_id) = block_relay_id(&block.header) else {
+            return;
+        };
+        self.in_flight.remove(&relay_id);
         match result {
             Ok(()) => self.finalize_block(block, origin),
-            Err(err) => {
-                self.reject(block_id, origin, format!("Stage A VerifyFW failed: {err}"));
-                self.drop_parked_children(block_id);
-            }
+            // A Stage A failure shows these bytes are bad, not that no valid block has
+            // this block_id (the claims checked here are not all bound by it), so
+            // children parked under the block_id stay parked for the genuine parent.
+            Err(err) => self.reject(
+                block_id,
+                relay_id,
+                origin,
+                format!("Stage A VerifyFW failed: {err}"),
+            ),
         }
     }
 
@@ -561,7 +596,7 @@ impl ChainActor {
                 info!(
                     height = outcome.meta.height,
                     id = %outcome.meta.id.short_hex(16),
-                    miner = outcome.meta.miner_owner,
+                    miner = %outcome.meta.miner_key_id.short_hex(16),
                     jobs = block.body.jobs.len(),
                     shares = block.body.shares.len(),
                     weight = outcome.meta.cumulative_weight,
@@ -577,7 +612,7 @@ impl ChainActor {
                     self.publish_status();
                     self.rebuild_and_publish_template();
                     let _ = self.event_tx.send(ChainEvent::TipChanged {
-                        tip: outcome.meta,
+                        tip: Box::new(outcome.meta),
                         connected: outcome.connected,
                         disconnected: outcome.disconnected,
                     });
@@ -587,8 +622,12 @@ impl ChainActor {
                     let _ = self.import_block(child.block, child.origin);
                 }
             }
+            // After Stage A the header's claims match its block_id, and the body is bound
+            // by body_core_root, so this failure condemns every block with this block_id.
             Err(TreeError::Invalid(reason)) => {
-                self.reject(block_id, origin, reason);
+                if let Ok(relay_id) = block_relay_id(&block.header) {
+                    self.reject(block_id, relay_id, origin, reason);
+                }
                 self.drop_parked_children(block_id);
             }
             Err(other) => debug!(id = ?block_id, error = %other, "Block not applied"),
@@ -604,38 +643,42 @@ impl ChainActor {
         });
     }
 
-    fn park(&mut self, parent: Digest, block: Arc<Block>, origin: Origin) {
+    fn park(&mut self, parent: Digest, block: Arc<Block>, relay_id: Digest, origin: Origin) {
         while self.parked_order.len() >= ORPHAN_LIMIT {
-            let Some((old_id, old_parent)) = self.parked_order.pop_front() else {
+            let Some((old_relay, _, old_parent)) = self.parked_order.pop_front() else {
                 break;
             };
             if let Some(list) = self.parked_by_parent.get_mut(&old_parent) {
-                list.retain(|e| e.block.header.block_id != old_id);
+                list.retain(|e| e.relay_id != old_relay);
                 if list.is_empty() {
                     self.parked_by_parent.remove(&old_parent);
                 }
             }
         }
-        self.parked_order.push_back((block.header.block_id, parent));
+        self.parked_order
+            .push_back((relay_id, block.header.block_id, parent));
         self.parked_by_parent
             .entry(parent)
             .or_default()
-            .push(ParkedBlock { block, origin });
+            .push(ParkedBlock {
+                block,
+                relay_id,
+                origin,
+            });
     }
 
     fn take_parked_children(&mut self, parent: Digest) -> Vec<ParkedBlock> {
         let children = self.parked_by_parent.remove(&parent).unwrap_or_default();
         if !children.is_empty() {
-            self.parked_order.retain(|(_, p)| *p != parent);
+            self.parked_order.retain(|(_, _, p)| *p != parent);
         }
         children
     }
 
     fn drop_parked_children(&mut self, parent: Digest) {
         for child in self.take_parked_children(parent) {
-            let id = child.block.header.block_id;
-            self.invalid_lru.insert(id);
-            self.drop_parked_children(id);
+            self.invalid_lru.insert(child.relay_id);
+            self.drop_parked_children(child.block.header.block_id);
         }
     }
 
@@ -661,7 +704,7 @@ impl ChainActor {
     fn publish_status(&self) {
         let snap = build_status_snapshot(
             &self.tree,
-            self.owner_id,
+            &self.miner,
             self.start_instant,
             self.parked_order.len(),
         );
@@ -682,7 +725,7 @@ impl ChainActor {
             &tip_state,
             &mempool_txs,
             &self.own_shares,
-            self.owner_id,
+            &self.miner,
             now_bucket,
         );
         let tpl = match result {
@@ -706,6 +749,19 @@ impl ChainActor {
 }
 
 async fn verify_block_parallel(block: &Arc<Block>, sem: &Arc<Semaphore>) -> Result<(), WorkError> {
+    // Signatures first: about 0.5 ms each, so a forged block is rejected before any of
+    // its tiles (tens of ms each) is recomputed.
+    {
+        let _permit = sem
+            .acquire()
+            .await
+            .map_err(|e| WorkError::Internal(e.to_string()))?;
+        let signed = block.clone();
+        tokio::task::spawn_blocking(move || BlockTree::verify_signatures(&signed))
+            .await
+            .map_err(|e| WorkError::Internal(e.to_string()))??;
+    }
+
     let mut jobs = vec![(
         block.header.context.clone(),
         ClaimedWork::from_header(&block.header),
@@ -749,7 +805,7 @@ async fn verify_block_parallel(block: &Arc<Block>, sem: &Arc<Semaphore>) -> Resu
 
 fn build_status_snapshot(
     tree: &BlockTree,
-    owner_id: u64,
+    miner: &OwnerKeypair,
     start_instant: Instant,
     orphan_count: usize,
 ) -> StatusSnapshot {
@@ -763,7 +819,8 @@ fn build_status_snapshot(
         blocks_per_epoch: genesis.blocks_per_epoch,
         target_block_secs: genesis.target_block_secs,
         max_jobs_per_block: genesis.max_jobs_per_block,
-        owner_id,
+        miner_key_id: miner.key_id(),
+        owner_id: miner.owner_id(),
         start_instant,
         tip: tree.tip_meta().clone(),
         epoch: ledger.epoch(),

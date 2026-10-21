@@ -15,16 +15,21 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub mod consts {
     use core::time::Duration;
 
-    /// P2P protocol version in `Handshake`.
-    pub const WIRE_VERSION: u32 = 1;
+    /// P2P protocol version in `Handshake` (2: ML-DSA-87 keys and signatures on the wire).
+    pub const WIRE_VERSION: u32 = 2;
     /// `protocol_version` context field (core `*/v2` labels).
     pub const CORE_PROTOCOL_VERSION: u64 = 2;
-    /// `crypto_suite_id`; 0 means "non-cryptographic placeholder suite".
-    pub const PLACEHOLDER_SUITE_ID: u64 = 0;
+    /// `crypto_suite_id` 1: SHA3-512 and SHAKE256 (FIPS 202) with ML-DSA-87 (FIPS 204).
+    /// Suite 0 was the non-cryptographic placeholder suite of testnet v0.
+    pub const CRYPTO_SUITE_ID: u64 = 1;
     /// `generator_version` context field.
     pub const GENERATOR_VERSION: u64 = 2;
     /// Bytes per digest.
     pub const DIGEST_LEN: usize = 64;
+    /// Bytes per encoded ML-DSA-87 public key (FIPS 204 `pkEncode`).
+    pub const PUBLIC_KEY_LEN: usize = 2_592;
+    /// Bytes per encoded ML-DSA-87 signature (FIPS 204 `sigEncode`).
+    pub const SIGNATURE_LEN: usize = 4_627;
     /// Lower clamp for any lottery target.
     pub const MIN_TARGET: u128 = 1u128 << 64;
     /// Operand length of an `ExactDot` job (`= work::TILE_DIM`).
@@ -307,6 +312,115 @@ impl<'de> Deserialize<'de> for Target {
     }
 }
 
+/// Fixed-width byte strings too large for serde's array support: encoded as a
+/// tuple of `N` bytes (no length prefix, like [`Digest`]) and as lowercase hex in
+/// human-readable formats. The bytes live on the heap so the structs that carry
+/// them stay small.
+macro_rules! fixed_bytes {
+    ($(#[$doc:meta])* $name:ident, $len:expr) => {
+        $(#[$doc])*
+        // normative
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        pub struct $name(pub Box<[u8; $len]>);
+
+        impl $name {
+            /// Copies exactly `$len` bytes into a new value.
+            pub fn from_slice(bytes: &[u8]) -> Result<Self, String> {
+                let array: [u8; $len] = bytes.try_into().map_err(|_| {
+                    format!(
+                        "{} must be {} bytes, got {}",
+                        stringify!($name),
+                        $len,
+                        bytes.len()
+                    )
+                })?;
+                Ok($name(Box::new(array)))
+            }
+
+            /// The raw bytes.
+            pub fn as_bytes(&self) -> &[u8; $len] {
+                &self.0
+            }
+
+            /// Lowercase hex encoding of all bytes.
+            pub fn to_hex(&self) -> String {
+                to_hex(&self.0[..])
+            }
+
+            /// Parses a lowercase or uppercase hex string of exactly `2 * $len` characters.
+            pub fn from_hex(s: &str) -> Result<Self, String> {
+                Self::from_slice(&from_hex(s)?)
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}({}..)", stringify!($name), to_hex(&self.0[..8]))
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                if s.is_human_readable() {
+                    return s.serialize_str(&self.to_hex());
+                }
+                let mut t = s.serialize_tuple($len)?;
+                for b in self.0.iter() {
+                    t.serialize_element(b)?;
+                }
+                t.end()
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct BytesVisitor;
+                impl<'de> Visitor<'de> for BytesVisitor {
+                    type Value = $name;
+
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        write!(f, "{} bytes or {} hex characters", $len, 2 * $len)
+                    }
+
+                    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                        $name::from_hex(v).map_err(E::custom)
+                    }
+
+                    fn visit_seq<A: SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        let mut bytes = Box::new([0u8; $len]);
+                        for (i, slot) in bytes.iter_mut().enumerate() {
+                            *slot = seq
+                                .next_element()?
+                                .ok_or_else(|| de::Error::invalid_length(i, &self))?;
+                        }
+                        Ok($name(bytes))
+                    }
+                }
+                if d.is_human_readable() {
+                    d.deserialize_str(BytesVisitor)
+                } else {
+                    d.deserialize_tuple($len, BytesVisitor)
+                }
+            }
+        }
+    };
+}
+
+fixed_bytes!(
+    /// Encoded ML-DSA-87 public key: an owner's on-chain identity.
+    PublicKey,
+    PUBLIC_KEY_LEN
+);
+
+fixed_bytes!(
+    /// Encoded ML-DSA-87 signature.
+    Signature,
+    SIGNATURE_LEN
+);
+
 fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -489,8 +603,39 @@ pub struct BlockHeader {
     pub seal_target: Target,
     /// `Θ_S` for this height, bound through context field 15.
     pub share_target: Target,
-    /// `scheduler::OwnerId` of the beneficiary, bound through context fields 11 and 12.
-    pub miner_owner: u64,
+    /// Beneficiary's ML-DSA-87 key; its key id is bound through context fields 11 and 12.
+    pub miner_key: PublicKey,
+    /// Miner's signature over every field above (`chain::header_signing_digest`).
+    pub signature: Signature,
+}
+
+impl BlockHeader {
+    /// Canonical encoding of every field except `signature`: the bytes the miner signs.
+    pub fn unsigned_encoding(&self) -> Result<Vec<u8>, codec::CodecError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            context: &'a FwContext,
+            output_root: &'a Digest,
+            work_id: &'a Digest,
+            block_id: &'a Digest,
+            share_ticket: &'a Digest,
+            seal_ticket: &'a Digest,
+            seal_target: &'a Target,
+            share_target: &'a Target,
+            miner_key: &'a PublicKey,
+        }
+        codec::encode(&Unsigned {
+            context: &self.context,
+            output_root: &self.output_root,
+            work_id: &self.work_id,
+            block_id: &self.block_id,
+            share_ticket: &self.share_ticket,
+            seal_ticket: &self.seal_ticket,
+            seal_target: &self.seal_target,
+            share_target: &self.share_target,
+            miner_key: &self.miner_key,
+        })
+    }
 }
 
 /// Full block (§5.2).
@@ -525,8 +670,8 @@ pub struct BlockBody {
 // normative
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JobTransaction {
-    /// Free tag, unauthenticated in v0.
-    pub client: Digest,
+    /// The client's ML-DSA-87 key, which signs the job.
+    pub client_key: PublicKey,
     /// Queue fee `f_queue` in atoms, `> 0`.
     pub queue_fee: u64,
     /// Base Fee `F_base` in atoms, `> 0`.
@@ -543,9 +688,39 @@ pub struct JobTransaction {
     pub nonce: u64,
     /// The computation to run.
     pub payload: JobPayload,
+    /// Client signature over `tx_id` (`chain::job_signing_digest`).
+    pub signature: Signature,
 }
 
 impl JobTransaction {
+    /// Canonical encoding of every field except `signature`. `tx_id` hashes these
+    /// bytes, so a transaction's identity does not depend on its signature.
+    pub fn unsigned_encoding(&self) -> Result<Vec<u8>, codec::CodecError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            client_key: &'a PublicKey,
+            queue_fee: u64,
+            base_fee: u64,
+            v_exec: u64,
+            v_da: u64,
+            v_ref: u64,
+            expiry_height: u64,
+            nonce: u64,
+            payload: &'a JobPayload,
+        }
+        codec::encode(&Unsigned {
+            client_key: &self.client_key,
+            queue_fee: self.queue_fee,
+            base_fee: self.base_fee,
+            v_exec: self.v_exec,
+            v_da: self.v_da,
+            v_ref: self.v_ref,
+            expiry_height: self.expiry_height,
+            nonce: self.nonce,
+            payload: &self.payload,
+        })
+    }
+
     /// Computes `deposit = base_fee + v_exec + v_da + v_ref` with checked addition.
     pub fn checked_deposit(&self) -> Option<u64> {
         self.base_fee
@@ -579,8 +754,8 @@ pub enum JobPayload {
 pub struct ShareProof {
     /// Full context of the attempt (its own parent, height and body root).
     pub context: FwContext,
-    /// Beneficiary; must match context fields 11 and 12.
-    pub owner: u64,
+    /// Beneficiary's ML-DSA-87 key; its key id must match context fields 11 and 12.
+    pub owner_key: PublicKey,
     /// Claimed `outputRoot`.
     pub output_root: Digest,
     /// Claimed `WorkID`, which is the ShareID.
@@ -589,6 +764,31 @@ pub struct ShareProof {
     pub share_ticket: Digest,
     /// `Θ_S` at `context.height` on the including chain.
     pub share_target: Target,
+    /// Owner's signature over every field above (`chain::share_signing_digest`).
+    pub signature: Signature,
+}
+
+impl ShareProof {
+    /// Canonical encoding of every field except `signature`: the bytes the owner signs.
+    pub fn unsigned_encoding(&self) -> Result<Vec<u8>, codec::CodecError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            context: &'a FwContext,
+            owner_key: &'a PublicKey,
+            output_root: &'a Digest,
+            work_id: &'a Digest,
+            share_ticket: &'a Digest,
+            share_target: &'a Target,
+        }
+        codec::encode(&Unsigned {
+            context: &self.context,
+            owner_key: &self.owner_key,
+            output_root: &self.output_root,
+            work_id: &self.work_id,
+            share_ticket: &self.share_ticket,
+            share_target: &self.share_target,
+        })
+    }
 }
 
 /// Lease assignment (§5.6).
@@ -599,8 +799,8 @@ pub struct LeaseAssignment {
     pub job_id: u64,
     /// ShareID that won the slot.
     pub share_id: Digest,
-    /// Owner of that ShareID, the executor by attribution.
-    pub owner: u64,
+    /// Key id of that ShareID's owner, the executor by attribution.
+    pub owner: Digest,
 }
 
 /// Settlement receipt (§5.6).
@@ -611,8 +811,8 @@ pub struct SettlementReceipt {
     pub job_id: u64,
     /// Its transaction identifier.
     pub tx_id: Digest,
-    /// Owner of the leased ShareID.
-    pub executor_owner: u64,
+    /// Key id of the leased ShareID's owner.
+    pub executor_owner: Digest,
     /// Height of `JOB_ADMIT_AND_LEASE`.
     pub admitted_at: u64,
     /// `TESTNET_PROFILE.exact_dot(xs, ys)`.
@@ -636,8 +836,8 @@ pub type CategoryDelta = [i128; 8];
 // normative
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerReward {
-    /// Share owner.
-    pub owner: u64,
+    /// Share owner's key id.
+    pub owner: Digest,
     /// Atoms booked for that owner this epoch.
     pub atoms: u64,
 }
@@ -678,7 +878,7 @@ pub enum FeeTransition {
         lots: u32,
         /// Shares weighed.
         shares: u32,
-        /// Booked atoms per owner, sorted by owner.
+        /// Booked atoms per owner, sorted by owner key id.
         per_owner: Vec<OwnerReward>,
         /// Per-category delta.
         delta: CategoryDelta,
@@ -713,8 +913,8 @@ pub enum FeeTransition {
         job_id: u64,
         /// Base Fee.
         base_fee: u64,
-        /// Lease owner.
-        owner: u64,
+        /// Lease owner's key id.
+        owner: Digest,
         /// Per-category delta.
         delta: CategoryDelta,
     },

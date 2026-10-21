@@ -100,7 +100,10 @@ impl<T: Copy + Eq + std::hash::Hash> LruSeen<T> {
 struct NetShared {
     peers: HashMap<PeerId, PeerHandle>,
     bans: HashMap<BanKey, Instant>,
+    /// Relay ids (`chain::block_relay_id`), not block ids: a copy with a forged
+    /// signature has the honest `block_id` and must not shadow the genuine block.
     seen_blocks: LruSeen<Digest>,
+    /// Relay ids (`chain::job_relay_id`), not tx ids, for the same reason.
     seen_jobs: LruSeen<Digest>,
     paused: bool,
 }
@@ -321,7 +324,9 @@ impl PeerManager {
                 };
                 let tip_height = self.status_rx.borrow().tip.height;
                 let height = block.header.context.height;
-                self.lock().seen_blocks.mark_seen(block.header.block_id);
+                if let Ok(relay_id) = chain::block_relay_id(&block.header) {
+                    self.lock().seen_blocks.mark_seen(relay_id);
+                }
                 if height + RELAY_DEPTH >= tip_height {
                     let msg = WireMessage::GossipBlock(Box::new((*block).clone()));
                     self.broadcast(&msg, exclude);
@@ -348,8 +353,8 @@ impl PeerManager {
             Origin::Peer(pid) => Some(pid),
             _ => None,
         };
-        if let Ok((tx_id, _)) = chain::compute_job_ids(&tx) {
-            self.lock().seen_jobs.mark_seen(tx_id);
+        if let Ok(relay_id) = chain::job_relay_id(&tx) {
+            self.lock().seen_jobs.mark_seen(relay_id);
         }
         self.broadcast(&WireMessage::GossipJob(tx), exclude);
     }
@@ -535,14 +540,16 @@ impl PeerManager {
                 Err(Disconnect::Ban(PROTOCOL_BAN, "second Handshake".into()))
             }
             WireMessage::GossipBlock(block) => {
-                let block_id = block.header.block_id;
                 let height = block.header.context.height;
+                let Ok(relay_id) = chain::block_relay_id(&block.header) else {
+                    return Ok(());
+                };
                 {
                     let mut guard = self.lock();
                     if let Some(p) = guard.peers.get_mut(&peer_id) {
                         p.best_height = p.best_height.max(height);
                     }
-                    if !guard.seen_blocks.mark_seen(block_id) {
+                    if !guard.seen_blocks.mark_seen(relay_id) {
                         return Ok(());
                     }
                 }
@@ -562,10 +569,10 @@ impl PeerManager {
                 }
             }
             WireMessage::GossipJob(tx) => {
-                let Ok((tx_id, _)) = chain::compute_job_ids(&tx) else {
+                let Ok(relay_id) = chain::job_relay_id(&tx) else {
                     return Ok(());
                 };
-                if !self.lock().seen_jobs.mark_seen(tx_id) {
+                if !self.lock().seen_jobs.mark_seen(relay_id) {
                     return Ok(());
                 }
                 let (reply_tx, reply_rx) = oneshot::channel();

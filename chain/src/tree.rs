@@ -6,18 +6,18 @@ use std::sync::Arc;
 
 use ledger::StateCategory;
 use wire::{
-    Block, CORE_PROTOCOL_VERSION, Digest, FeeTransition, GENERATOR_VERSION, GenesisConfig,
-    MAX_FUTURE_SECS, MAX_REORG_DEPTH, PLACEHOLDER_SUITE_ID, ShareProof, Target, codec,
+    Block, CORE_PROTOCOL_VERSION, CRYPTO_SUITE_ID, Digest, FeeTransition, GENERATOR_VERSION,
+    GenesisConfig, MAX_FUTURE_SECS, MAX_REORG_DEPTH, ShareProof, Target, codec,
 };
 
 use crate::core_adapter::{
     ClaimedWork, Lottery, WorkError, compute_body_root, compute_difficulty_context,
     compute_job_ids, compute_miner_policy_digest, compute_payout_policy_digest,
-    compute_program_and_air_ids, top128, validate_genesis, verify_fresh_work,
+    compute_program_and_air_ids, owner_key_id, top128, validate_genesis, verify_fresh_work,
+    verify_header_miner, verify_job_client, verify_share_owner,
 };
 use crate::difficulty::{ChainView, expected_targets, seal_weight, share_target_for, share_weight};
 use crate::stf::{NodeState, ShareRecord, VerifiedShare, apply_body};
-use crate::template::verified_share;
 
 /// Metadata stored per validated block in `BlockTree` (§8.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,8 +38,8 @@ pub struct BlockMeta {
     pub seal_weight: u128,
     /// Sum of seal weights from genesis.
     pub cumulative_weight: u128,
-    /// Beneficiary (0 for genesis).
-    pub miner_owner: u64,
+    /// Beneficiary's key id (`Digest::ZERO` for genesis).
+    pub miner_key_id: Digest,
 }
 
 /// Summary of an admitted job inside a block for `/api/blocks` (§9.4).
@@ -49,8 +49,8 @@ pub struct JobSummary {
     pub job_id: u64,
     /// Transaction identifier.
     pub tx_id: Digest,
-    /// Lease owner.
-    pub executor_owner: u64,
+    /// Lease owner's key id.
+    pub executor_owner: Digest,
     /// Escrow deposit.
     pub deposit: u64,
     /// Queue fee.
@@ -66,8 +66,8 @@ pub struct ReceiptSummary {
     pub job_id: u64,
     /// Exact dot product.
     pub result: i128,
-    /// Lease owner.
-    pub executor_owner: u64,
+    /// Lease owner's key id.
+    pub executor_owner: Digest,
     /// Height of admission.
     pub admitted_at: u64,
 }
@@ -77,8 +77,8 @@ pub struct ReceiptSummary {
 pub struct ShareSummary {
     /// ShareID.
     pub work_id: Digest,
-    /// Beneficiary.
-    pub owner: u64,
+    /// Beneficiary's key id.
+    pub owner: Digest,
     /// Height the share was mined at.
     pub height: u64,
     /// `w_s`.
@@ -96,8 +96,8 @@ pub struct BlockSummary {
     pub parent_id: Digest,
     /// `stable_anchor_id`.
     pub anchor_id: Digest,
-    /// Beneficiary.
-    pub miner_owner: u64,
+    /// Beneficiary's key id.
+    pub miner_key_id: Digest,
     /// Context field 16.
     pub time_bucket: u64,
     /// Winning nonce.
@@ -270,7 +270,7 @@ impl BlockTree {
             share_target: share_target_for(seal, genesis.share_ratio),
             seal_weight: 0,
             cumulative_weight: 0,
-            miner_owner: 0,
+            miner_key_id: Digest::ZERO,
         };
         Ok(Self {
             genesis,
@@ -452,13 +452,11 @@ impl BlockTree {
             return Err(invalid(format!("expected height {h}, got {}", ctx.height)));
         }
         self.check_context_constants(ctx, program_id, air_id)?;
-        if block.header.miner_owner < 1 {
-            return Err(invalid("miner_owner must be >= 1"));
-        }
-        if ctx.miner_policy_digest != compute_miner_policy_digest(block.header.miner_owner)
-            || ctx.payout_policy_digest != compute_payout_policy_digest(block.header.miner_owner)
+        let miner_key_id = owner_key_id(&block.header.miner_key);
+        if ctx.miner_policy_digest != compute_miner_policy_digest(&miner_key_id)
+            || ctx.payout_policy_digest != compute_payout_policy_digest(&miner_key_id)
         {
-            return Err(invalid("policy digest does not match miner_owner"));
+            return Err(invalid("policy digest does not match miner_key"));
         }
         if ctx.body_core_root != compute_body_root(body).map_err(invalid)? {
             return Err(invalid("body_core_root mismatch"));
@@ -514,10 +512,7 @@ impl BlockTree {
                 ctx.protocol_version == CORE_PROTOCOL_VERSION,
                 "protocol_version",
             ),
-            (
-                ctx.crypto_suite_id == PLACEHOLDER_SUITE_ID,
-                "crypto_suite_id",
-            ),
+            (ctx.crypto_suite_id == CRYPTO_SUITE_ID, "crypto_suite_id"),
             (ctx.program_id == program_id, "program_id"),
             (ctx.air_id == air_id, "air_id"),
             (
@@ -549,9 +544,6 @@ impl BlockTree {
         if parent_state.shares.contains_key(&sh.work_id) {
             return Err(invalid("share work_id already registered"));
         }
-        if sh.owner < 1 {
-            return Err(invalid("share owner must be >= 1"));
-        }
         let c = &sh.context;
         self.check_context_constants(c, program_id, air_id)
             .map_err(|e| invalid(format!("share: {e}")))?;
@@ -561,8 +553,9 @@ impl BlockTree {
         if c.stable_anchor_id != view.block_id_at(s.saturating_sub(self.genesis.anchor_depth)) {
             return Err(invalid("share stable_anchor_id mismatch"));
         }
-        if c.miner_policy_digest != compute_miner_policy_digest(sh.owner)
-            || c.payout_policy_digest != compute_payout_policy_digest(sh.owner)
+        let owner_key_id = owner_key_id(&sh.owner_key);
+        if c.miner_policy_digest != compute_miner_policy_digest(&owner_key_id)
+            || c.payout_policy_digest != compute_payout_policy_digest(&owner_key_id)
         {
             return Err(invalid("share policy digest mismatch"));
         }
@@ -576,8 +569,26 @@ impl BlockTree {
         Ok(())
     }
 
-    /// Runs Stage A (VerifyFW) synchronously on the header and all shares (§6.2).
+    /// Verifies the ML-DSA-87 signatures of the header, every job and every share.
+    ///
+    /// Cheap next to a tile recomputation (about 0.5 ms each), so Stage A runs it first.
+    /// Jobs are checked against the header's `genesis_id`, which Stage B pins to ours.
+    pub fn verify_signatures(block: &Block) -> Result<(), WorkError> {
+        verify_header_miner(&block.header).map_err(|e| WorkError::Signature("header", e))?;
+        let genesis_id = block.header.context.genesis_id;
+        for tx in &block.body.jobs {
+            verify_job_client(tx, &genesis_id).map_err(|e| WorkError::Signature("job", e))?;
+        }
+        for sh in &block.body.shares {
+            verify_share_owner(sh).map_err(|e| WorkError::Signature("share", e))?;
+        }
+        Ok(())
+    }
+
+    /// Runs Stage A synchronously: every signature, then VerifyFW on the header and all
+    /// shares (§6.2).
     pub fn verify_stage_a(block: &Block) -> Result<(), WorkError> {
+        Self::verify_signatures(block)?;
         verify_fresh_work(
             &block.header.context,
             &ClaimedWork::from_header(&block.header),
@@ -597,6 +608,9 @@ impl BlockTree {
 
     /// Applies §6.8 steps 8–9: `apply_body`, header share registration, insertion and fork
     /// choice. The caller must have run `pre_validate` and Stage A (or trust the block).
+    ///
+    /// Owners enter the state only through verified signatures: the miner's and every
+    /// share owner's ML-DSA-87 signature is checked here even for trusted blocks.
     pub fn apply_verified_block(&mut self, block: Arc<Block>) -> Result<InsertOutcome, TreeError> {
         let id = block.header.block_id;
         if self.metas.contains_key(&id) {
@@ -612,7 +626,15 @@ impl BlockTree {
 
         // Step 8: apply_body and require the body's derived fields to match
         let h = parent_meta.height + 1;
-        let verified: Vec<VerifiedShare> = block.body.shares.iter().map(verified_share).collect();
+        let miner = verify_header_miner(&block.header)
+            .map_err(|e| invalid(format!("header signature: {e}")))?;
+        let verified: Vec<VerifiedShare> = block
+            .body
+            .shares
+            .iter()
+            .map(VerifiedShare::verify)
+            .collect::<Result<_, _>>()
+            .map_err(|e| invalid(format!("share signature: {e}")))?;
         let (mut post_state, derived) =
             apply_body(parent_state, &self.genesis, h, &block.body.jobs, &verified)
                 .map_err(|e| invalid(e.to_string()))?;
@@ -637,7 +659,7 @@ impl BlockTree {
                 .entry(block.header.work_id)
                 .or_insert(ShareRecord {
                     work_id: block.header.work_id,
-                    owner: block.header.miner_owner,
+                    owner: miner,
                     weight: share_weight(block.header.share_target),
                     height: h,
                     included_at: h,
@@ -658,7 +680,7 @@ impl BlockTree {
             share_target: block.header.share_target,
             seal_weight: sw,
             cumulative_weight: cw,
-            miner_owner: block.header.miner_owner,
+            miner_key_id: miner.key_id(),
         };
 
         // Fork choice (§6.5): strictly heavier wins; a tie keeps the current tip.
@@ -743,7 +765,7 @@ fn build_summary(
         jobs.push(JobSummary {
             job_id,
             tx_id,
-            executor_owner: block.body.leases.get(i).map_or(0, |l| l.owner),
+            executor_owner: block.body.leases.get(i).map_or(Digest::ZERO, |l| l.owner),
             deposit,
             queue_fee: tx.queue_fee,
             base_fee: tx.base_fee,
@@ -766,7 +788,7 @@ fn build_summary(
         .iter()
         .map(|s| ShareSummary {
             work_id: s.work_id,
-            owner: s.owner,
+            owner: owner_key_id(&s.owner_key),
             height: s.context.height,
             weight: share_weight(s.share_target),
         })
@@ -777,7 +799,7 @@ fn build_summary(
         block_id: meta.id,
         parent_id: meta.parent,
         anchor_id: block.header.context.stable_anchor_id,
-        miner_owner: meta.miner_owner,
+        miner_key_id: meta.miner_key_id,
         time_bucket: meta.time_bucket,
         attempt_nonce: block.header.context.attempt_nonce,
         epoch: post_state.ledger.epoch(),
@@ -797,11 +819,16 @@ fn build_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core_adapter::{compute_client_digest, fw_context_to_core};
+    use crate::core_adapter::fw_context_to_core;
+    use crate::keys::{OwnerKeypair, unsigned};
     use crate::template::build_template;
     use primitives::TOTAL_SUPPLY;
     use wire::{DifficultyMode, JobPayload, JobTransaction};
     use work::FreshWorkIds;
+
+    fn key(i: u8) -> Arc<OwnerKeypair> {
+        Arc::new(OwnerKeypair::from_seed(&[i; 32]))
+    }
 
     fn test_genesis() -> GenesisConfig {
         let mut g = GenesisConfig::default_testnet(1_700_000_000);
@@ -819,7 +846,7 @@ mod tests {
     fn mine_one(
         tree: &BlockTree,
         parent_id: Digest,
-        owner: u64,
+        owner: &Arc<OwnerKeypair>,
         mempool: &[JobTransaction],
         nonce: u64,
         time_bucket: u64,
@@ -843,12 +870,13 @@ mod tests {
         let ctx = fw_context_to_core(&tpl.context_with_nonce(nonce)).unwrap();
         let inst = ctx.instance();
         let z = inst.x.product(&inst.y);
-        tpl.seal(nonce, &FreshWorkIds::derive(&ctx, &z))
+        tpl.seal(nonce, &FreshWorkIds::derive(&ctx, &z)).unwrap()
     }
 
-    fn sample_job(nonce: u64, expiry_height: u64) -> JobTransaction {
-        JobTransaction {
-            client: compute_client_digest("alice").unwrap(),
+    fn sample_job(nonce: u64, expiry_height: u64, genesis_id: &Digest) -> JobTransaction {
+        let client = key(200);
+        let mut tx = JobTransaction {
+            client_key: client.public_key().clone(),
             queue_fee: 100_000_000,
             base_fee: 1_000_000_000,
             v_exec: 8_000_000_000,
@@ -860,14 +888,18 @@ mod tests {
                 xs: (1..=512).map(|i| i as f64).collect(),
                 ys: (1..=512).rev().map(|i| i as f64).collect(),
             },
-        }
+            signature: unsigned(),
+        };
+        client.sign_job(&mut tx, genesis_id).unwrap();
+        tx
     }
 
     #[test]
     fn stf_job_lifecycle_and_tamper_rejection() {
         let g = test_genesis();
         let mut tree = BlockTree::new(g.clone()).unwrap();
-        let tx = sample_job(1, 100);
+        let tx = sample_job(1, 100, &tree.genesis_id());
+        let miner = key(1);
 
         // Epoch 1 (boundary h = 4) books the header shares of blocks 1..=3; that booking
         // is paid into U at the epoch-2 boundary h = 8. Until then the founder tranches
@@ -875,7 +907,7 @@ mod tests {
         let b1 = mine_one(
             &tree,
             tree.tip_id(),
-            1,
+            &miner,
             std::slice::from_ref(&tx),
             0,
             1_700_000_001,
@@ -889,7 +921,7 @@ mod tests {
             let b = mine_one(
                 &tree,
                 tree.tip_id(),
-                1,
+                &miner,
                 std::slice::from_ref(&tx),
                 h,
                 1_700_000_000 + h,
@@ -908,7 +940,7 @@ mod tests {
         let b8 = mine_one(
             &tree,
             tree.tip_id(),
-            1,
+            &miner,
             std::slice::from_ref(&tx),
             8,
             1_700_000_008,
@@ -916,8 +948,9 @@ mod tests {
         assert_eq!(b8.body.jobs.len(), 1);
         assert_eq!(b8.body.leases.len(), 1);
 
+        // Another key cannot claim the block: the work binds the miner's key id.
         let mut tampered = b8.clone();
-        tampered.header.miner_owner = 999;
+        key(9).sign_header(&mut tampered.header).unwrap();
         assert!(tree.pre_validate(&tampered, None).is_err());
 
         tree.pre_validate(&b8, None).unwrap();
@@ -927,7 +960,7 @@ mod tests {
 
         // settle_delay = 2: the job settles at h = 10.
         for h in 9..=10 {
-            let b = mine_one(&tree, tree.tip_id(), 1, &[], h, 1_700_000_000 + h);
+            let b = mine_one(&tree, tree.tip_id(), &miner, &[], h, 1_700_000_000 + h);
             assert_eq!(b.body.receipts.len(), usize::from(h == 10));
             tree.pre_validate(&b, None).unwrap();
             tree.apply_verified_block(Arc::new(b)).unwrap();
@@ -952,8 +985,9 @@ mod tests {
         let mut tree = BlockTree::new(g).unwrap();
         let genesis_id = tree.genesis_id();
 
-        let a1 = mine_one(&tree, genesis_id, 1, &[], 1, 1_700_000_001);
-        let b1 = mine_one(&tree, genesis_id, 2, &[], 2, 1_700_000_001);
+        let (k1, k2) = (key(1), key(2));
+        let a1 = mine_one(&tree, genesis_id, &k1, &[], 1, 1_700_000_001);
+        let b1 = mine_one(&tree, genesis_id, &k2, &[], 2, 1_700_000_001);
 
         let out_a1 = tree.apply_verified_block(Arc::new(a1.clone())).unwrap();
         assert!(out_a1.tip_changed);
@@ -965,7 +999,7 @@ mod tests {
         assert_eq!(tree.tip_id(), a1.header.block_id);
 
         // Extending branch B to height 2 makes it heavier: reorg.
-        let b2 = mine_one(&tree, b1.header.block_id, 2, &[], 3, 1_700_000_002);
+        let b2 = mine_one(&tree, b1.header.block_id, &k2, &[], 3, 1_700_000_002);
         tree.pre_validate(&b2, None).unwrap();
         let out_b2 = tree.apply_verified_block(Arc::new(b2.clone())).unwrap();
         assert!(out_b2.tip_changed);
@@ -978,7 +1012,7 @@ mod tests {
         assert_eq!(tree.canonical_id_at(2), Some(b2.header.block_id));
 
         // A block on the abandoned branch still validates against its own ancestry.
-        let a2 = mine_one(&tree, a1.header.block_id, 1, &[], 4, 1_700_000_002);
+        let a2 = mine_one(&tree, a1.header.block_id, &k1, &[], 4, 1_700_000_002);
         tree.pre_validate(&a2, None).unwrap();
         let out_a2 = tree.apply_verified_block(Arc::new(a2)).unwrap();
         assert!(!out_a2.tip_changed, "equal weight keeps the current tip");

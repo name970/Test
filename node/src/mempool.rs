@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use chain::{JobValidationError, compute_job_ids, validate_job_stateless};
+use chain::{JobValidationError, compute_job_ids, validate_job_stateless, verify_job_client};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::warn;
 use wire::{Block, Digest, JobTransaction, MEMPOOL_CAPACITY};
@@ -186,6 +186,13 @@ impl MempoolActor {
         tx: JobTransaction,
         origin: Origin,
     ) -> Result<MempoolInsertOk, MempoolReject> {
+        // Duplicates first: a re-signed or forged copy of a pooled job has the same
+        // tx_id, and rejecting it costs one hash instead of a full validation.
+        if let Ok((tx_id, job_id)) = compute_job_ids(&tx)
+            && (self.by_tx_id.contains(&tx_id) || self.by_job_id.contains_key(&job_id))
+        {
+            return Err(MempoolReject::Duplicate);
+        }
         let (tx_id, job_id, deposit, expected_result) =
             validate_job_stateless(&tx).map_err(|err| MempoolReject::Invalid {
                 code: rejection_code(&err),
@@ -213,6 +220,12 @@ impl MempoolActor {
         if self.fifo.len() >= MEMPOOL_CAPACITY {
             return Err(MempoolReject::Full);
         }
+        // Last, so duplicates relayed by several peers never pay for a verification.
+        let genesis_id = self.status_rx.borrow().genesis_id;
+        verify_job_client(&tx, &genesis_id).map_err(|err| MempoolReject::Invalid {
+            code: "bad_signature",
+            message: format!("client signature: {err}"),
+        })?;
 
         self.push(tx_id, job_id, tx.clone());
         self.publish_view();

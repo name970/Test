@@ -2,16 +2,18 @@
 
 use std::sync::Arc;
 use wire::{
-    Block, BlockBody, BlockHeader, CORE_PROTOCOL_VERSION, Digest, FwContext, GENERATOR_VERSION,
-    GenesisConfig, JobTransaction, PLACEHOLDER_SUITE_ID, ShareProof, Target, codec,
+    Block, BlockBody, BlockHeader, CORE_PROTOCOL_VERSION, CRYPTO_SUITE_ID, Digest, FwContext,
+    GENERATOR_VERSION, GenesisConfig, JobTransaction, ShareProof, Target, codec,
 };
 use work::FreshWorkIds;
 
 use crate::core_adapter::{
     compute_body_root, compute_difficulty_context, compute_job_ids, compute_miner_policy_digest,
     compute_payout_policy_digest, compute_program_and_air_ids, fresh_work_ids_to_digests,
+    owner_key_id,
 };
-use crate::difficulty::{ChainView, expected_targets, share_weight};
+use crate::difficulty::{ChainView, expected_targets};
+use crate::keys::{OwnerKeypair, unsigned};
 use crate::stf::{NodeState, StfError, VerifiedShare, apply_body};
 
 /// Mining template published to the `ConsensusEngine` (§7.4, §8.5).
@@ -27,8 +29,8 @@ pub struct Template {
     pub seal_target: Target,
     /// `Θ_S` of the next height.
     pub share_target: Target,
-    /// Beneficiary of everything mined on this template.
-    pub miner_owner: u64,
+    /// Beneficiary of everything mined on this template; signs its blocks and shares.
+    pub miner: Arc<OwnerKeypair>,
 }
 
 impl Template {
@@ -39,36 +41,44 @@ impl Template {
         ctx
     }
 
-    /// Seals this template into a `Block` using the given `nonce` and `FreshWorkIds`.
-    pub fn seal(&self, nonce: u64, ids: &FreshWorkIds) -> Block {
+    /// Seals this template into a signed `Block` using the given `nonce` and `FreshWorkIds`.
+    /// Errors only if the OS random number generator fails while signing.
+    pub fn seal(&self, nonce: u64, ids: &FreshWorkIds) -> Result<Block, String> {
         let d = fresh_work_ids_to_digests(ids);
-        Block {
-            header: BlockHeader {
-                context: self.context_with_nonce(nonce),
-                output_root: d.output_root,
-                work_id: d.work_id,
-                block_id: d.block_id,
-                share_ticket: d.share_ticket,
-                seal_ticket: d.seal_ticket,
-                seal_target: self.seal_target,
-                share_target: self.share_target,
-                miner_owner: self.miner_owner,
-            },
+        let mut header = BlockHeader {
+            context: self.context_with_nonce(nonce),
+            output_root: d.output_root,
+            work_id: d.work_id,
+            block_id: d.block_id,
+            share_ticket: d.share_ticket,
+            seal_ticket: d.seal_ticket,
+            seal_target: self.seal_target,
+            share_target: self.share_target,
+            miner_key: self.miner.public_key().clone(),
+            signature: unsigned(),
+        };
+        self.miner.sign_header(&mut header)?;
+        Ok(Block {
+            header,
             body: (*self.body).clone(),
-        }
+        })
     }
 
-    /// Packages an attempt on this template into a `ShareProof` using `nonce` and `FreshWorkIds`.
-    pub fn share(&self, nonce: u64, ids: &FreshWorkIds) -> ShareProof {
+    /// Packages an attempt on this template into a signed `ShareProof` using `nonce` and
+    /// `FreshWorkIds`. Errors only if the OS random number generator fails while signing.
+    pub fn share(&self, nonce: u64, ids: &FreshWorkIds) -> Result<ShareProof, String> {
         let d = fresh_work_ids_to_digests(ids);
-        ShareProof {
+        let mut share = ShareProof {
             context: self.context_with_nonce(nonce),
-            owner: self.miner_owner,
+            owner_key: self.miner.public_key().clone(),
             output_root: d.output_root,
             work_id: d.work_id,
             share_ticket: d.share_ticket,
             share_target: self.share_target,
-        }
+            signature: unsigned(),
+        };
+        self.miner.sign_share(&mut share)?;
+        Ok(share)
     }
 
     /// True when `other` would make the miners evaluate exactly the same contexts.
@@ -76,12 +86,13 @@ impl Template {
         self.context == other.context
             && self.seal_target == other.seal_target
             && self.share_target == other.share_target
-            && self.miner_owner == other.miner_owner
+            && self.miner.key_id() == other.miner.key_id()
     }
 }
 
-/// Own shares that satisfy the §6.7 inclusion rules for a block at height `h` on `chain`,
-/// sorted by `work_id`, unique, at most `max_shares_per_block`.
+/// Own shares that satisfy the §6.7 inclusion rules for a block at height `h` on `chain`
+/// and carry a valid owner signature, sorted by `work_id`, unique, at most
+/// `max_shares_per_block`, each with its `VerifiedShare`.
 fn includable_shares(
     genesis: &GenesisConfig,
     genesis_id: Digest,
@@ -89,9 +100,9 @@ fn includable_shares(
     tip_state: &NodeState,
     own_shares: &[ShareProof],
     h: u64,
-) -> Vec<ShareProof> {
+) -> Vec<(ShareProof, VerifiedShare)> {
     let (program_id, air_id) = compute_program_and_air_ids();
-    let mut shares: Vec<ShareProof> = own_shares
+    let mut shares: Vec<&ShareProof> = own_shares
         .iter()
         .filter(|sh| {
             let s = sh.context.height;
@@ -103,38 +114,30 @@ fn includable_shares(
             }
             let (exp_seal, exp_share) = chain.targets_at(s);
             let c = &sh.context;
-            sh.owner >= 1
-                && c.chain_id == genesis.chain_id
+            let key_id = owner_key_id(&sh.owner_key);
+            c.chain_id == genesis.chain_id
                 && c.genesis_id == genesis_id
                 && c.protocol_version == CORE_PROTOCOL_VERSION
-                && c.crypto_suite_id == PLACEHOLDER_SUITE_ID
+                && c.crypto_suite_id == CRYPTO_SUITE_ID
                 && c.program_id == program_id
                 && c.air_id == air_id
                 && c.generator_version == GENERATOR_VERSION
                 && c.parent_canonical_id == chain.block_id_at(s - 1)
                 && c.stable_anchor_id == chain.block_id_at(s.saturating_sub(genesis.anchor_depth))
-                && c.miner_policy_digest == compute_miner_policy_digest(sh.owner)
-                && c.payout_policy_digest == compute_payout_policy_digest(sh.owner)
+                && c.miner_policy_digest == compute_miner_policy_digest(&key_id)
+                && c.payout_policy_digest == compute_payout_policy_digest(&key_id)
                 && c.parent_derived_difficulty_context
                     == compute_difficulty_context(exp_seal, exp_share)
                 && sh.share_target == exp_share
         })
-        .cloned()
         .collect();
     shares.sort_by_key(|s| s.work_id);
     shares.dedup_by_key(|s| s.work_id);
-    shares.truncate(genesis.max_shares_per_block as usize);
     shares
-}
-
-/// The `VerifiedShare` view of a share proof.
-pub fn verified_share(sh: &ShareProof) -> VerifiedShare {
-    VerifiedShare {
-        work_id: sh.work_id,
-        owner: sh.owner,
-        weight: share_weight(sh.share_target),
-        height: sh.context.height,
-    }
+        .into_iter()
+        .filter_map(|sh| VerifiedShare::verify(sh).ok().map(|v| (sh.clone(), v)))
+        .take(genesis.max_shares_per_block as usize)
+        .collect()
 }
 
 /// Runs `apply_body` and assembles the body with its derived fields.
@@ -144,9 +147,9 @@ fn derive_body(
     h: u64,
     jobs: Vec<JobTransaction>,
     shares: &[ShareProof],
+    verified: &[VerifiedShare],
 ) -> Result<BlockBody, StfError> {
-    let verified: Vec<VerifiedShare> = shares.iter().map(verified_share).collect();
-    let (_, derived) = apply_body(tip_state, genesis, h, &jobs, &verified)?;
+    let (_, derived) = apply_body(tip_state, genesis, h, &jobs, verified)?;
     Ok(BlockBody {
         jobs,
         shares: shares.to_vec(),
@@ -172,14 +175,17 @@ pub fn build_template(
     tip_state: &NodeState,
     mempool_fifo: &[JobTransaction],
     own_shares: &[ShareProof],
-    miner_owner: u64,
+    miner: &Arc<OwnerKeypair>,
     now_bucket: u64,
 ) -> Result<Template, StfError> {
     let h = tip_height + 1;
-    let mut shares = includable_shares(genesis, genesis_id, chain, tip_state, own_shares, h);
-    let verified: Vec<VerifiedShare> = shares.iter().map(verified_share).collect();
+    let (mut shares, mut verified): (Vec<ShareProof>, Vec<VerifiedShare>) =
+        includable_shares(genesis, genesis_id, chain, tip_state, own_shares, h)
+            .into_iter()
+            .unzip();
     if apply_body(tip_state, genesis, h, &[], &verified).is_err() {
         shares.clear();
+        verified.clear();
     }
 
     // Greedily add jobs in FIFO order; the body itself stays sorted by tx_id (§7.4).
@@ -197,18 +203,18 @@ pub fn build_template(
         let mut candidate = selected.clone();
         candidate.insert(pos, (tx_id, tx.clone()));
         let jobs: Vec<JobTransaction> = candidate.iter().map(|(_, j)| j.clone()).collect();
-        let verified: Vec<VerifiedShare> = shares.iter().map(verified_share).collect();
         if apply_body(tip_state, genesis, h, &jobs, &verified).is_ok() {
             selected = candidate;
         }
     }
 
     let mut jobs: Vec<JobTransaction> = selected.into_iter().map(|(_, j)| j).collect();
-    let mut body = derive_body(tip_state, genesis, h, jobs.clone(), &shares)?;
-    let size_limit = genesis.max_block_bytes.saturating_sub(4096) as usize;
+    let mut body = derive_body(tip_state, genesis, h, jobs.clone(), &shares, &verified)?;
+    // Leave room for the header (8,203 bytes with its key and signature) and framing.
+    let size_limit = genesis.max_block_bytes.saturating_sub(16_384) as usize;
     while !jobs.is_empty() && codec::encode(&body).map_or(usize::MAX, |b| b.len()) > size_limit {
         jobs.pop();
-        body = derive_body(tip_state, genesis, h, jobs.clone(), &shares)?;
+        body = derive_body(tip_state, genesis, h, jobs.clone(), &shares, &verified)?;
     }
 
     let (seal_target, share_target) = expected_targets(h, chain, genesis);
@@ -218,15 +224,15 @@ pub fn build_template(
         chain_id: genesis.chain_id,
         genesis_id,
         protocol_version: CORE_PROTOCOL_VERSION,
-        crypto_suite_id: PLACEHOLDER_SUITE_ID,
+        crypto_suite_id: CRYPTO_SUITE_ID,
         program_id,
         air_id,
         generator_version: GENERATOR_VERSION,
         parent_canonical_id: chain.block_id_at(tip_height),
         stable_anchor_id: chain.block_id_at(h.saturating_sub(genesis.anchor_depth)),
         height: h,
-        miner_policy_digest: compute_miner_policy_digest(miner_owner),
-        payout_policy_digest: compute_payout_policy_digest(miner_owner),
+        miner_policy_digest: compute_miner_policy_digest(&miner.key_id()),
+        payout_policy_digest: compute_payout_policy_digest(&miner.key_id()),
         attempt_nonce: 0,
         body_core_root,
         parent_derived_difficulty_context: compute_difficulty_context(seal_target, share_target),
@@ -239,6 +245,6 @@ pub fn build_template(
         body: Arc::new(body),
         seal_target,
         share_target,
-        miner_owner,
+        miner: miner.clone(),
     })
 }

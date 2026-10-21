@@ -9,6 +9,7 @@
 pub mod chain_actor;
 pub mod cli;
 pub mod engine;
+pub mod keystore;
 pub mod mempool;
 pub mod net;
 pub mod rpc;
@@ -21,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
-use wire::{DifficultyMode, GenesisConfig, Target};
+use wire::{DifficultyMode, Digest, GenesisConfig, Target};
 
 use crate::chain_actor::{ChainActor, ChainCmd, ChainEvent, StatusSnapshot};
 use crate::cli::{DifficultyArg, GenesisArgs, RunArgs};
@@ -43,6 +44,8 @@ pub struct NodeHandle {
     pub p2p_addr: SocketAddr,
     /// Bound RPC / explorer address.
     pub rpc_addr: SocketAddr,
+    /// Key id of this node's ML-DSA-87 miner key.
+    pub miner_key_id: Digest,
     /// Command channel of the ChainState actor.
     pub chain_tx: mpsc::Sender<ChainCmd>,
     /// Command channel of the mempool actor.
@@ -128,17 +131,27 @@ pub fn load_genesis(args: &RunArgs) -> Result<GenesisConfig, NodeError> {
 
 /// Starts all actors, P2P networking, the ConsensusEngine and the Axum RPC for one node.
 pub async fn start_node(args: RunArgs) -> Result<NodeHandle, NodeError> {
-    if args.owner_id < 1 {
-        return Err("--owner-id must be >= 1".into());
-    }
     let profile_check = chain::testnet_ozaki_profile().validate();
     profile_check.map_err(|e| format!("TESTNET_PROFILE validation failed: {e}"))?;
     let genesis = load_genesis(&args)?;
 
+    let key_path = args
+        .key_file
+        .clone()
+        .unwrap_or_else(|| args.data_dir.join(keystore::KEY_FILE_NAME));
     if args.reset && args.data_dir.exists() {
-        std::fs::remove_dir_all(&args.data_dir)?;
+        keystore::reset_data_dir(&args.data_dir, &key_path)?;
     }
     std::fs::create_dir_all(&args.data_dir)?;
+    let (miner, created) = keystore::load_or_create(&key_path)?;
+    let miner = Arc::new(miner);
+    info!(
+        key_id = %miner.key_id().short_hex(16),
+        owner_id = miner.owner_id(),
+        path = %key_path.display(),
+        "{} ML-DSA-87 miner key",
+        if created { "Generated a new" } else { "Loaded the" }
+    );
     let (log_writer, disk_blocks) = BlockStore::open(&args.data_dir.join("blocks.log"))?;
 
     let (chain_tx, chain_rx) = mpsc::channel::<ChainCmd>(1_024);
@@ -156,7 +169,7 @@ pub async fn start_node(args: RunArgs) -> Result<NodeHandle, NodeError> {
 
     let (mut chain_actor, status_rx) = ChainActor::new(
         genesis.clone(),
-        args.owner_id,
+        miner.clone(),
         log_writer,
         chain_tx.clone(),
         chain_rx,
@@ -209,6 +222,7 @@ pub async fn start_node(args: RunArgs) -> Result<NodeHandle, NodeError> {
         mempool_tx.clone(),
         engine.clone(),
         peer_manager.clone(),
+        miner.clone(),
         shutdown_rx,
     )
     .await?;
@@ -216,6 +230,7 @@ pub async fn start_node(args: RunArgs) -> Result<NodeHandle, NodeError> {
     Ok(NodeHandle {
         p2p_addr,
         rpc_addr,
+        miner_key_id: miner.key_id(),
         chain_tx,
         mempool_tx,
         status_rx,

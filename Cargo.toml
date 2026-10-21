@@ -30,6 +30,8 @@ chain = { path = "chain" }
 # (same repository, same `keccak` backend).
 sha3 = { version = "0.12.0", default-features = false }
 shake = { version = "0.1.0", default-features = false }
+# FIPS 204 ML-DSA-87 (RustCrypto). Shares `shake` and `keccak` with the hashing above.
+ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "getrandom"] }
 
 serde = { version = "1.0.228", features = ["derive"] }
 # 3.0.0 is a compile_error! tombstone (RUSTSEC-2025-0141); 1.3.3 is declared complete.
@@ -65,4 +67,9 @@ opt-level = 3
 [profile.dev.package.sha3]
 opt-level = 3
 [profile.dev.package.shake]
+opt-level = 3
+# ML-DSA-87 signs and verifies every block, share and job.
+[profile.dev.package.ml-dsa]
+opt-level = 3
+[profile.dev.package.module-lattice]
 opt-level = 3

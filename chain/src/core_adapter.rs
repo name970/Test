@@ -1,14 +1,20 @@
 //! Core adapter (§3.3, §5.4, §5.8, §5.9, §6.1, §6.2, §13).
 //!
-//! The only module that converts between wire types and the frozen core crates.
+//! The only module that converts between wire types and the frozen core crates. It is
+//! also where owner identity crosses into the core: an ML-DSA-87 signature is verified
+//! here before the owner's key id and its 64-bit `scheduler::OwnerId` reach `apply_body`.
 
 use core::fmt;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use ledger::{EmissionRate, Ledger, LedgerParams};
-use primitives::DomainSeparatedHash;
+use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa87, VerifyingKey};
+use primitives::{DomainSeparatedHash, labels, pq_sizes};
 use scivm::{OzakiIIProfile, RoundingMode};
 use wire::{
     BlockBody, BlockHeader, DOT_LEN, Digest, FwContext, GenesisConfig, JobPayload, JobTransaction,
-    MAX_JOB_BYTES, MIN_TARGET, ShareProof, Target, codec,
+    MAX_JOB_BYTES, MIN_TARGET, PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN, ShareProof, Signature,
+    Target, codec,
 };
 use work::{FreshWorkContext, FreshWorkIds, TILE_DIM};
 
@@ -20,18 +26,30 @@ use work::{FreshWorkContext, FreshWorkIds, TILE_DIM};
 pub const LABEL_GENESIS: &str = "PLAU/TESTNET/GENESIS/v1";
 /// Label of the `program_id` and `air_id` tags.
 pub const LABEL_TAG: &str = "PLAU/TESTNET/TAG/v1";
-/// Label of `miner_policy_digest`.
-pub const LABEL_MINER: &str = "PLAU/TESTNET/MINER/v1";
-/// Label of `payout_policy_digest`.
-pub const LABEL_PAYOUT: &str = "PLAU/TESTNET/PAYOUT/v1";
+/// Label of `miner_policy_digest` (v2: hashes the owner key id).
+pub const LABEL_MINER: &str = "PLAU/TESTNET/MINER/v2";
+/// Label of `payout_policy_digest` (v2: hashes the owner key id).
+pub const LABEL_PAYOUT: &str = "PLAU/TESTNET/PAYOUT/v2";
 /// Label of `parent_derived_difficulty_context`.
 pub const LABEL_DIFFICULTY: &str = "PLAU/TESTNET/DIFFICULTY/v1";
 /// Label of `body_core_root`.
 pub const LABEL_BODY: &str = "PLAU/TESTNET/BODY/v1";
-/// Label of `tx_id`.
-pub const LABEL_JOB: &str = "PLAU/TESTNET/JOB/v1";
-/// Label of the RPC client tag.
-pub const LABEL_CLIENT: &str = "PLAU/TESTNET/CLIENT/v1";
+/// Label of `tx_id` (v2: hashes the encoding without the signature).
+pub const LABEL_JOB: &str = "PLAU/TESTNET/JOB/v2";
+/// Label of an owner key id, `H(PLAU/TESTNET/OWNER/v1, public key)`.
+pub const LABEL_OWNER: &str = "PLAU/TESTNET/OWNER/v1";
+/// Label of the digest a client signs for a job.
+pub const LABEL_SIG_JOB: &str = "PLAU/TESTNET/SIG/JOB/v1";
+/// Label of the digest an owner signs for a share proof.
+pub const LABEL_SIG_SHARE: &str = "PLAU/TESTNET/SIG/SHARE/v1";
+/// Label of the digest a miner signs for a block header.
+pub const LABEL_SIG_HEADER: &str = "PLAU/TESTNET/SIG/HEADER/v1";
+/// FIPS 204 context string of every ML-DSA-87 signature (spec eqs. 2.3–2.5).
+pub const SIGNATURE_CONTEXT: &[u8] = labels::PLAU_TX.as_bytes();
+/// Label of a block's relay id (local, not consensus).
+pub const LABEL_RELAY_BLOCK: &str = "PLAU/TESTNET/RELAY/BLOCK/v1";
+/// Label of a job's relay id (local, not consensus).
+pub const LABEL_RELAY_JOB: &str = "PLAU/TESTNET/RELAY/JOB/v1";
 /// Label of `ledger_digest`.
 pub const LABEL_LEDGER: &str = "PLAU/TESTNET/LEDGER/v1";
 /// Label of `result_digest`.
@@ -44,6 +62,8 @@ pub const AIR_TAG_NAME: &str = "air/int8-tile";
 
 const _: () = assert!(DOT_LEN == TILE_DIM);
 const _: () = assert!(wire::DIGEST_LEN == primitives::DIGEST_LEN);
+const _: () = assert!(PUBLIC_KEY_LEN as u64 == pq_sizes::ML_DSA_87_PUBLIC_KEY);
+const _: () = assert!(SIGNATURE_LEN as u64 == pq_sizes::ML_DSA_87_SIGNATURE);
 
 /// Converts a core `DomainSeparatedHash` into a wire `Digest`.
 pub fn hash_to_digest(h: &DomainSeparatedHash) -> Digest {
@@ -73,14 +93,14 @@ pub fn compute_program_and_air_ids() -> (Digest, Digest) {
     (program_id, air_id)
 }
 
-/// Computes `miner_policy_digest = H(PLAU/TESTNET/MINER/v1, owner_be)`.
-pub fn compute_miner_policy_digest(owner: u64) -> Digest {
-    domain_hash(LABEL_MINER, &[&owner.to_be_bytes()])
+/// Computes `miner_policy_digest = H(PLAU/TESTNET/MINER/v2, owner_key_id)`.
+pub fn compute_miner_policy_digest(owner_key_id: &Digest) -> Digest {
+    domain_hash(LABEL_MINER, &[&owner_key_id.0])
 }
 
-/// Computes `payout_policy_digest = H(PLAU/TESTNET/PAYOUT/v1, owner_be)`.
-pub fn compute_payout_policy_digest(owner: u64) -> Digest {
-    domain_hash(LABEL_PAYOUT, &[&owner.to_be_bytes()])
+/// Computes `payout_policy_digest = H(PLAU/TESTNET/PAYOUT/v2, owner_key_id)`.
+pub fn compute_payout_policy_digest(owner_key_id: &Digest) -> Digest {
+    domain_hash(LABEL_PAYOUT, &[&owner_key_id.0])
 }
 
 /// Computes `parent_derived_difficulty_context = H(PLAU/TESTNET/DIFFICULTY/v1, seal_target, share_target)`.
@@ -105,18 +125,11 @@ fn job_ids_from_encoding(encoded: &[u8]) -> (Digest, u64) {
     (tx_id, u64::from_be_bytes(first8))
 }
 
-/// Computes `(tx_id, job_id)` for a `JobTransaction` (§5.4).
+/// Computes `(tx_id, job_id)` for a `JobTransaction` (§5.4). `tx_id` hashes the
+/// encoding without the signature, so re-signing a job never changes its identity.
 pub fn compute_job_ids(tx: &JobTransaction) -> Result<(Digest, u64), String> {
-    let bytes = codec::encode(tx).map_err(|e| e.to_string())?;
+    let bytes = tx.unsigned_encoding().map_err(|e| e.to_string())?;
     Ok(job_ids_from_encoding(&bytes))
-}
-
-/// Computes `JobTransaction.client` from a client label of at most 64 bytes (§3.3, §9.5).
-pub fn compute_client_digest(client_text: &str) -> Result<Digest, String> {
-    if client_text.len() > 64 {
-        return Err("client text exceeds 64 bytes".to_string());
-    }
-    Ok(domain_hash(LABEL_CLIENT, &[client_text.as_bytes()]))
 }
 
 /// Computes `result_digest = H(PLAU/TESTNET/RESULT/v1, job_id, result)`.
@@ -266,6 +279,8 @@ pub fn validate_job_stateless(
     if encoded.len() > MAX_JOB_BYTES {
         return Err(JobValidationError::TooLarge(encoded.len()));
     }
+    // `tx_id` hashes the bytes without the trailing signature, as in `compute_job_ids`.
+    let unsigned_len = encoded.len() - SIGNATURE_LEN;
 
     let dot = match &tx.payload {
         JobPayload::ExactDot { xs, ys } => {
@@ -291,8 +306,206 @@ pub fn validate_job_stateless(
         }
     };
 
-    let (tx_id, job_id) = job_ids_from_encoding(&encoded);
+    let (tx_id, job_id) = job_ids_from_encoding(&encoded[..unsigned_len]);
     Ok((tx_id, job_id, deposit, dot))
+}
+
+// ---------------------------------------------------------------------------
+// Owner identity: key ids, signing digests and ML-DSA-87 verification
+// ---------------------------------------------------------------------------
+
+/// Computes an owner key id, `H(PLAU/TESTNET/OWNER/v1, public key)`.
+pub fn owner_key_id(key: &PublicKey) -> Digest {
+    domain_hash(LABEL_OWNER, &[&key.as_bytes()[..]])
+}
+
+/// Narrows a key id to the 64-bit `scheduler::OwnerId` (its first 8 bytes, big-endian).
+///
+/// The frozen scheduler uses this only for owner capacity bounds. Rewards, leases
+/// and receipts carry the full 512-bit key id, so a colliding 64-bit value (about
+/// 2^32 key generations) cannot redirect funds or attributions.
+pub fn owner_id_from_key_id(key_id: &Digest) -> u64 {
+    let mut first8 = [0u8; 8];
+    first8.copy_from_slice(&key_id.0[..8]);
+    u64::from_be_bytes(first8)
+}
+
+/// The digest a client signs: `H(PLAU/TESTNET/SIG/JOB/v1, genesis_id, tx_id)`.
+///
+/// `tx_id` covers every field but the signature; `genesis_id` stops a job signed for
+/// one testnet from being replayed on another.
+pub fn job_signing_digest(tx: &JobTransaction, genesis_id: &Digest) -> Result<Digest, String> {
+    let (tx_id, _) = compute_job_ids(tx)?;
+    Ok(domain_hash(LABEL_SIG_JOB, &[&genesis_id.0, &tx_id.0]))
+}
+
+/// The digest an owner signs: `H(PLAU/TESTNET/SIG/SHARE/v1, unsigned share encoding)`.
+/// The context inside binds the chain and the genesis.
+pub fn share_signing_digest(share: &ShareProof) -> Result<Digest, String> {
+    let bytes = share.unsigned_encoding().map_err(|e| e.to_string())?;
+    Ok(domain_hash(LABEL_SIG_SHARE, &[&bytes]))
+}
+
+/// The digest a miner signs: `H(PLAU/TESTNET/SIG/HEADER/v1, unsigned header encoding)`.
+pub fn header_signing_digest(header: &BlockHeader) -> Result<Digest, String> {
+    let bytes = header.unsigned_encoding().map_err(|e| e.to_string())?;
+    Ok(domain_hash(LABEL_SIG_HEADER, &[&bytes]))
+}
+
+/// Signature verification error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignatureError {
+    /// The signed object could not be encoded.
+    Encoding(String),
+    /// The signature bytes are not a valid ML-DSA-87 encoding (FIPS 204 `sigDecode`).
+    Malformed,
+    /// ML-DSA-87 verification failed.
+    Invalid,
+}
+
+impl fmt::Display for SignatureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SignatureError::Encoding(msg) => write!(f, "cannot encode the signed object: {msg}"),
+            SignatureError::Malformed => write!(f, "malformed ML-DSA-87 signature"),
+            SignatureError::Invalid => write!(f, "ML-DSA-87 signature verification failed"),
+        }
+    }
+}
+
+impl std::error::Error for SignatureError {}
+
+/// Relay id of a block: a hash of its full encoded header, signature included. The
+/// header commits to the body through `body_core_root`, so this names the exact block
+/// bytes.
+///
+/// `block_id` leaves out the signature (and other claimed fields), so anyone can make
+/// an invalid copy that shares an honest block's `block_id`. Relay and rejection
+/// caches must key on this id, or such a copy would shadow the genuine block.
+pub fn block_relay_id(header: &BlockHeader) -> Result<Digest, String> {
+    let bytes = codec::encode(header).map_err(|e| e.to_string())?;
+    Ok(domain_hash(LABEL_RELAY_BLOCK, &[&bytes]))
+}
+
+/// Relay id of a job: a hash of its full encoding, signature included. Relay caches
+/// key on it for the reason given at [`block_relay_id`]; the mempool and the chain
+/// keep deduplicating by `tx_id`.
+pub fn job_relay_id(tx: &JobTransaction) -> Result<Digest, String> {
+    let bytes = codec::encode(tx).map_err(|e| e.to_string())?;
+    Ok(domain_hash(LABEL_RELAY_JOB, &[&bytes]))
+}
+
+/// An owner whose ML-DSA-87 signature over a specific object has been verified.
+///
+/// Only [`verify_share_owner`], [`verify_header_miner`] and [`verify_job_client`]
+/// create one, each from the signature on its own object, so a `VerifiedOwner` cannot
+/// be minted from a signature over some unrelated digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedOwner {
+    key_id: Digest,
+    owner_id: u64,
+}
+
+impl VerifiedOwner {
+    /// The owner key id, `H(PLAU/TESTNET/OWNER/v1, public key)`.
+    pub fn key_id(&self) -> Digest {
+        self.key_id
+    }
+
+    /// The 64-bit `scheduler::OwnerId` derived from the key id.
+    pub fn owner_id(&self) -> u64 {
+        self.owner_id
+    }
+}
+
+/// Decoded verifying keys kept by [`verify_ml_dsa_87`], most recently used last.
+const KEY_CACHE_CAPACITY: usize = 64;
+
+type KeyCache = Mutex<Vec<(Digest, Arc<VerifyingKey<MlDsa87>>)>>;
+
+/// The decoded verifying key for `key`, whose key id is `key_id`.
+///
+/// Decoding (FIPS 204 `pkDecode` plus `ExpandA`) costs about two thirds of a
+/// verification, and a testnet has few distinct signers, so recently used keys are
+/// cached. Entries are keyed by the SHA3-512 key id of the encoded key.
+fn decoded_key(key_id: &Digest, key: &PublicKey) -> Arc<VerifyingKey<MlDsa87>> {
+    static CACHE: OnceLock<KeyCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::with_capacity(KEY_CACHE_CAPACITY)));
+    {
+        let mut entries = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = entries.iter().position(|(id, _)| id == key_id) {
+            let entry = entries.remove(pos);
+            let decoded = entry.1.clone();
+            entries.push(entry);
+            return decoded;
+        }
+    }
+    let encoded = EncodedVerifyingKey::<MlDsa87>::try_from(&key.as_bytes()[..])
+        .expect("invariant: a PublicKey holds exactly 2,592 bytes");
+    let decoded = Arc::new(VerifyingKey::<MlDsa87>::decode(&encoded));
+    let mut entries = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if !entries.iter().any(|(id, _)| id == key_id) {
+        if entries.len() >= KEY_CACHE_CAPACITY {
+            entries.remove(0);
+        }
+        entries.push((*key_id, decoded.clone()));
+    }
+    decoded
+}
+
+/// Checks an ML-DSA-87 signature (FIPS 204 `ML-DSA.Verify` with context
+/// [`SIGNATURE_CONTEXT`]) over a domain-separated `digest`.
+///
+/// This is the raw check. Code that needs an owner identity uses the object-specific
+/// verifiers below, which are the only way to obtain a [`VerifiedOwner`].
+pub fn verify_ml_dsa_87(
+    key: &PublicKey,
+    digest: &Digest,
+    signature: &Signature,
+) -> Result<(), SignatureError> {
+    verify_owner_signature(key, digest, signature).map(|_| ())
+}
+
+/// Verifies `signature` and, only on success, returns the signer's key id and
+/// derived `OwnerId`.
+fn verify_owner_signature(
+    key: &PublicKey,
+    digest: &Digest,
+    signature: &Signature,
+) -> Result<VerifiedOwner, SignatureError> {
+    let encoded_sig = EncodedSignature::<MlDsa87>::try_from(&signature.as_bytes()[..])
+        .map_err(|_| SignatureError::Malformed)?;
+    let sig =
+        ml_dsa::Signature::<MlDsa87>::decode(&encoded_sig).ok_or(SignatureError::Malformed)?;
+    let key_id = owner_key_id(key);
+    if !decoded_key(&key_id, key).verify_with_context(&digest.0, SIGNATURE_CONTEXT, &sig) {
+        return Err(SignatureError::Invalid);
+    }
+    Ok(VerifiedOwner {
+        key_id,
+        owner_id: owner_id_from_key_id(&key_id),
+    })
+}
+
+/// Verifies a share proof's owner signature.
+pub fn verify_share_owner(share: &ShareProof) -> Result<VerifiedOwner, SignatureError> {
+    let digest = share_signing_digest(share).map_err(SignatureError::Encoding)?;
+    verify_owner_signature(&share.owner_key, &digest, &share.signature)
+}
+
+/// Verifies a block header's miner signature.
+pub fn verify_header_miner(header: &BlockHeader) -> Result<VerifiedOwner, SignatureError> {
+    let digest = header_signing_digest(header).map_err(SignatureError::Encoding)?;
+    verify_owner_signature(&header.miner_key, &digest, &header.signature)
+}
+
+/// Verifies a job's client signature for the chain with `genesis_id`.
+pub fn verify_job_client(
+    tx: &JobTransaction,
+    genesis_id: &Digest,
+) -> Result<VerifiedOwner, SignatureError> {
+    let digest = job_signing_digest(tx, genesis_id).map_err(SignatureError::Encoding)?;
+    verify_owner_signature(&tx.client_key, &digest, &tx.signature)
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +641,8 @@ pub enum WorkError {
     SealTicketMismatch,
     /// The lottery value is not below its target.
     TargetNotMet,
+    /// A header, share or job signature does not verify (names the object).
+    Signature(&'static str, SignatureError),
     /// The verification task failed to run (panicked or was cancelled).
     Internal(String),
 }
@@ -444,6 +659,7 @@ impl fmt::Display for WorkError {
             WorkError::ShareTicketMismatch => write!(f, "share_ticket mismatch"),
             WorkError::SealTicketMismatch => write!(f, "seal_ticket mismatch"),
             WorkError::TargetNotMet => write!(f, "lottery ticket did not meet target"),
+            WorkError::Signature(what, err) => write!(f, "{what} signature: {err}"),
             WorkError::Internal(msg) => write!(f, "verification task failed: {msg}"),
         }
     }

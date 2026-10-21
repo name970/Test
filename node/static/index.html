@@ -236,7 +236,7 @@ tr.flash-row { animation: rowflash 1.2s ease; }
   <div class="brand">PLAUTHIUM TESTNET EXPLORER</div>
   <div class="strip">
     <span>Chain: <b id="h-chain">-</b> (<b id="h-chain-id">-</b>)</span>
-    <span>Owner: <b id="h-owner">-</b></span>
+    <span>Miner key: <b id="h-owner" class="mono">-</b></span>
     <span>Peers: <b id="h-peers">0</b></span>
     <span>Tip: <b id="h-height">0</b> (<b id="h-tip-id">-</b>)</span>
     <span>Epoch: <b id="h-epoch">0</b></span>
@@ -299,8 +299,8 @@ tr.flash-row { animation: rowflash 1.2s ease; }
 
     <section class="card">
       <h2>Submit SciVM Ozaki-II Commercial Job (512-dim ExactDot)</h2>
+      <p style="font-size:12px;margin:0 0 8px;">Jobs are signed with this node's ML-DSA-87 miner key.</p>
       <div class="form-grid">
-        <div><label for="f-client">Client Tag</label><input id="f-client" value="explorer"></div>
         <div><label for="f-qfee">Queue Fee (PLAU)</label><input id="f-qfee" value="1"></div>
         <div><label for="f-bfee">Base Fee (PLAU)</label><input id="f-bfee" value="10"></div>
         <div><label for="f-vexec">v_exec (PLAU)</label><input id="f-vexec" value="80"></div>
@@ -371,6 +371,12 @@ tr.flash-row { animation: rowflash 1.2s ease; }
     })[ch]);
   }
 
+  // Owners are 128-hex-character ML-DSA-87 key ids; show their first 12 characters.
+  function shortKey(keyId) {
+    const s = String(keyId || "");
+    return s.length > 12 ? s.slice(0, 12) + ".." : s;
+  }
+
   function groupBigInt(valStr) {
     const s = String(valStr);
     const neg = s.startsWith("-");
@@ -426,7 +432,6 @@ tr.flash-row { animation: rowflash 1.2s ease; }
     msgEl.textContent = "Submitting...";
     try {
       const body = {
-        client: document.getElementById("f-client").value.trim(),
         queue_fee: plauToAtoms(document.getElementById("f-qfee").value),
         base_fee: plauToAtoms(document.getElementById("f-bfee").value),
         v_exec: plauToAtoms(document.getElementById("f-vexec").value),
@@ -544,7 +549,7 @@ tr.flash-row { animation: rowflash 1.2s ease; }
       tr.innerHTML =
         '<td class="mono"><b>' + b.height + '</b></td>' +
         '<td class="mono">' + esc(b.block_id.slice(0, 12)) + '..</td>' +
-        '<td class="mono">' + esc(b.miner_owner) + '</td>' +
+        '<td class="mono" title="' + esc(b.miner_owner) + '">' + esc(shortKey(b.miner_owner)) + '</td>' +
         '<td class="num">' + b.jobs.length + '</td>' +
         '<td class="num">' + b.receipts.length + '</td>' +
         '<td class="num">' + b.shares.length + star + '</td>' +
@@ -570,7 +575,7 @@ tr.flash-row { animation: rowflash 1.2s ease; }
           " ΔR_l=" + esc(ft.delta.R_l) + " ΔP=" + esc(ft.delta.P_pending)
         ).join("<br>");
         const rcLines = (b.receipts || []).map(r =>
-          "Receipt job=" + esc(r.job_id) + " executor=" + esc(r.executor_owner) + " result=" + esc(r.result)
+          "Receipt job=" + esc(r.job_id) + " executor=" + esc(shortKey(r.executor_owner)) + " result=" + esc(r.result)
         ).join("<br>");
         td.innerHTML = (ftLines || "No fee transitions") + (rcLines ? "<br>" + rcLines : "");
         dtr.appendChild(td);
@@ -588,14 +593,14 @@ tr.flash-row { animation: rowflash 1.2s ease; }
       for (const b of latestBlocks) {
         for (const r of (b.receipts || [])) {
           if (r.job_id === mj.job_id) {
-            status = "settled @" + b.height + " (owner " + r.executor_owner + ")";
+            status = "settled @" + b.height + " (owner " + shortKey(r.executor_owner) + ")";
             settledResult = groupBigInt(r.result) + (r.result === mj.ref_dot ? " ✓" : " ✗");
           }
         }
         if (status === "pending") {
           for (const j of (b.jobs || [])) {
             if (j.job_id === mj.job_id) {
-              status = "admitted @" + b.height + " (lease owner " + j.executor_owner + ")";
+              status = "admitted @" + b.height + " (lease owner " + shortKey(j.executor_owner) + ")";
             }
           }
         }
@@ -621,7 +626,9 @@ tr.flash-row { animation: rowflash 1.2s ease; }
 
       document.getElementById("h-chain").textContent = st.chain.name;
       document.getElementById("h-chain-id").textContent = st.chain.chain_id;
-      document.getElementById("h-owner").textContent = st.node.owner_id;
+      const ownerEl = document.getElementById("h-owner");
+      ownerEl.textContent = shortKey(st.node.owner_key_id);
+      ownerEl.title = "ML-DSA-87 key id " + st.node.owner_key_id + " (OwnerId " + st.node.owner_id + ")";
       document.getElementById("h-peers").textContent = st.node.peers;
       document.getElementById("h-height").textContent = st.tip.height;
       document.getElementById("h-tip-id").textContent = st.tip.block_id.slice(0, 10) + "..";

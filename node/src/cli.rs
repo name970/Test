@@ -6,15 +6,19 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const KNOWN_GAPS_HELP: &str = "\
-KNOWN V0 TESTNET GAPS (blueprint §1.2):
-  1. (Closed in v1) Hashing is SHA3-512 and SHAKE256 (FIPS 202); signatures are still missing (gap 2).
-  2. No signatures: owner IDs are self-declared integers; Circulating (U) acts as a shared testnet faucet.
+KNOWN TESTNET GAPS (blueprint §1.2; gaps 1 and 2 are closed in v1):
   3. VerifyFW by recomputation: validators recompute 512x512 INT8 tiles (no Circle STARK, no P-DAL).
   4. Shares are not gossiped: miners include only their own shares in their own blocks.
   5. Commercial execution is replicated: every validator recomputes Ozaki-II dot products (consensus weight 0).
   6. No refunds or timeouts: every admitted job settles deterministically after settle_delay blocks.
   7. Founder vesting is tied to BLOCKS_PER_DAY = 720 blocks regardless of the target block time.
-  8. State only grows: matured fee lots are never pruned by the core ledger.";
+  8. State only grows: matured fee lots are never pruned by the core ledger.
+  Note: Circulating (U) is a shared testnet faucet. The core ledger has no per-account balances, so a
+  job's ML-DSA-87 signature authenticates its client, but the deposit is debited from the aggregate U.
+
+CLOSED IN V1:
+  1. Hashing is SHA3-512 and SHAKE256 (FIPS 202).
+  2. Owners are ML-DSA-87 keys (FIPS 204) that sign every block header, share proof and job.";
 
 /// Plauthium multi-node P2P testnet daemon.
 #[derive(Debug, Parser)]
@@ -78,12 +82,14 @@ pub struct GenesisArgs {
 /// Arguments of `plauthium-node run`.
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
-    /// Node data directory (stores blocks.log).
+    /// Node data directory (stores blocks.log and, by default, the miner key).
     #[arg(long)]
     pub data_dir: PathBuf,
-    /// Miner and beneficiary OwnerId (>= 1).
+    /// ML-DSA-87 miner key file (default: <DATA_DIR>/miner_key.bin). Created with a fresh
+    /// key on the first run and loaded on every later run; its key signs this node's
+    /// blocks, shares and RPC-submitted jobs.
     #[arg(long)]
-    pub owner_id: u64,
+    pub key_file: Option<PathBuf>,
     /// Optional path to a custom genesis.json file (default: embedded testnet genesis).
     #[arg(long)]
     pub genesis: Option<PathBuf>,
@@ -105,7 +111,8 @@ pub struct RunArgs {
     /// Number of concurrent Stage A verification tasks (default: CPUs / 2).
     #[arg(long)]
     pub verify_threads: Option<usize>,
-    /// Delete the data directory before starting.
+    /// Delete the chain data in the data directory before starting. The miner key file
+    /// is kept, so the node keeps its identity.
     #[arg(long, default_value_t = false)]
     pub reset: bool,
 }

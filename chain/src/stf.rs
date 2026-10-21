@@ -8,21 +8,22 @@ use primitives::{Atoms, ShareWeight};
 use scheduler::{OwnerId, ShareID, dhondt_allocation};
 use wire::{
     CategoryDelta, Digest, FeeTransition, GenesisConfig, JobTransaction, LeaseAssignment,
-    OwnerReward, SettlementReceipt,
+    OwnerReward, SettlementReceipt, ShareProof,
 };
 
 use crate::core_adapter::{
-    JobValidationError, LABEL_LEDGER, compute_result_digest, digest_to_hash, domain_hash,
-    validate_job_stateless,
+    JobValidationError, LABEL_LEDGER, SignatureError, VerifiedOwner, compute_result_digest,
+    digest_to_hash, domain_hash, validate_job_stateless, verify_share_owner,
 };
+use crate::difficulty::share_weight;
 
 /// Registered Fresh Work share in `NodeState` (§7.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShareRecord {
     /// ShareID.
     pub work_id: Digest,
-    /// Beneficiary.
-    pub owner: u64,
+    /// Beneficiary, whose signature was verified before registration.
+    pub owner: VerifiedOwner,
     /// `w_s`, fixed by the share target at the share's height.
     pub weight: u64,
     /// Height the share was mined at.
@@ -40,8 +41,8 @@ pub struct OpenJob {
     pub tx_id: Digest,
     /// Height of `JOB_ADMIT_AND_LEASE`.
     pub admitted_at: u64,
-    /// Lease owner (executor by attribution).
-    pub owner: u64,
+    /// Lease owner's key id (executor by attribution).
+    pub owner: Digest,
     /// Leased ShareID.
     pub share_id: Digest,
     /// Executor remuneration.
@@ -117,16 +118,48 @@ impl NodeState {
 }
 
 /// Share pre-validated (Stage A and B) for `apply_body` (§7.2).
+///
+/// The fields are private and [`VerifiedShare::verify`] is the only constructor: it
+/// checks the proof's own ML-DSA-87 owner signature and takes every field from that
+/// same proof, so `apply_body` never registers a share its owner did not sign.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedShare {
+    work_id: Digest,
+    owner: VerifiedOwner,
+    weight: u64,
+    height: u64,
+}
+
+impl VerifiedShare {
+    /// Verifies the share's owner signature and returns its `apply_body` view.
+    pub fn verify(share: &ShareProof) -> Result<Self, SignatureError> {
+        Ok(Self {
+            work_id: share.work_id,
+            owner: verify_share_owner(share)?,
+            weight: share_weight(share.share_target),
+            height: share.context.height,
+        })
+    }
+
     /// ShareID.
-    pub work_id: Digest,
-    /// Beneficiary.
-    pub owner: u64,
-    /// `w_s`.
-    pub weight: u64,
+    pub fn work_id(&self) -> Digest {
+        self.work_id
+    }
+
+    /// Beneficiary, whose signature on this share verified.
+    pub fn owner(&self) -> VerifiedOwner {
+        self.owner
+    }
+
+    /// `w_s`, from the share target.
+    pub fn weight(&self) -> u64 {
+        self.weight
+    }
+
     /// Height the share was mined at.
-    pub height: u64,
+    pub fn height(&self) -> u64 {
+        self.height
+    }
 }
 
 /// Derived body commitments produced by `apply_body` (§5.3, §7.2).
@@ -295,10 +328,11 @@ pub fn apply_body(
         let weights: Vec<ShareWeight> = epoch_cohort.iter().map(|sh| sh.weight).collect();
         let (d_book, payout) = s.ledger.book_epoch(&weights)?;
 
-        let mut owner_totals: BTreeMap<u64, u64> = BTreeMap::new();
+        // Rewards are keyed by the full 512-bit key id, never by the 64-bit OwnerId.
+        let mut owner_totals: BTreeMap<Digest, u64> = BTreeMap::new();
         for (sh, reward) in epoch_cohort.iter().zip(&payout.per_share) {
             if reward.get() > 0 {
-                *owner_totals.entry(sh.owner).or_insert(0) += reward.get();
+                *owner_totals.entry(sh.owner.key_id()).or_insert(0) += reward.get();
             }
         }
         let per_owner: Vec<OwnerReward> = owner_totals
@@ -401,7 +435,7 @@ pub fn apply_body(
             .map(|sh| ShareID {
                 id: digest_to_hash(&sh.work_id),
                 weight: sh.weight,
-                owner: OwnerId(sh.owner),
+                owner: OwnerId(sh.owner.owner_id()),
             })
             .collect();
 
@@ -422,16 +456,17 @@ pub fn apply_body(
             let d = s
                 .ledger
                 .job_admit_and_lease(JobId(job_id), Atoms(tx.base_fee))?;
+            let owner = share.owner.key_id();
             fee_transitions.push(FeeTransition::JobAdmitAndLease {
                 job_id,
                 base_fee: tx.base_fee,
-                owner: share.owner,
+                owner,
                 delta: to_category_delta(&d),
             });
             leases.push(LeaseAssignment {
                 job_id,
                 share_id: share.work_id,
-                owner: share.owner,
+                owner,
             });
             s.open_jobs.insert(
                 job_id,
@@ -439,7 +474,7 @@ pub fn apply_body(
                     job_id,
                     tx_id,
                     admitted_at: h,
-                    owner: share.owner,
+                    owner,
                     share_id: share.work_id,
                     v_exec: tx.v_exec,
                     v_da: tx.v_da,

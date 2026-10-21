@@ -4,10 +4,13 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chain::OwnerKeypair;
+use chain::keys::unsigned;
 use node::chain_actor::{ChainCmd, Origin};
 use node::cli::RunArgs;
 use node::mempool::MempoolCmd;
@@ -45,17 +48,18 @@ fn test_genesis() -> GenesisConfig {
     g
 }
 
+/// Starts node `index` on `dir/n<index>`; its miner key is created there on first start.
 async fn start(
     dir: &Path,
-    owner: u64,
+    index: u64,
     genesis: &Path,
     peers: Vec<SocketAddr>,
     mine: bool,
     reset: bool,
 ) -> NodeHandle {
     start_node(RunArgs {
-        data_dir: dir.join(format!("n{owner}")),
-        owner_id: owner,
+        data_dir: dir.join(format!("n{index}")),
+        key_file: None,
         genesis: Some(genesis.to_path_buf()),
         p2p_listen: "127.0.0.1:0".parse().unwrap(),
         rpc_listen: "127.0.0.1:0".parse().unwrap(),
@@ -178,11 +182,23 @@ async fn acceptance_criteria_a2_to_a6() {
     )
     .await;
 
+    // Every node generated its own ML-DSA-87 key in its data directory.
+    let miner_keys: HashSet<String> = [&n1, &n2, &n3]
+        .iter()
+        .map(|n| n.miner_key_id.to_hex())
+        .collect();
+    assert_eq!(miner_keys.len(), 3, "three distinct miner identities");
+    for i in 1..=3 {
+        assert!(base_dir.join(format!("n{i}/miner_key.bin")).exists());
+    }
+    let n3_key_id = n3.miner_key_id;
+
     // A6: the explorer is served at `/` with the conservation badge.
     let (code, html) = http(n1.rpc_addr, "GET", "/", None).await;
     assert_eq!(code, 200);
     assert!(html.contains("Σ = M = 1,500,000,000,000,000 ✓"));
-    status_json(&n1).await;
+    let st = status_json(&n1).await;
+    assert_eq!(st["node"]["owner_key_id"], n1.miner_key_id.to_hex());
 
     // A2 (part 1): all nodes advance; the epoch-1 booking is paid into U at h = 10.
     wait_until("height >= 11 on all nodes", || {
@@ -195,7 +211,6 @@ async fn acceptance_criteria_a2_to_a6() {
     let ys: Vec<i64> = (1..=512).rev().collect();
     let direct_dot: i128 = xs.iter().zip(&ys).map(|(&a, &b)| i128::from(a * b)).sum();
     let body = serde_json::json!({
-        "client": "a3-client",
         "nonce": "777",
         "payload": { "type": "exact_dot", "xs": xs, "ys": ys }
     })
@@ -204,6 +219,8 @@ async fn acceptance_criteria_a2_to_a6() {
     assert_eq!(code, 202, "{resp}");
     let resp: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(resp["expected_result"], direct_dot.to_string());
+    // The RPC signs the job with node 1's miner key.
+    assert_eq!(resp["client_key_id"], n1.miner_key_id.to_hex());
     assert_eq!(resp["deposit"], "10000000000");
     let job_id = resp["job_id"].as_str().unwrap().to_string();
     let (code, _) = http(n1.rpc_addr, "POST", "/api/submit_job", Some(&body)).await;
@@ -225,6 +242,12 @@ async fn acceptance_criteria_a2_to_a6() {
             blocks
                 .iter()
                 .all(|b| b["total_after"].as_str() == Some(supply.as_str()))
+        );
+        // Every block was mined, and signed, by one of the three node keys.
+        assert!(
+            blocks
+                .iter()
+                .all(|b| miner_keys.contains(b["miner_owner"].as_str().unwrap()))
         );
         let receipt = blocks.iter().find_map(|b| {
             b["receipts"]
@@ -281,6 +304,10 @@ async fn acceptance_criteria_a2_to_a6() {
         height(&n3) >= pre_stop_h,
         "blocks.log is replayed before start_node returns"
     );
+    assert_eq!(
+        n3.miner_key_id, n3_key_id,
+        "node 3 reloads its persisted miner key"
+    );
     wait_until("node 3 resync", || tip_id(&n3) == tip_id(&n1)).await;
     assert_eq!(
         n3.status_rx.borrow().balances,
@@ -290,8 +317,9 @@ async fn acceptance_criteria_a2_to_a6() {
     // A5: partition {1} | {2, 3}; mine 1 block on node 1 and 3 on node 2, then reconnect.
     n1.peer_manager.set_network_paused(true);
     let base_h = height(&n1);
-    let part_tx = JobTransaction {
-        client: chain::compute_client_digest("partition-job").unwrap(),
+    let client = OwnerKeypair::from_seed(&[7; 32]);
+    let mut part_tx = JobTransaction {
+        client_key: client.public_key().clone(),
         queue_fee: 100_000_000,
         base_fee: 1_000_000_000,
         v_exec: 8_000_000_000,
@@ -303,7 +331,30 @@ async fn acceptance_criteria_a2_to_a6() {
             xs: vec![2.0; 512],
             ys: vec![3.0; 512],
         },
+        signature: unsigned(),
     };
+    let genesis_id = n1.status_rx.borrow().genesis_id;
+    client.sign_job(&mut part_tx, &genesis_id).unwrap();
+
+    // A job whose signature does not verify is refused.
+    let mut forged = part_tx.clone();
+    forged.nonce += 1;
+    let (f_tx, f_rx) = oneshot::channel();
+    n1.mempool_tx
+        .send(MempoolCmd::Insert {
+            tx: forged,
+            origin: Origin::Rpc,
+            reply: f_tx,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        f_rx.await.unwrap(),
+        Err(node::mempool::MempoolReject::Invalid {
+            code: "bad_signature",
+            ..
+        })
+    ));
     let (p_tx, p_rx) = oneshot::channel();
     n1.mempool_tx
         .send(MempoolCmd::Insert {

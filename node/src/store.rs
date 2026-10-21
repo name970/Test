@@ -107,7 +107,7 @@ impl BlockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wire::{BlockBody, BlockHeader, Digest, FwContext, Target};
+    use wire::{BlockBody, BlockHeader, Digest, FwContext, PUBLIC_KEY_LEN, PublicKey, Target};
 
     fn block(height: u64) -> Block {
         let d = Digest([height as u8; 64]);
@@ -117,7 +117,7 @@ mod tests {
                     chain_id: 1,
                     genesis_id: d,
                     protocol_version: 2,
-                    crypto_suite_id: 0,
+                    crypto_suite_id: 1,
                     program_id: d,
                     air_id: d,
                     generator_version: 2,
@@ -138,7 +138,8 @@ mod tests {
                 seal_ticket: d,
                 seal_target: Target(u128::MAX),
                 share_target: Target(u128::MAX),
-                miner_owner: 1,
+                miner_key: PublicKey::from_slice(&[height as u8; PUBLIC_KEY_LEN]).unwrap(),
+                signature: chain::keys::unsigned(),
             },
             body: BlockBody {
                 jobs: vec![],
