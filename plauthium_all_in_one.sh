@@ -7,7 +7,7 @@ if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi #
 # Contents: the frozen mathematical core (primitives, work, scivm, scheduler, ledger, poc),
 # the testnet crates (wire, chain, node), the embedded explorer (node/static/index.html),
 # the default genesis (node/genesis.testnet.json), all tests, Cargo.lock and the scripts.
-# Source: branch claude/gallant-mccarthy-87dbfp, commit b9c7004 (46 files, 548369 bytes).
+# Source: branch claude/gallant-mccarthy-87dbfp, commit 1ca6131 (47 files, 614424 bytes).
 #
 # Usage (save this text as plauthium_all_in_one.sh, then run it with bash):
 #   bash plauthium_all_in_one.sh                       # write ./plauthium-workspace, build, start testnet
@@ -52,7 +52,7 @@ case $ROOT in /*) ;; *) ROOT=./$ROOT ;; esac
 
 mkdir -p "$ROOT"
 cd "$ROOT"
-echo "Writing 46 files to $(pwd)"
+echo "Writing 47 files to $(pwd)"
 
 mkdir -p chain
 mkdir -p chain/src
@@ -1334,7 +1334,7 @@ testnet crates wrap it into a multi-node P2P network, as specified in
 and every public item is documented.
 
 ```sh
-cargo test --workspace --release   # 64 tests, including the 3-node integration test (~2 min)
+cargo test --workspace --release   # 75 tests, including the 3-node integration test (~2 min)
 cargo run -p poc                   # core: mock block transition + ASCII summary
 scripts/local_testnet.sh           # 3 mining nodes on localhost with live explorers
 ```
@@ -1351,9 +1351,9 @@ Run the tests in release mode. Every block involves at least one real 512×512 t
 | `scheduler`  | §6.1–6.5  | `ShareID`, sequential D'Hondt (`w_s/(a_s+1)` by exact cross-multiplication, ties to least ShareID), owner capacity, persistent cohort counters |
 | `ledger`     | §7.1–7.8  | 8 disjoint `StateCategory` balances, atomic zero-sum deltas, `FounderVesting` (1,460 daily tranches × 720 blocks), `FeeLot` with ceiling budgets, floor payouts and segregated dust |
 | `poc`        | —         | Binary that runs Genesis → Fresh Work → D'Hondt → Base Fee lock/maturation/payout |
-| `wire`       | blueprint §3–§5 | The five P2P messages, block/job/share types, `Digest`/`Target`, fixed-width ML-DSA-87 `PublicKey`/`Signature`, the bincode 1.3.3 codec (fixed-width little-endian, trailing bytes rejected), protocol constants |
+| `wire`       | blueprint §3–§5 | The six P2P messages (incl. `GossipShare`), block/job/share types, `Digest`/`Target`, fixed-width ML-DSA-87 `PublicKey`/`Signature`, the bincode 1.3.3 codec (fixed-width little-endian, trailing bytes rejected), protocol constants |
 | `chain`      | blueprint §6–§7 | Genesis validation, Stage A (signatures, then VerifyFW by recomputing the tile) and Stage B (context checks), windowed retarget, `apply_body` (the state transition on `ledger::Ledger`), D'Hondt leases, templates, `BlockTree` with heaviest-seal-weight fork choice, ML-DSA-87 owner keys (`chain::keys`) |
-| `node`       | blueprint §8–§10 | `plauthium-node`: ChainState / Mempool actors, multi-threaded ConsensusEngine, length-delimited TCP PeerManager with sync, append-only `blocks.log`, persistent miner key, axum JSON RPC and the embedded explorer |
+| `node`       | blueprint §8–§10 | `plauthium-node`: ChainState / Mempool actors, multi-threaded ConsensusEngine, length-delimited TCP PeerManager with sync, append-only `blocks.log`, persistent miner key, share pool with `GossipShare` relay, axum JSON RPC and the embedded explorer |
 
 ## Local 3-node testnet
 
@@ -1413,14 +1413,54 @@ seed. Its **key id** is `H(PLAU/TESTNET/OWNER/v1, public key)`.
 - **Relay ids:** `block_id` and `tx_id` leave out signatures, so anyone can forge an invalid
   copy that shares an honest object's id. The node's relay and rejection caches therefore
   key on a hash of the full signed encoding (`chain::block_relay_id`, `chain::job_relay_id`),
-  and a forged copy cannot shadow the genuine block or job.
+  and a forged copy cannot shadow the genuine block or job. A block's relay id covers its
+  body as well, so a genuine header carrying a forged body cannot shadow the block either.
 
-`crypto_suite_id` is 1 (SHA3-512 + SHAKE256 + ML-DSA-87) and `WIRE_VERSION` is 2.
+`crypto_suite_id` is 1 (SHA3-512 + SHAKE256 + ML-DSA-87).
+
+## Share gossip (v1)
+
+`WIRE_VERSION` 3 adds `GossipShare(ShareProof)`. Every node keeps a share pool (`node::share_pool`)
+of verified shares, its own and gossiped ones, one per `work_id`. Templates take up to
+`max_shares_per_block` of them, whoever mined them, oldest height first, and emit them sorted by
+`work_id`, so a share counts for rewards and leases even if its owner never seals a block.
+
+A gossiped share enters the pool, and is relayed onward, only after every check passes,
+cheapest first:
+
+1. Dedupe: by relay id (`chain::share_relay_id`, the full signed encoding), by `work_id`
+   against the pool (work-checked shares only), and by (owner key id, `work_id`) against
+   shares still awaiting their work check. A slot is only taken once the owner signature
+   verified, so a forged copy, or a claim to another owner's `work_id`, cannot shadow the
+   genuine share, and re-signed copies (ML-DSA signing is randomized) cost nothing.
+2. No-work checks (`BlockTree::check_gossip_share`): context constants, owner binding,
+   height, anchor and target on the share's own branch, inclusion window, not yet
+   registered.
+3. Limits on shares awaiting their work check: 8 per peer, 64 in total.
+4. The ML-DSA-87 signature, checked on the spot.
+5. Its tile, recomputed off the chain actor on a separate, smaller verification budget,
+   so a block's Stage A never queues behind share gossip.
+
+A share whose parent block is in Stage A waits for it (signature already checked, counted
+in the limits), and is dropped if that block fails. Such a share, a stale one and one whose
+parent is unknown are dropped without penalty and not remembered as seen, so a later relay
+can still deliver them. Useless shares (ignored for any reason, including the limits above,
+or duplicates under a new encoding) are budgeted at 256 a minute per peer; past that, the
+peer's shares are dropped unread until the minute is up. The peer is throttled, not banned,
+since an honest peer that is syncing sends many such shares. A peer that sends an invalid
+share is banned, even if it disconnected first, and a ban closes every connection under its
+key (the IP for remote peers). Inbound connections are limited to 16 per remote IP, and a
+dialer backs off unless the remote side completes the handshake.
+
+Templates include only fully verified shares, and `validate_genesis` requires every block
+to fit a full set of `max_shares_per_block` shares plus 16 KiB of headroom. The pool is
+pruned when shares leave the inclusion window or are registered on the canonical chain,
+and the shares of abandoned blocks return to it on a reorg.
 
 ## Known gaps (blueprint §1.2)
 
-Gaps 1 (placeholder hashing) and 2 (self-declared integer owners, no signatures) are closed
-in v1. The numbering of the remaining gaps follows the blueprint.
+Gaps 1 (placeholder hashing), 2 (self-declared integer owners, no signatures) and 4 (shares
+not gossiped) are closed in v1. The numbering of the remaining gaps follows the blueprint.
 
 - **Shared faucet.** The core ledger has no per-account balances (see
   `ledger/src/lib.rs` lines 18–21), so a job's signature authenticates its client, but its
@@ -1428,8 +1468,6 @@ in v1. The numbering of the remaining gaps follows the blueprint.
 
 3. **VerifyFW by recomputation.** Validators recompute every claimed tile instead of
    verifying a Circle STARK. There is no P-DAL (Reed–Solomon layer).
-4. **Shares are not gossiped.** A miner includes only its own shares in its own blocks, so
-   reward fairness is approximate. `GossipShare` is deferred to v1.
 5. **Commercial execution is replicated.** Every validator recomputes each job's result.
    The lessee is the executor by attribution only. Commercial weight stays 0
    (`scivm::CONSENSUS_WEIGHT`).
@@ -1525,10 +1563,14 @@ use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa87, VerifyingKey};
 use primitives::{DomainSeparatedHash, labels, pq_sizes};
 use scivm::{OzakiIIProfile, RoundingMode};
 use wire::{
-    BlockBody, BlockHeader, DOT_LEN, Digest, FwContext, GenesisConfig, JobPayload, JobTransaction,
-    MAX_JOB_BYTES, MIN_TARGET, PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN, ShareProof, Signature,
-    Target, codec,
+    Block, BlockBody, BlockHeader, DOT_LEN, Digest, ENCODED_HEADER_LEN, ENCODED_SHARE_LEN,
+    FwContext, GenesisConfig, JobPayload, JobTransaction, MAX_JOB_BYTES, MIN_TARGET,
+    PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN, ShareProof, Signature, Target, codec,
 };
+
+/// Bytes `validate_genesis` requires beyond the header and a full set of shares: room
+/// for the body's framing (vector lengths, `ledger_digest`) and its derived fields.
+pub const BLOCK_HEADROOM: u64 = 16_384;
 use work::{FreshWorkContext, FreshWorkIds, TILE_DIM};
 
 // ---------------------------------------------------------------------------
@@ -1563,6 +1605,8 @@ pub const SIGNATURE_CONTEXT: &[u8] = labels::PLAU_TX.as_bytes();
 pub const LABEL_RELAY_BLOCK: &str = "PLAU/TESTNET/RELAY/BLOCK/v1";
 /// Label of a job's relay id (local, not consensus).
 pub const LABEL_RELAY_JOB: &str = "PLAU/TESTNET/RELAY/JOB/v1";
+/// Label of a share proof's relay id (local, not consensus).
+pub const LABEL_RELAY_SHARE: &str = "PLAU/TESTNET/RELAY/SHARE/v1";
 /// Label of `ledger_digest`.
 pub const LABEL_LEDGER: &str = "PLAU/TESTNET/LEDGER/v1";
 /// Label of `result_digest`.
@@ -1705,6 +1749,17 @@ pub fn validate_genesis(config: &GenesisConfig) -> Result<(LedgerParams, Ledger,
         && window < 2
     {
         return Err("retarget window must be >= 2 when Windowed".to_string());
+    }
+    // A full set of shares must always fit, or a template holding them (every node
+    // picks the same gossiped shares) would be too large to be a valid block.
+    let full_shares = config
+        .max_shares_per_block
+        .checked_mul(ENCODED_SHARE_LEN as u64)
+        .and_then(|b| b.checked_add(ENCODED_HEADER_LEN as u64 + BLOCK_HEADROOM));
+    if full_shares.is_none_or(|need| need > config.max_block_bytes) {
+        return Err(format!(
+            "max_block_bytes must hold the header, max_shares_per_block shares of {ENCODED_SHARE_LEN} bytes and {BLOCK_HEADROOM} bytes of headroom"
+        ));
     }
 
     let emission_rate = EmissionRate::new(config.emission_numerator, config.emission_denominator)
@@ -1888,15 +1943,16 @@ impl fmt::Display for SignatureError {
 
 impl std::error::Error for SignatureError {}
 
-/// Relay id of a block: a hash of its full encoded header, signature included. The
-/// header commits to the body through `body_core_root`, so this names the exact block
-/// bytes.
+/// Relay id of a block: a hash of its full encoding, header (signature included) and
+/// body, so it names the exact block bytes.
 ///
 /// `block_id` leaves out the signature (and other claimed fields), so anyone can make
 /// an invalid copy that shares an honest block's `block_id`. Relay and rejection
-/// caches must key on this id, or such a copy would shadow the genuine block.
-pub fn block_relay_id(header: &BlockHeader) -> Result<Digest, String> {
-    let bytes = codec::encode(header).map_err(|e| e.to_string())?;
+/// caches must key on this id, or such a copy would shadow the genuine block. The body
+/// is hashed too: `body_core_root` binds it only once checked, so a genuine header
+/// with a forged body must not share the genuine block's relay id either.
+pub fn block_relay_id(block: &Block) -> Result<Digest, String> {
+    let bytes = codec::encode(block).map_err(|e| e.to_string())?;
     Ok(domain_hash(LABEL_RELAY_BLOCK, &[&bytes]))
 }
 
@@ -1906,6 +1962,14 @@ pub fn block_relay_id(header: &BlockHeader) -> Result<Digest, String> {
 pub fn job_relay_id(tx: &JobTransaction) -> Result<Digest, String> {
     let bytes = codec::encode(tx).map_err(|e| e.to_string())?;
     Ok(domain_hash(LABEL_RELAY_JOB, &[&bytes]))
+}
+
+/// Relay id of a share proof: a hash of its full encoding, signature included. Relay
+/// and rejection caches key on it for the reason given at [`block_relay_id`]; the
+/// share pool keeps one share per `work_id`.
+pub fn share_relay_id(share: &ShareProof) -> Result<Digest, String> {
+    let bytes = codec::encode(share).map_err(|e| e.to_string())?;
+    Ok(domain_hash(LABEL_RELAY_SHARE, &[&bytes]))
 }
 
 /// An owner whose ML-DSA-87 signature over a specific object has been verified.
@@ -2508,19 +2572,19 @@ pub use core_adapter::{
     validate_job_stateless, verify_fresh_work, verify_header_miner, verify_job_client,
     verify_ml_dsa_87, verify_share_owner,
 };
-pub use core_adapter::{block_relay_id, job_relay_id};
+pub use core_adapter::{block_relay_id, job_relay_id, share_relay_id};
 pub use difficulty::{
     ChainView, expected_targets, scale_target, seal_weight, share_target_for, share_weight, work_of,
 };
 pub use keys::OwnerKeypair;
 pub use stf::{
-    DerivedBody, NodeState, OpenJob, ShareRecord, StfError, VerifiedShare, apply_body,
+    DerivedBody, NodeState, OpenJob, ShareRecord, SignedShare, StfError, VerifiedShare, apply_body,
     compute_ledger_digest, to_category_delta,
 };
 pub use template::{Template, build_template};
 pub use tree::{
     AncestorChainView, BlockMeta, BlockSummary, BlockTree, InsertOutcome, JobSummary,
-    ReceiptSummary, ShareSummary, TreeError,
+    ReceiptSummary, ShareCheck, ShareSummary, TreeError,
 };
 EOF
 
@@ -2686,6 +2750,34 @@ impl VerifiedShare {
     /// Height the share was mined at.
     pub fn height(&self) -> u64 {
         self.height
+    }
+}
+
+/// A share proof together with its [`VerifiedShare`] view, as kept in a share pool.
+///
+/// [`SignedShare::verify`] is the only constructor, so the two always belong
+/// together and the owner signature is checked exactly once, on entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedShare {
+    proof: ShareProof,
+    verified: VerifiedShare,
+}
+
+impl SignedShare {
+    /// Verifies the proof's owner signature (not its work) and pairs it with its view.
+    pub fn verify(proof: ShareProof) -> Result<Self, SignatureError> {
+        let verified = VerifiedShare::verify(&proof)?;
+        Ok(Self { proof, verified })
+    }
+
+    /// The share proof.
+    pub fn proof(&self) -> &ShareProof {
+        &self.proof
+    }
+
+    /// Its verified `apply_body` view.
+    pub fn verified(&self) -> &VerifiedShare {
+        &self.verified
     }
 }
 
@@ -3073,7 +3165,7 @@ use crate::core_adapter::{
 };
 use crate::difficulty::{ChainView, expected_targets};
 use crate::keys::{OwnerKeypair, unsigned};
-use crate::stf::{NodeState, StfError, VerifiedShare, apply_body};
+use crate::stf::{NodeState, SignedShare, StfError, VerifiedShare, apply_body};
 
 /// Mining template published to the `ConsensusEngine` (§7.4, §8.5).
 #[derive(Clone, Debug)]
@@ -3149,21 +3241,29 @@ impl Template {
     }
 }
 
-/// Own shares that satisfy the §6.7 inclusion rules for a block at height `h` on `chain`
-/// and carry a valid owner signature, sorted by `work_id`, unique, at most
-/// `max_shares_per_block`, each with its `VerifiedShare`.
+/// The pool shares to include in a block at height `h` on `chain`.
+///
+/// A share qualifies if it satisfies the §6.7 inclusion rules on this branch: inside
+/// the inclusion window, not yet registered, and mined on this chain's ancestor with
+/// its context and target. Pool shares are signature-checked on entry
+/// ([`SignedShare`]) and gossiped ones also work-checked, so neither is redone here.
+///
+/// Up to `max_shares_per_block` shares are taken, oldest height first (those leave the
+/// window soonest), then lowest `work_id`; the result is sorted by `work_id` as
+/// `apply_body` requires.
 fn includable_shares(
     genesis: &GenesisConfig,
     genesis_id: Digest,
     chain: &impl ChainView,
     tip_state: &NodeState,
-    own_shares: &[ShareProof],
+    pool: &[SignedShare],
     h: u64,
-) -> Vec<(ShareProof, VerifiedShare)> {
+) -> Vec<SignedShare> {
     let (program_id, air_id) = compute_program_and_air_ids();
-    let mut shares: Vec<&ShareProof> = own_shares
+    let mut shares: Vec<&SignedShare> = pool
         .iter()
-        .filter(|sh| {
+        .filter(|signed| {
+            let sh = signed.proof();
             let s = sh.context.height;
             if s < 1 || s >= h || s < h.saturating_sub(genesis.share_inclusion_window) {
                 return false;
@@ -3190,13 +3290,12 @@ fn includable_shares(
                 && sh.share_target == exp_share
         })
         .collect();
-    shares.sort_by_key(|s| s.work_id);
-    shares.dedup_by_key(|s| s.work_id);
-    shares
-        .into_iter()
-        .filter_map(|sh| VerifiedShare::verify(sh).ok().map(|v| (sh.clone(), v)))
-        .take(genesis.max_shares_per_block as usize)
-        .collect()
+    shares.sort_by_key(|s| (s.proof().work_id, s.proof().context.height));
+    shares.dedup_by_key(|s| s.proof().work_id);
+    shares.sort_by_key(|s| (s.proof().context.height, s.proof().work_id));
+    shares.truncate(genesis.max_shares_per_block as usize);
+    shares.sort_by_key(|s| s.proof().work_id);
+    shares.into_iter().cloned().collect()
 }
 
 /// Runs `apply_body` and assembles the body with its derived fields.
@@ -3221,7 +3320,8 @@ fn derive_body(
 
 /// Builds a new mining `Template` on top of the tip at `tip_height` of `chain` (§7.4).
 ///
-/// Jobs are taken in FIFO order (no fee priority, WP 6.16) as long as the body stays
+/// Shares come from `share_pool`, which holds this node's own shares and the verified
+/// gossiped ones (see `includable_shares`). Jobs are taken in FIFO order (no fee priority, WP 6.16) as long as the body stays
 /// valid; unfundable jobs are skipped and stay in the mempool. Errors only if even an
 /// empty body cannot be derived, which would indicate a corrupted tip state.
 #[allow(clippy::too_many_arguments)]
@@ -3233,14 +3333,15 @@ pub fn build_template(
     tip_height: u64,
     tip_state: &NodeState,
     mempool_fifo: &[JobTransaction],
-    own_shares: &[ShareProof],
+    share_pool: &[SignedShare],
     miner: &Arc<OwnerKeypair>,
     now_bucket: u64,
 ) -> Result<Template, StfError> {
     let h = tip_height + 1;
     let (mut shares, mut verified): (Vec<ShareProof>, Vec<VerifiedShare>) =
-        includable_shares(genesis, genesis_id, chain, tip_state, own_shares, h)
+        includable_shares(genesis, genesis_id, chain, tip_state, share_pool, h)
             .into_iter()
+            .map(|signed| (signed.proof().clone(), signed.verified().clone()))
             .unzip();
     if apply_body(tip_state, genesis, h, &[], &verified).is_err() {
         shares.clear();
@@ -3269,10 +3370,23 @@ pub fn build_template(
 
     let mut jobs: Vec<JobTransaction> = selected.into_iter().map(|(_, j)| j).collect();
     let mut body = derive_body(tip_state, genesis, h, jobs.clone(), &shares, &verified)?;
-    // Leave room for the header (8,203 bytes with its key and signature) and framing.
-    let size_limit = genesis.max_block_bytes.saturating_sub(16_384) as usize;
-    while !jobs.is_empty() && codec::encode(&body).map_or(usize::MAX, |b| b.len()) > size_limit {
-        jobs.pop();
+    // A block encodes as its header followed by its body, so the body gets everything
+    // but the fixed-width header.
+    let size_limit = genesis
+        .max_block_bytes
+        .saturating_sub(wire::ENCODED_HEADER_LEN as u64) as usize;
+    let oversized = |body: &BlockBody| codec::encode(body).map_or(true, |b| b.len() > size_limit);
+    while oversized(&body) && !(jobs.is_empty() && shares.is_empty()) {
+        if jobs.pop().is_none() {
+            // validate_genesis leaves BLOCK_HEADROOM beyond a full set of shares for the
+            // body's framing and derived fields, so this needs a degenerate genesis or
+            // huge derived fields. Drop the newest share (most time left in the window).
+            let newest = (0..shares.len())
+                .max_by_key(|&i| (shares[i].context.height, shares[i].work_id))
+                .expect("invariant: shares is not empty here");
+            shares.remove(newest);
+            verified.remove(newest);
+        }
         body = derive_body(tip_state, genesis, h, jobs.clone(), &shares, &verified)?;
     }
 
@@ -3541,6 +3655,21 @@ impl std::error::Error for TreeError {}
 
 fn invalid(reason: impl Into<String>) -> TreeError {
     TreeError::Invalid(reason.into())
+}
+
+/// Outcome of the checks a gossiped share passes before its work is verified
+/// ([`BlockTree::check_gossip_share`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShareCheck {
+    /// Every check that needs no work passed: verify the signature and the work next.
+    Verify,
+    /// The share's parent block is not in the tree; it may still be on its way.
+    UnknownParent(Digest),
+    /// Possibly honest but of no use here (stale, already registered, ...): drop it
+    /// without penalizing the sender.
+    Ignore(&'static str),
+    /// No honest node relays this share: penalize the sender.
+    Invalid(String),
 }
 
 /// Outcome of inserting a verified block into `BlockTree`.
@@ -3879,6 +4008,62 @@ impl BlockTree {
             return Err(invalid("share difficulty context mismatch"));
         }
         Ok(())
+    }
+
+    /// Checks a gossiped share against everything that needs no work recomputation,
+    /// before it may enter the share pool.
+    ///
+    /// Context constants and the owner binding must hold on any chain. If the parent is
+    /// known, the height, anchor and targets are checked on the parent's own branch, so
+    /// an honest share from a side branch still passes. Shares outside the inclusion
+    /// window of the canonical tip, or already registered on it, are ignored. Whether a
+    /// pooled share fits a given template is decided again when the template is built.
+    pub fn check_gossip_share(&self, sh: &ShareProof) -> ShareCheck {
+        let (program_id, air_id) = compute_program_and_air_ids();
+        let c = &sh.context;
+        if let Err(e) = self.check_context_constants(c, program_id, air_id) {
+            return ShareCheck::Invalid(format!("share: {e}"));
+        }
+        let owner_key_id = owner_key_id(&sh.owner_key);
+        if c.miner_policy_digest != compute_miner_policy_digest(&owner_key_id)
+            || c.payout_policy_digest != compute_payout_policy_digest(&owner_key_id)
+        {
+            return ShareCheck::Invalid("share policy digest mismatch".into());
+        }
+        let s = c.height;
+        if s < 1 {
+            return ShareCheck::Invalid("share height 0".into());
+        }
+        let next = self.tip_meta().height + 1;
+        if s < next.saturating_sub(self.genesis.share_inclusion_window) {
+            return ShareCheck::Ignore("share is outside the inclusion window");
+        }
+        if self.tip_state().shares.contains_key(&sh.work_id) {
+            return ShareCheck::Ignore("share already registered");
+        }
+        let Some(parent) = self.metas.get(&c.parent_canonical_id) else {
+            return ShareCheck::UnknownParent(c.parent_canonical_id);
+        };
+        if parent.height + 1 != s {
+            return ShareCheck::Invalid(format!(
+                "share height {s} does not follow its parent at {}",
+                parent.height
+            ));
+        }
+        let Some(view) = self.ancestor_view(parent.id) else {
+            return ShareCheck::Ignore("share parent branch unavailable");
+        };
+        if c.stable_anchor_id != view.block_id_at(s.saturating_sub(self.genesis.anchor_depth)) {
+            return ShareCheck::Invalid("share stable_anchor_id mismatch".into());
+        }
+        let (exp_seal, exp_share) = expected_targets(s, &view, &self.genesis);
+        if sh.share_target != exp_share {
+            return ShareCheck::Invalid("share_target mismatch".into());
+        }
+        if c.parent_derived_difficulty_context != compute_difficulty_context(exp_seal, exp_share) {
+            return ShareCheck::Invalid("share difficulty context mismatch".into());
+        }
+        ShareCheck::Verify
     }
 
     /// Verifies the ML-DSA-87 signatures of the header, every job and every share.
@@ -4342,9 +4527,9 @@ use std::sync::Arc;
 use chain::core_adapter::fw_context_to_core;
 use chain::keys::unsigned;
 use chain::{
-    BlockTree, OwnerKeypair, SignatureError, StfError, TreeError, VerifiedShare, WorkError,
-    apply_body, build_template, compute_body_root, compute_difficulty_context, compute_job_ids,
-    verify_ml_dsa_87,
+    BlockTree, OwnerKeypair, ShareCheck, SignatureError, SignedShare, StfError, TreeError,
+    VerifiedShare, WorkError, apply_body, build_template, compute_body_root,
+    compute_difficulty_context, compute_job_ids, verify_ml_dsa_87,
 };
 use ledger::{LedgerError, StateCategory};
 use primitives::{Atoms, TOTAL_SUPPLY};
@@ -4452,6 +4637,11 @@ fn template_on(
     let anc = tree.ancestor_view(parent_id).unwrap();
     let parent_meta = tree.get_meta(&parent_id).unwrap();
     let parent_state = tree.get_state(&parent_id).unwrap();
+    // As a share pool would: only signature-checked shares enter.
+    let pool: Vec<SignedShare> = shares
+        .iter()
+        .filter_map(|sh| SignedShare::verify(sh.clone()).ok())
+        .collect();
     build_template(
         1,
         tree.genesis(),
@@ -4460,7 +4650,7 @@ fn template_on(
         parent_meta.height,
         &parent_state,
         mempool,
-        shares,
+        &pool,
         owner,
         parent_meta.time_bucket + 1,
     )
@@ -4907,17 +5097,10 @@ fn signatures_bind_headers_shares_and_jobs() {
     ));
     assert!(tree.apply_verified_block(Arc::new(forged_share)).is_err());
 
-    // A template never includes a share whose signature fails.
+    // A share whose signature fails never enters a share pool, so no template sees it.
     let mut bad_sig_share = share.clone();
     bad_sig_share.signature.0[0] ^= 0x01;
-    let tpl = template_on(
-        &tree,
-        tree.tip_id(),
-        &miner,
-        &[],
-        std::slice::from_ref(&bad_sig_share),
-    );
-    assert!(tpl.body.shares.is_empty());
+    assert!(SignedShare::verify(bad_sig_share).is_err());
 
     // Job: signed for another genesis, or carrying another client's key.
     let other_genesis = Digest([0xee; DIGEST_LEN]);
@@ -4996,6 +5179,197 @@ fn ml_dsa_87_matches_an_independent_implementation() {
     corrupted.0[4_000] ^= 0x10;
     assert!(verify_ml_dsa_87(kp.public_key(), &digest, &corrupted).is_err());
     assert!(verify_ml_dsa_87(kp.public_key(), &digest, &unsigned()).is_err());
+}
+
+/// Templates draw shares from the pool, whoever mined them: shares of several owners
+/// are included oldest height first, capped at `max_shares_per_block`, and emitted
+/// strictly sorted by `work_id`. The rest follow in the next block.
+#[test]
+fn templates_include_pool_shares_from_every_owner() {
+    let mut g = fast_genesis();
+    g.max_shares_per_block = 4;
+    let mut tree = BlockTree::new(g).unwrap();
+    let (miner, alice, bob) = (key(1), key(2), key(3));
+    for h in 1..=3 {
+        let blk = mine_block_on(&tree, tree.tip_id(), &miner, &[], &[], h);
+        extend(&mut tree, blk);
+    }
+
+    // Six shares by two other owners, mined at heights 1..=3 on the canonical chain.
+    let mut pool_proofs = Vec::new();
+    for (owner, parent_h, nonce) in [
+        (&alice, 0, 100),
+        (&alice, 1, 101),
+        (&bob, 1, 102),
+        (&alice, 2, 103),
+        (&bob, 2, 104),
+        (&bob, 2, 105),
+    ] {
+        let parent = tree.canonical_id_at(parent_h).unwrap();
+        pool_proofs.push(mine_share_on(&tree, parent, owner, nonce));
+    }
+    let mut expected = pool_proofs.clone();
+    expected.sort_by_key(|sh| (sh.context.height, sh.work_id));
+    expected.truncate(4);
+    expected.sort_by_key(|sh| sh.work_id);
+
+    let blk = mine_block_on(&tree, tree.tip_id(), &miner, &[], &pool_proofs, 4);
+    assert_eq!(blk.body.shares, expected, "oldest four, sorted by work_id");
+    assert!(
+        blk.body
+            .shares
+            .windows(2)
+            .all(|w| w[0].work_id < w[1].work_id)
+    );
+    extend(&mut tree, blk);
+    let state = tree.tip_state();
+    for sh in &expected {
+        let owner = state.shares[&sh.work_id].owner.key_id();
+        assert_eq!(owner, chain::owner_key_id(&sh.owner_key));
+        assert_ne!(owner, miner.key_id(), "included by another node's miner");
+    }
+
+    // The two left out are included next, while still inside the window.
+    let next = mine_block_on(&tree, tree.tip_id(), &miner, &[], &pool_proofs, 5);
+    assert_eq!(next.body.shares.len(), 2);
+    assert!(next.body.shares.iter().all(|sh| !expected.contains(sh)));
+    extend(&mut tree, next);
+    assert!(
+        template_on(&tree, tree.tip_id(), &miner, &[], &pool_proofs)
+            .body
+            .shares
+            .is_empty(),
+        "registered shares are never included twice"
+    );
+}
+
+/// `check_gossip_share`: honest shares (also from a side branch) go on to work
+/// verification; malformed ones are Invalid (their sender is penalized); stale,
+/// registered or unknown-parent shares are harmless.
+#[test]
+fn gossip_share_checks_sort_honest_stale_and_invalid_shares() {
+    let mut g = fast_genesis();
+    g.share_inclusion_window = 4;
+    let mut tree = BlockTree::new(g).unwrap();
+    let (miner, alice) = (key(1), key(2));
+    for h in 1..=3 {
+        let blk = mine_block_on(&tree, tree.tip_id(), &miner, &[], &[], h);
+        extend(&mut tree, blk);
+    }
+    let tip = tree.tip_id();
+    let honest = mine_share_on(&tree, tip, &alice, 7);
+    assert_eq!(tree.check_gossip_share(&honest), ShareCheck::Verify);
+
+    // An honest share mined on a side branch is checked on its own branch.
+    let side_parent = mine_block_on(
+        &tree,
+        tree.canonical_id_at(2).unwrap(),
+        &alice,
+        &[],
+        &[],
+        50,
+    );
+    tree.pre_validate(&side_parent, None).unwrap();
+    let side_id = side_parent.header.block_id;
+    assert!(
+        !tree
+            .apply_verified_block(Arc::new(side_parent))
+            .unwrap()
+            .tip_changed
+    );
+    let side_share = mine_share_on(&tree, side_id, &alice, 8);
+    assert_eq!(tree.check_gossip_share(&side_share), ShareCheck::Verify);
+
+    let invalid = |sh: &ShareProof| matches!(tree.check_gossip_share(sh), ShareCheck::Invalid(_));
+    let mut other_owner = honest.clone();
+    key(9).sign_share(&mut other_owner).unwrap();
+    assert!(invalid(&other_owner), "the work binds the owner's key id");
+    let mut easy_target = honest.clone();
+    easy_target.share_target = Target(u128::MAX - 1);
+    alice.sign_share(&mut easy_target).unwrap();
+    assert!(invalid(&easy_target));
+    let mut bad_anchor = honest.clone();
+    bad_anchor.context.stable_anchor_id = Digest([3; DIGEST_LEN]);
+    assert!(invalid(&bad_anchor));
+    let mut wrong_chain = honest.clone();
+    wrong_chain.context.chain_id ^= 1;
+    assert!(invalid(&wrong_chain));
+    let mut wrong_height = honest.clone();
+    wrong_height.context.height += 1;
+    assert!(invalid(&wrong_height));
+
+    let mut orphan = honest.clone();
+    orphan.context.parent_canonical_id = Digest([4; DIGEST_LEN]);
+    assert_eq!(
+        tree.check_gossip_share(&orphan),
+        ShareCheck::UnknownParent(Digest([4; DIGEST_LEN]))
+    );
+
+    // Registered once included (the height-4 share fits from block 5 on), stale once it
+    // leaves the window (4 blocks).
+    let b4 = mine_block_on(&tree, tip, &miner, &[], &[], 4);
+    extend(&mut tree, b4);
+    assert_eq!(tree.check_gossip_share(&honest), ShareCheck::Verify);
+    let with_share = mine_block_on(
+        &tree,
+        tree.tip_id(),
+        &miner,
+        &[],
+        std::slice::from_ref(&honest),
+        5,
+    );
+    assert_eq!(with_share.body.shares.len(), 1);
+    extend(&mut tree, with_share);
+    assert!(matches!(
+        tree.check_gossip_share(&honest),
+        ShareCheck::Ignore(_)
+    ));
+    let old = mine_share_on(&tree, tree.canonical_id_at(0).unwrap(), &alice, 9);
+    assert!(matches!(
+        tree.check_gossip_share(&old),
+        ShareCheck::Ignore(_)
+    ));
+}
+
+/// A genesis whose blocks could not hold a full set of shares is rejected: every node
+/// picks the same gossiped shares, so such a template could never be a valid block.
+#[test]
+fn genesis_must_fit_a_full_set_of_shares() {
+    let mut g = fast_genesis();
+    let need = g.max_shares_per_block * wire::ENCODED_SHARE_LEN as u64
+        + wire::ENCODED_HEADER_LEN as u64
+        + chain::core_adapter::BLOCK_HEADROOM;
+    g.max_block_bytes = need;
+    assert!(chain::validate_genesis(&g).is_ok());
+    g.max_block_bytes = need - 1;
+    assert!(chain::validate_genesis(&g).is_err());
+    g.max_shares_per_block = u64::MAX;
+    assert!(chain::validate_genesis(&g).is_err(), "no overflow");
+}
+
+/// At the smallest `max_block_bytes` that `validate_genesis` accepts, a block still
+/// holds a full set of pooled shares.
+#[test]
+fn a_full_set_of_shares_fits_the_smallest_valid_block() {
+    let mut g = fast_genesis();
+    g.max_shares_per_block = 4;
+    g.max_block_bytes = 4 * wire::ENCODED_SHARE_LEN as u64
+        + wire::ENCODED_HEADER_LEN as u64
+        + chain::core_adapter::BLOCK_HEADROOM;
+    let mut tree = BlockTree::new(g).unwrap();
+    let (miner, alice) = (key(1), key(2));
+    for h in 1..=2 {
+        let blk = mine_block_on(&tree, tree.tip_id(), &miner, &[], &[], h);
+        extend(&mut tree, blk);
+    }
+    let shares: Vec<ShareProof> = (0..4)
+        .map(|i| mine_share_on(&tree, tree.canonical_id_at(i % 2).unwrap(), &alice, 300 + i))
+        .collect();
+    let blk = mine_block_on(&tree, tree.tip_id(), &miner, &[], &shares, 3);
+    assert_eq!(blk.body.shares.len(), 4, "no share was trimmed");
+    let size = wire::codec::encode(&blk).unwrap().len() as u64;
+    assert!(size <= tree.genesis().max_block_bytes);
+    extend(&mut tree, blk);
 }
 EOF
 
@@ -6294,8 +6668,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chain::{
-    BlockMeta, BlockSummary, BlockTree, ClaimedWork, Lottery, OwnerKeypair, Template, TreeError,
-    WorkError, block_relay_id, build_template, verify_fresh_work,
+    BlockMeta, BlockSummary, BlockTree, ClaimedWork, Lottery, OwnerKeypair, ShareCheck,
+    SignedShare, Template, TreeError, WorkError, block_relay_id, build_template, owner_key_id,
+    share_relay_id, verify_fresh_work,
 };
 use ledger::StateCategory;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
@@ -6307,7 +6682,19 @@ use wire::{
 };
 
 use crate::mempool::MempoolView;
+use crate::share_pool::{SHARE_POOL_CAPACITY, SharePool};
 use crate::store::BlockLogWriter;
+
+/// Maximum gossiped shares awaiting their work check (one tile recomputation each),
+/// parked or running. Parked shares count too, so releasing them never exceeds it.
+const SHARE_CHECK_LIMIT: usize = 64;
+/// Per peer: shares parked or awaiting their work check. Honest gossip stays far below.
+const SHARE_PEER_LIMIT: usize = 8;
+
+/// A pending share's slot: (owner key id, work_id). Keyed by owner too because only
+/// the work check ties a work_id to its owner: a validly signed claim to another
+/// owner's work_id must not hold that owner's slot.
+type ShareSlot = (Digest, Digest);
 
 /// Identifier of a connected peer.
 pub type PeerId = u64;
@@ -6342,6 +6729,22 @@ pub enum ImportAck {
     TooDeep,
 }
 
+/// Immediate acknowledgment of `ChainCmd::ImportShare`, sent before the work check runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShareAck {
+    /// Accepted for verification.
+    Queued,
+    /// Waiting for its parent block, which is being verified. The share is dropped
+    /// without penalty if that block turns out invalid, so it may be relayed again.
+    Parked,
+    /// Already pooled, registered, in flight, parked or rejected before.
+    Duplicate,
+    /// Of no use here (stale, unknown parent, ...); the sender is not penalized.
+    Ignored(&'static str),
+    /// No honest node relays this share; the sender is penalized.
+    Invalid(String),
+}
+
 /// Commands accepted by `ChainActor` (§8.2).
 pub enum ChainCmd {
     /// Imports a block from a peer, the miner or disk.
@@ -6355,8 +6758,28 @@ pub enum ChainCmd {
     },
     /// A block sealed by the local miner.
     SubmitLocalBlock(Box<Block>),
-    /// A share found by the local miner.
+    /// A share found by the local miner: pooled and gossiped to every peer.
     SubmitLocalShare(Box<ShareProof>),
+    /// A share gossiped by a peer.
+    ImportShare {
+        /// The share.
+        share: Box<ShareProof>,
+        /// Where it came from.
+        origin: Origin,
+        /// Immediate acknowledgment.
+        ack: Option<oneshot::Sender<ShareAck>>,
+    },
+    /// Internal: the work check of a gossiped share finished.
+    ShareVerified {
+        /// The share's (owner key id, work_id).
+        slot: (Digest, Digest),
+        /// The share's relay id.
+        relay_id: Digest,
+        /// Where it came from.
+        origin: Origin,
+        /// The verified share, or why it was rejected.
+        result: Result<Box<SignedShare>, String>,
+    },
     /// Internal: Stage A finished for a block.
     WorkVerified {
         /// The verified block.
@@ -6422,6 +6845,20 @@ pub enum ChainEvent {
         /// Why.
         reason: String,
     },
+    /// A share entered the pool (own or verified gossip); peers relay it.
+    ShareAccepted {
+        /// The share.
+        share: Arc<ShareProof>,
+        /// Where it came from.
+        origin: Origin,
+    },
+    /// A gossiped share was rejected as invalid; the origin peer is penalized.
+    ShareRejected {
+        /// Where it came from.
+        origin: Origin,
+        /// Why.
+        reason: String,
+    },
     /// The canonical tip changed.
     TipChanged {
         /// New tip (boxed: it carries the 64-byte miner key id).
@@ -6476,10 +6913,21 @@ pub struct StatusSnapshot {
     pub open_jobs: usize,
     /// Parked blocks waiting for their parent.
     pub orphan_count: usize,
+    /// Verified shares waiting for a block (own and gossiped).
+    pub share_pool: usize,
 }
 
 struct ParkedBlock {
     block: Arc<Block>,
+    relay_id: Digest,
+    origin: Origin,
+}
+
+/// A gossiped share whose signature verified, waiting for its parent's Stage A.
+struct ParkedShare {
+    parent: Digest,
+    slot: ShareSlot,
+    signed: Box<SignedShare>,
     relay_id: Digest,
     origin: Origin,
 }
@@ -6541,12 +6989,22 @@ pub struct ChainActor {
     status_tx: watch::Sender<Arc<StatusSnapshot>>,
     mempool_view: watch::Receiver<Arc<MempoolView>>,
     verify_sem: Arc<Semaphore>,
+    // Shares get their own, smaller verification budget, so a block's Stage A never
+    // queues behind share gossip.
+    share_verify_sem: Arc<Semaphore>,
     start_instant: Instant,
     template_gen: u64,
-    own_shares: Vec<ShareProof>,
+    share_pool: SharePool,
+    // Work checks in flight by slot. Only a share whose owner signature verified can
+    // take a slot, so a forged copy cannot shadow the genuine share, and re-signed
+    // copies of a pending share (ML-DSA signing is randomized) are dropped before
+    // costing a verification.
+    share_checks: HashMap<ShareSlot, Origin>,
+    parked_shares: VecDeque<ParkedShare>, // oldest first
+    invalid_shares: LruIdCache,           // relay ids
     // Blocks awaiting validation are deduplicated by relay id (`chain::block_relay_id`),
-    // not by block_id: a copy with a forged signature shares the honest block_id and
-    // must not shadow, or get cached as invalid in place of, the genuine block.
+    // not by block_id: a copy with a forged signature or body shares the honest block_id
+    // and must not shadow, or get cached as invalid in place of, the genuine block.
     in_flight: HashMap<Digest, Digest>, // relay_id -> block_id
     parked_by_parent: HashMap<Digest, Vec<ParkedBlock>>,
     parked_order: VecDeque<(Digest, Digest, Digest)>, // (relay_id, block_id, parent_id), oldest first
@@ -6569,8 +7027,10 @@ impl ChainActor {
         verify_sem: Arc<Semaphore>,
     ) -> Result<(Self, watch::Receiver<Arc<StatusSnapshot>>), String> {
         let tree = BlockTree::new(genesis)?;
+        let share_verify_sem =
+            Arc::new(Semaphore::new((verify_sem.available_permits() / 2).max(1)));
         let start_instant = Instant::now();
-        let status = build_status_snapshot(&tree, &miner, start_instant, 0);
+        let status = build_status_snapshot(&tree, &miner, start_instant, 0, 0);
         let (status_tx, status_rx) = watch::channel(Arc::new(status));
         let mut actor = Self {
             tree,
@@ -6583,9 +7043,13 @@ impl ChainActor {
             status_tx,
             mempool_view,
             verify_sem,
+            share_verify_sem,
             start_instant,
             template_gen: 0,
-            own_shares: Vec::new(),
+            share_pool: SharePool::new(SHARE_POOL_CAPACITY),
+            share_checks: HashMap::new(),
+            parked_shares: VecDeque::new(),
+            invalid_shares: LruIdCache::new(4_096),
             in_flight: HashMap::new(),
             parked_by_parent: HashMap::new(),
             parked_order: VecDeque::new(),
@@ -6686,9 +7150,29 @@ impl ChainActor {
                 }
             }
             ChainCmd::SubmitLocalShare(share) => {
-                if !self.own_shares.iter().any(|s| s.work_id == share.work_id) {
-                    self.own_shares.push(*share);
-                    return true;
+                // Our own template's work, Freivalds-checked by the miner: only the
+                // signature check that every pooled share carries.
+                match SignedShare::verify(*share) {
+                    Ok(signed) => return self.admit_share(signed, Origin::Local),
+                    Err(e) => warn!(error = %e, "Local share has an invalid signature"),
+                }
+            }
+            ChainCmd::ImportShare { share, origin, ack } => {
+                let res = self.import_share(share, origin);
+                if let Some(tx) = ack {
+                    let _ = tx.send(res);
+                }
+            }
+            ChainCmd::ShareVerified {
+                slot,
+                relay_id,
+                origin,
+                result,
+            } => {
+                self.share_checks.remove(&slot);
+                match result {
+                    Ok(signed) => return self.admit_share(*signed, origin),
+                    Err(reason) => self.reject_share(relay_id, origin, reason),
                 }
             }
             ChainCmd::WorkVerified {
@@ -6769,7 +7253,7 @@ impl ChainActor {
 
     fn import_block(&mut self, block: Arc<Block>, origin: Origin) -> ImportAck {
         let block_id = block.header.block_id;
-        let relay_id = match block_relay_id(&block.header) {
+        let relay_id = match block_relay_id(&block) {
             Ok(id) => id,
             Err(e) => return ImportAck::Invalid(format!("unencodable header: {e}")),
         };
@@ -6829,6 +7313,189 @@ impl ChainActor {
         });
     }
 
+    /// Admits a gossiped share for verification, cheapest checks first: dedupe, the
+    /// no-work checks, per-peer and global limits, then the owner signature here on the
+    /// actor (well under a millisecond). The tile recomputation follows off the actor
+    /// (`ChainCmd::ShareVerified`), or once the parent block passes Stage A if the share
+    /// arrived while it was being verified.
+    fn import_share(&mut self, share: Box<ShareProof>, origin: Origin) -> ShareAck {
+        let relay_id = match share_relay_id(&share) {
+            Ok(id) => id,
+            Err(e) => return ShareAck::Invalid(format!("unencodable share: {e}")),
+        };
+        // The pool holds work-checked shares only, so a work_id there is settled.
+        let slot = (owner_key_id(&share.owner_key), share.work_id);
+        if self.share_pool.contains(&share.work_id)
+            || self.share_checks.contains_key(&slot)
+            || self.parked_shares.iter().any(|p| p.slot == slot)
+            || self.invalid_shares.contains(&relay_id)
+        {
+            return ShareAck::Duplicate;
+        }
+        let parent = match self.tree.check_gossip_share(&share) {
+            ShareCheck::Verify => None,
+            // Shares follow their parent closely: wait if it is in Stage A, so it has
+            // passed Stage B. A parked orphan block's id is unauthenticated and does not
+            // qualify.
+            ShareCheck::UnknownParent(parent) if self.in_flight.values().any(|b| *b == parent) => {
+                Some(parent)
+            }
+            ShareCheck::UnknownParent(_) => return ShareAck::Ignored("share parent is unknown"),
+            ShareCheck::Ignore(why) => return ShareAck::Ignored(why),
+            ShareCheck::Invalid(reason) => {
+                self.reject_share(relay_id, origin, reason.clone());
+                return ShareAck::Invalid(reason);
+            }
+        };
+        if self.share_checks.len() + self.parked_shares.len() >= SHARE_CHECK_LIMIT
+            || self.peer_share_load(origin) >= SHARE_PEER_LIMIT
+        {
+            return ShareAck::Ignored("too many shares awaiting verification");
+        }
+        let signed = match SignedShare::verify(*share) {
+            Ok(signed) => Box::new(signed),
+            Err(e) => {
+                let reason = format!("share signature: {e}");
+                self.reject_share(relay_id, origin, reason.clone());
+                return ShareAck::Invalid(reason);
+            }
+        };
+        match parent {
+            None => {
+                self.spawn_share_work_check(slot, signed, relay_id, origin);
+                ShareAck::Queued
+            }
+            Some(parent) => {
+                self.parked_shares.push_back(ParkedShare {
+                    parent,
+                    slot,
+                    signed,
+                    relay_id,
+                    origin,
+                });
+                ShareAck::Parked
+            }
+        }
+    }
+
+    /// Shares from `origin` that are parked or awaiting their work check.
+    fn peer_share_load(&self, origin: Origin) -> usize {
+        self.share_checks.values().filter(|o| **o == origin).count()
+            + self
+                .parked_shares
+                .iter()
+                .filter(|p| p.origin == origin)
+                .count()
+    }
+
+    /// Takes the share's slot and recomputes its tile off the actor.
+    fn spawn_share_work_check(
+        &mut self,
+        slot: ShareSlot,
+        signed: Box<SignedShare>,
+        relay_id: Digest,
+        origin: Origin,
+    ) {
+        self.share_checks.insert(slot, origin);
+        let sem = self.share_verify_sem.clone();
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
+                tokio::task::spawn_blocking(move || {
+                    let proof = signed.proof();
+                    verify_fresh_work(
+                        &proof.context,
+                        &ClaimedWork::from_share(proof),
+                        proof.share_target,
+                        Lottery::Share,
+                    )
+                    .map_err(|e| format!("share VerifyFW failed: {e}"))?;
+                    Ok(signed)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            }
+            .await;
+            let _ = tx
+                .send(ChainCmd::ShareVerified {
+                    slot,
+                    relay_id,
+                    origin,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    /// Pools a verified share that is still useful and announces it for relay.
+    /// Returns true when the pool changed (a template rebuild is due).
+    fn admit_share(&mut self, signed: SignedShare, origin: Origin) -> bool {
+        let proof = signed.proof();
+        let min_height = (self.tree.tip_meta().height + 1)
+            .saturating_sub(self.tree.genesis().share_inclusion_window);
+        if proof.context.height < min_height
+            || self.tree.tip_state().shares.contains_key(&proof.work_id)
+        {
+            return false;
+        }
+        let share = Arc::new(proof.clone());
+        if !self.share_pool.insert(signed) {
+            return false;
+        }
+        let _ = self
+            .event_tx
+            .send(ChainEvent::ShareAccepted { share, origin });
+        self.publish_status();
+        true
+    }
+
+    fn reject_share(&mut self, relay_id: Digest, origin: Origin, reason: String) {
+        debug!(?origin, %reason, "Rejected share");
+        self.invalid_shares.insert(relay_id);
+        let _ = self
+            .event_tx
+            .send(ChainEvent::ShareRejected { origin, reason });
+    }
+
+    /// Resumes the shares parked for `parent`, now that it is in the tree: the no-work
+    /// checks run again (now on the parent's branch), then the work check.
+    fn release_parked_shares(&mut self, parent: Digest) {
+        let (ready, waiting): (VecDeque<_>, VecDeque<_>) = self
+            .parked_shares
+            .drain(..)
+            .partition(|p| p.parent == parent);
+        self.parked_shares = waiting;
+        for p in ready {
+            if self.share_pool.contains(&p.slot.1) || self.share_checks.contains_key(&p.slot) {
+                continue;
+            }
+            match self.tree.check_gossip_share(p.signed.proof()) {
+                ShareCheck::Verify => {
+                    self.spawn_share_work_check(p.slot, p.signed, p.relay_id, p.origin)
+                }
+                ShareCheck::Invalid(reason) => self.reject_share(p.relay_id, p.origin, reason),
+                ShareCheck::UnknownParent(_) | ShareCheck::Ignore(_) => {}
+            }
+        }
+    }
+
+    /// After a tip change: return the shares of abandoned blocks to the pool, then drop
+    /// what is outside the inclusion window or registered on the new canonical chain.
+    fn refresh_share_pool(&mut self, tip_height: u64, disconnected: &[Arc<Block>]) {
+        for share in disconnected.iter().flat_map(|blk| &blk.body.shares) {
+            // These passed Stage A inside their block; only the signature is rechecked.
+            if let Ok(signed) = SignedShare::verify(share.clone()) {
+                self.share_pool.insert(signed);
+            }
+        }
+        let min_height =
+            (tip_height + 1).saturating_sub(self.tree.genesis().share_inclusion_window);
+        let tip_state = self.tree.tip_state();
+        self.share_pool
+            .prune(min_height, |work_id| tip_state.shares.contains_key(work_id));
+    }
+
     fn spawn_stage_a(&self, block: Arc<Block>, origin: Origin) {
         let sem = self.verify_sem.clone();
         let tx = self.self_tx.clone();
@@ -6851,7 +7518,7 @@ impl ChainActor {
         result: Result<(), WorkError>,
     ) {
         let block_id = block.header.block_id;
-        let Ok(relay_id) = block_relay_id(&block.header) else {
+        let Ok(relay_id) = block_relay_id(&block) else {
             return;
         };
         self.in_flight.remove(&relay_id);
@@ -6860,12 +7527,24 @@ impl ChainActor {
             // A Stage A failure shows these bytes are bad, not that no valid block has
             // this block_id (the claims checked here are not all bound by it), so
             // children parked under the block_id stay parked for the genuine parent.
-            Err(err) => self.reject(
-                block_id,
-                relay_id,
-                origin,
-                format!("Stage A VerifyFW failed: {err}"),
-            ),
+            Err(err) => {
+                self.reject(
+                    block_id,
+                    relay_id,
+                    origin,
+                    format!("Stage A VerifyFW failed: {err}"),
+                );
+                self.drop_parked_shares_unless_pending(block_id);
+            }
+        }
+    }
+
+    /// Drops, without penalty, the shares parked for `block_id` unless another copy
+    /// of that block is still in Stage A. A block id is unauthenticated until Stage A
+    /// passes, so shares parked behind a block that fails it may name a fabricated one.
+    fn drop_parked_shares_unless_pending(&mut self, block_id: Digest) {
+        if !self.in_flight.values().any(|b| *b == block_id) {
+            self.parked_shares.retain(|p| p.parent != block_id);
         }
     }
 
@@ -6893,7 +7572,7 @@ impl ChainActor {
                     origin,
                 });
                 if outcome.tip_changed {
-                    self.prune_own_shares(outcome.meta.height);
+                    self.refresh_share_pool(outcome.meta.height, &outcome.disconnected);
                     self.publish_status();
                     self.rebuild_and_publish_template();
                     let _ = self.event_tx.send(ChainEvent::TipChanged {
@@ -6902,30 +7581,27 @@ impl ChainActor {
                         disconnected: outcome.disconnected,
                     });
                 }
-                // Re-submit the parked blocks whose parent is this block (§8.3).
+                // Re-submit the parked blocks and shares whose parent is this block (§8.3).
                 for child in self.take_parked_children(block_id) {
                     let _ = self.import_block(child.block, child.origin);
                 }
+                self.release_parked_shares(block_id);
             }
             // After Stage A the header's claims match its block_id, and the body is bound
             // by body_core_root, so this failure condemns every block with this block_id.
             Err(TreeError::Invalid(reason)) => {
-                if let Ok(relay_id) = block_relay_id(&block.header) {
+                if let Ok(relay_id) = block_relay_id(&block) {
                     self.reject(block_id, relay_id, origin, reason);
                 }
                 self.drop_parked_children(block_id);
+                // Shares mined on an invalid block can never be included.
+                self.parked_shares.retain(|p| p.parent != block_id);
             }
-            Err(other) => debug!(id = ?block_id, error = %other, "Block not applied"),
+            Err(other) => {
+                debug!(id = ?block_id, error = %other, "Block not applied");
+                self.drop_parked_shares_unless_pending(block_id);
+            }
         }
-    }
-
-    fn prune_own_shares(&mut self, tip_height: u64) {
-        let min_share_h =
-            (tip_height + 1).saturating_sub(self.tree.genesis().share_inclusion_window);
-        let tip_state = self.tree.tip_state();
-        self.own_shares.retain(|sh| {
-            sh.context.height >= min_share_h && !tip_state.shares.contains_key(&sh.work_id)
-        });
     }
 
     fn park(&mut self, parent: Digest, block: Arc<Block>, relay_id: Digest, origin: Origin) {
@@ -6992,6 +7668,7 @@ impl ChainActor {
             &self.miner,
             self.start_instant,
             self.parked_order.len(),
+            self.share_pool.len(),
         );
         let _ = self.status_tx.send(Arc::new(snap));
     }
@@ -7009,7 +7686,7 @@ impl ChainActor {
             tip_meta.height,
             &tip_state,
             &mempool_txs,
-            &self.own_shares,
+            self.share_pool.as_slice(),
             &self.miner,
             now_bucket,
         );
@@ -7093,6 +7770,7 @@ fn build_status_snapshot(
     miner: &OwnerKeypair,
     start_instant: Instant,
     orphan_count: usize,
+    share_pool: usize,
 ) -> StatusSnapshot {
     let state = tree.tip_state();
     let ledger = &state.ledger;
@@ -7118,6 +7796,7 @@ fn build_status_snapshot(
         pending_payout: state.pending_payout,
         open_jobs: state.open_jobs.len(),
         orphan_count,
+        share_pool,
     }
 }
 EOF
@@ -7131,9 +7810,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const KNOWN_GAPS_HELP: &str = "\
-KNOWN TESTNET GAPS (blueprint §1.2; gaps 1 and 2 are closed in v1):
+KNOWN TESTNET GAPS (blueprint §1.2; gaps 1, 2 and 4 are closed in v1):
   3. VerifyFW by recomputation: validators recompute 512x512 INT8 tiles (no Circle STARK, no P-DAL).
-  4. Shares are not gossiped: miners include only their own shares in their own blocks.
   5. Commercial execution is replicated: every validator recomputes Ozaki-II dot products (consensus weight 0).
   6. No refunds or timeouts: every admitted job settles deterministically after settle_delay blocks.
   7. Founder vesting is tied to BLOCKS_PER_DAY = 720 blocks regardless of the target block time.
@@ -7143,7 +7821,8 @@ KNOWN TESTNET GAPS (blueprint §1.2; gaps 1 and 2 are closed in v1):
 
 CLOSED IN V1:
   1. Hashing is SHA3-512 and SHAKE256 (FIPS 202).
-  2. Owners are ML-DSA-87 keys (FIPS 204) that sign every block header, share proof and job.";
+  2. Owners are ML-DSA-87 keys (FIPS 204) that sign every block header, share proof and job.
+  4. Shares are gossiped (GossipShare): verified shares from every node enter each miner's blocks.";
 
 /// Plauthium multi-node P2P testnet daemon.
 #[derive(Debug, Parser)]
@@ -7233,7 +7912,8 @@ pub struct RunArgs {
     /// Disable block mining on this node.
     #[arg(long, default_value_t = false)]
     pub no_mine: bool,
-    /// Number of concurrent Stage A verification tasks (default: CPUs / 2).
+    /// Number of concurrent Stage A verification tasks (default: CPUs / 2). Gossiped
+    /// shares get half as many again (at least one) for their work checks.
     #[arg(long)]
     pub verify_threads: Option<usize>,
     /// Delete the chain data in the data directory before starting. The miner key file
@@ -7742,6 +8422,7 @@ pub mod keystore;
 pub mod mempool;
 pub mod net;
 pub mod rpc;
+pub mod share_pool;
 pub mod store;
 
 use std::net::SocketAddr;
@@ -8354,10 +9035,12 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 use wire::{
     Block, Digest, HANDSHAKE_TIMEOUT, MAX_FRAME_BYTES, MAX_REORG_DEPTH, MAX_SYNC_BLOCKS,
-    MAX_SYNC_BYTES, SYNC_LOOKBACK, SYNC_TIMEOUT, WIRE_VERSION, WireMessage, codec,
+    MAX_SYNC_BYTES, SYNC_LOOKBACK, SYNC_TIMEOUT, ShareProof, WIRE_VERSION, WireMessage, codec,
 };
 
-use crate::chain_actor::{ChainCmd, ChainEvent, ImportAck, Origin, PeerId, StatusSnapshot};
+use crate::chain_actor::{
+    ChainCmd, ChainEvent, ImportAck, Origin, PeerId, ShareAck, StatusSnapshot,
+};
 use crate::mempool::{MempoolCmd, MempoolEvent, MempoolReject};
 
 /// Ban for protocol violations (bad frames, unexpected messages), §4.8.
@@ -8366,6 +9049,16 @@ const PROTOCOL_BAN: Duration = Duration::from_secs(60);
 const INVALID_BAN: Duration = Duration::from_secs(600);
 /// Invalid jobs tolerated per connection before a ban.
 const MAX_INVALID_JOBS: u32 = 10;
+/// Gossiped shares a peer may send per minute that turn out useless (ignored, or a
+/// duplicate under a new encoding). Past it, the peer's shares are dropped unread for
+/// the rest of the minute. Honest peers relay a few shares per block.
+const MAX_USELESS_SHARES_PER_MIN: u32 = 256;
+/// Inbound connections accepted per remote IP (loopback is exempt: local testnets).
+/// Generous, for honest nodes sharing a NAT address; it bounds sockets and per-peer
+/// budgets per IP.
+const MAX_INBOUND_PER_IP: usize = 16;
+/// Recently disconnected peers remembered so that a late rejection still bans them.
+const DEPARTED_MEMORY: usize = 1_024;
 /// Accepted blocks more than this far below the tip are not relayed: peers that
 /// need them fetch them with `SyncRequest`.
 const RELAY_DEPTH: u64 = 2 * SYNC_LOOKBACK;
@@ -8392,6 +9085,8 @@ struct PeerHandle {
     tx: mpsc::Sender<WireMessage>,
     best_height: u64,
     invalid_jobs: u32,
+    useless_shares: u32,
+    useless_window: Instant,
 }
 
 #[derive(Default)]
@@ -8420,6 +9115,11 @@ impl<T: Copy + Eq + std::hash::Hash> LruSeen<T> {
         }
     }
 
+    /// Whether `item` was seen.
+    fn contains(&self, item: &T) -> bool {
+        self.set.contains(item)
+    }
+
     /// Records `item`; returns false if it was already seen.
     fn mark_seen(&mut self, item: T) -> bool {
         if !self.set.insert(item) {
@@ -8439,10 +9139,16 @@ struct NetShared {
     peers: HashMap<PeerId, PeerHandle>,
     bans: HashMap<BanKey, Instant>,
     /// Relay ids (`chain::block_relay_id`), not block ids: a copy with a forged
-    /// signature has the honest `block_id` and must not shadow the genuine block.
+    /// signature or body has the honest `block_id` and must not shadow the genuine block.
     seen_blocks: LruSeen<Digest>,
     /// Relay ids (`chain::job_relay_id`), not tx ids, for the same reason.
     seen_jobs: LruSeen<Digest>,
+    /// Relay ids (`chain::share_relay_id`), not work ids, for the same reason.
+    seen_shares: LruSeen<Digest>,
+    /// Addresses of recently disconnected peers, newest last.
+    departed: VecDeque<(PeerId, SocketAddr)>,
+    /// Open inbound connections per remote IP (loopback not counted).
+    inbound_per_ip: HashMap<IpAddr, usize>,
     paused: bool,
 }
 
@@ -8462,6 +9168,46 @@ pub struct PeerManager {
     mempool_tx: mpsc::Sender<MempoolCmd>,
     status_rx: watch::Receiver<Arc<StatusSnapshot>>,
     shutdown_rx: watch::Receiver<bool>,
+}
+
+/// One inbound connection counted against its IP's limit; released on drop.
+struct InboundSlot {
+    mgr: Arc<PeerManager>,
+    ip: IpAddr,
+}
+
+impl InboundSlot {
+    /// Counts a new inbound connection from `ip`, or `None` if the IP is at its limit.
+    /// Loopback connections are not limited (they carry a dummy slot).
+    fn reserve(mgr: &Arc<PeerManager>, ip: IpAddr) -> Option<Self> {
+        if !ip.is_loopback() {
+            let mut guard = mgr.lock();
+            let count = guard.inbound_per_ip.entry(ip).or_insert(0);
+            if *count >= MAX_INBOUND_PER_IP {
+                return None;
+            }
+            *count += 1;
+        }
+        Some(Self {
+            mgr: mgr.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for InboundSlot {
+    fn drop(&mut self) {
+        if self.ip.is_loopback() {
+            return;
+        }
+        let mut guard = self.mgr.lock();
+        if let Some(count) = guard.inbound_per_ip.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                guard.inbound_per_ip.remove(&self.ip);
+            }
+        }
+    }
 }
 
 fn is_shutdown(rx: &watch::Receiver<bool>) -> bool {
@@ -8501,6 +9247,9 @@ impl PeerManager {
                 bans: HashMap::new(),
                 seen_blocks: LruSeen::new(8_192),
                 seen_jobs: LruSeen::new(16_384),
+                seen_shares: LruSeen::new(16_384),
+                departed: VecDeque::new(),
+                inbound_per_ip: HashMap::new(),
                 paused: false,
             }),
             chain_tx,
@@ -8521,8 +9270,15 @@ impl PeerManager {
                         if mgr.is_banned_or_paused(addr) {
                             continue;
                         }
+                        let Some(slot) = InboundSlot::reserve(&mgr, addr.ip()) else {
+                            debug!(%addr, "Too many inbound connections from this IP");
+                            continue;
+                        };
                         let conn = mgr.clone();
-                        tokio::spawn(async move { conn.run_connection(stream, addr, false).await });
+                        tokio::spawn(async move {
+                            conn.run_connection(stream, addr, false).await;
+                            drop(slot);
+                        });
                     }
                 }
             }
@@ -8600,13 +9356,17 @@ impl PeerManager {
             let mut backoff_secs = 1u64;
             while !is_shutdown(&sd) {
                 if !mgr.has_peer_addr(peer_addr) && !mgr.is_banned_or_paused(peer_addr) {
-                    match TcpStream::connect(peer_addr).await {
-                        Ok(stream) => {
-                            backoff_secs = 1;
-                            mgr.run_connection(stream, peer_addr, true).await;
-                        }
-                        Err(_) => backoff_secs = (backoff_secs * 2).min(30),
-                    }
+                    // Back off unless the peer accepted us: one that refuses the
+                    // connection (e.g. at its per-IP limit) gets no 1 Hz redial.
+                    let registered = match TcpStream::connect(peer_addr).await {
+                        Ok(stream) => mgr.run_connection(stream, peer_addr, true).await,
+                        Err(_) => false,
+                    };
+                    backoff_secs = if registered {
+                        1
+                    } else {
+                        (backoff_secs * 2).min(30)
+                    };
                 }
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
@@ -8626,11 +9386,27 @@ impl PeerManager {
         guard.bans.contains_key(&ban_key(addr)) || guard.bans.contains_key(&BanKey::Addr(addr))
     }
 
+    /// Bans the peer's key and drops every connection under it (their loops notice
+    /// within one poll tick).
     fn ban(&self, addr: SocketAddr, duration: Duration, reason: &str) {
         warn!(%addr, secs = duration.as_secs(), reason, "Banning peer");
-        self.lock()
-            .bans
-            .insert(ban_key(addr), Instant::now() + duration);
+        let key = ban_key(addr);
+        let mut guard = self.lock();
+        guard.bans.insert(key, Instant::now() + duration);
+        guard.peers.retain(|_, p| ban_key(p.addr) != key);
+    }
+
+    /// The address to penalize for `pid`: removes a connected peer, or finds one that
+    /// disconnected before its block or share was rejected.
+    fn take_peer_addr(&self, pid: PeerId) -> Option<SocketAddr> {
+        let mut guard = self.lock();
+        guard.peers.remove(&pid).map(|p| p.addr).or_else(|| {
+            guard
+                .departed
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, a)| *a)
+        })
     }
 
     fn has_peer_addr(&self, addr: SocketAddr) -> bool {
@@ -8662,7 +9438,7 @@ impl PeerManager {
                 };
                 let tip_height = self.status_rx.borrow().tip.height;
                 let height = block.header.context.height;
-                if let Ok(relay_id) = chain::block_relay_id(&block.header) {
+                if let Ok(relay_id) = chain::block_relay_id(&block) {
                     self.lock().seen_blocks.mark_seen(relay_id);
                 }
                 if height + RELAY_DEPTH >= tip_height {
@@ -8675,9 +9451,31 @@ impl PeerManager {
                 origin: Origin::Peer(pid),
                 reason,
             } => {
-                let addr = self.lock().peers.remove(&pid).map(|p| p.addr);
-                if let Some(addr) = addr {
+                if let Some(addr) = self.take_peer_addr(pid) {
                     warn!(peer = pid, id = ?block_id, %reason, "Peer sent an invalid block");
+                    self.ban(addr, INVALID_BAN, &reason);
+                }
+            }
+            // Own shares go to every peer; verified gossip to every peer but its sender.
+            ChainEvent::ShareAccepted { share, origin } => {
+                let exclude = match origin {
+                    Origin::Peer(pid) => Some(pid),
+                    _ => None,
+                };
+                if let Ok(relay_id) = chain::share_relay_id(&share) {
+                    self.lock().seen_shares.mark_seen(relay_id);
+                }
+                self.broadcast(
+                    &WireMessage::GossipShare(Box::new((*share).clone())),
+                    exclude,
+                );
+            }
+            ChainEvent::ShareRejected {
+                origin: Origin::Peer(pid),
+                reason,
+            } => {
+                if let Some(addr) = self.take_peer_addr(pid) {
+                    warn!(peer = pid, %reason, "Peer sent an invalid share");
                     self.ban(addr, INVALID_BAN, &reason);
                 }
             }
@@ -8697,7 +9495,9 @@ impl PeerManager {
         self.broadcast(&WireMessage::GossipJob(tx), exclude);
     }
 
-    async fn run_connection(&self, stream: TcpStream, addr: SocketAddr, outbound: bool) {
+    /// Runs one connection to its end. Returns whether the peer completed the
+    /// handshake and was registered.
+    async fn run_connection(&self, stream: TcpStream, addr: SocketAddr, outbound: bool) -> bool {
         let _ = stream.set_nodelay(true);
         let codec = LengthDelimitedCodec::builder()
             .length_field_type::<u32>()
@@ -8717,10 +9517,10 @@ impl PeerManager {
             }
         };
         let Ok(hs_bytes) = codec::encode(&our_hs) else {
-            return;
+            return false;
         };
         if framed.send(Bytes::from(hs_bytes)).await.is_err() {
-            return;
+            return false;
         }
 
         // Wait at most HANDSHAKE_TIMEOUT for the peer's Handshake (§4.5 step 3).
@@ -8740,22 +9540,22 @@ impl PeerManager {
                 }) => {
                     if version != WIRE_VERSION || chain_id != self.chain_id {
                         debug!(%addr, version, chain_id, "Handshake version or chain_id mismatch");
-                        return;
+                        return false;
                     }
                     (best_height, best_block_id)
                 }
                 _ => {
                     self.ban(addr, PROTOCOL_BAN, "first frame is not a valid Handshake");
-                    return;
+                    return false;
                 }
             },
             Ok(Some(Err(e))) if e.kind() == std::io::ErrorKind::InvalidData => {
                 self.ban(addr, PROTOCOL_BAN, "oversize frame");
-                return;
+                return false;
             }
             _ => {
                 debug!(%addr, "No handshake from peer");
-                return;
+                return false;
             }
         };
 
@@ -8767,7 +9567,7 @@ impl PeerManager {
             if guard.paused
                 || (outbound && guard.peers.values().any(|p| p.outbound && p.addr == addr))
             {
-                return;
+                return false;
             }
             guard.peers.insert(
                 peer_id,
@@ -8777,6 +9577,8 @@ impl PeerManager {
                     tx: write_tx.clone(),
                     best_height: peer_best_height,
                     invalid_jobs: 0,
+                    useless_shares: 0,
+                    useless_window: Instant::now(),
                 },
             );
         }
@@ -8844,8 +9646,13 @@ impl PeerManager {
                     sync = SyncState::default();
                 }
                 _ = poll.tick() => {
-                    if self.lock().paused {
-                        break Disconnect::Closed;
+                    // Paused, or banned meanwhile: a block or share rejected after its
+                    // asynchronous check removes the peer (ChainEvent::*Rejected).
+                    {
+                        let guard = self.lock();
+                        if guard.paused || !guard.peers.contains_key(&peer_id) {
+                            break Disconnect::Closed;
+                        }
                     }
                     if let Some((await_id, last_h)) = sync.awaiting
                         && self.has_block(await_id).await
@@ -8859,11 +9666,19 @@ impl PeerManager {
         };
 
         write_task.abort();
-        self.lock().peers.remove(&peer_id);
+        {
+            let mut guard = self.lock();
+            guard.peers.remove(&peer_id);
+            if guard.departed.len() >= DEPARTED_MEMORY {
+                guard.departed.pop_front();
+            }
+            guard.departed.push_back((peer_id, addr));
+        }
         match reason {
             Disconnect::Closed => debug!(peer = peer_id, %addr, "Disconnected peer"),
             Disconnect::Ban(duration, why) => self.ban(addr, duration, &why),
         }
+        true
     }
 
     async fn handle_peer_message(
@@ -8879,7 +9694,7 @@ impl PeerManager {
             }
             WireMessage::GossipBlock(block) => {
                 let height = block.header.context.height;
-                let Ok(relay_id) = chain::block_relay_id(&block.header) else {
+                let Ok(relay_id) = chain::block_relay_id(&block) else {
                     return Ok(());
                 };
                 {
@@ -8932,6 +9747,39 @@ impl PeerManager {
                     }
                 }
                 Ok(())
+            }
+            WireMessage::GossipShare(share) => {
+                // Ignored and duplicate shares cost us checks but are free to make (no
+                // signature or work is needed before they are dropped): budget them.
+                // Past the budget the peer is throttled, not banned: an honest peer
+                // that is syncing, or relaying to us while we catch up, sends many.
+                if self.useless_share_budget_spent(peer_id) {
+                    return Ok(());
+                }
+                let Ok(relay_id) = chain::share_relay_id(&share) else {
+                    return Ok(());
+                };
+                if self.lock().seen_shares.contains(&relay_id) {
+                    return Ok(());
+                }
+                let ack = self.import_share(share, peer_id).await;
+                // An ignored share (e.g. its parent had not arrived yet) or a parked one
+                // (its parent may prove a forgery) may be useful when relayed again
+                // later, so only the other outcomes are remembered.
+                if !matches!(ack, ShareAck::Ignored(_) | ShareAck::Parked) {
+                    self.lock().seen_shares.mark_seen(relay_id);
+                }
+                if matches!(ack, ShareAck::Ignored(_) | ShareAck::Duplicate)
+                    && let Some(p) = self.lock().peers.get_mut(&peer_id)
+                {
+                    p.useless_shares = p.useless_shares.saturating_add(1);
+                }
+                // Invalid shares get the peer banned here or, when the work check fails
+                // later, through ChainEvent::ShareRejected.
+                match ack {
+                    ShareAck::Invalid(reason) => Err(Disconnect::Ban(INVALID_BAN, reason)),
+                    _ => Ok(()),
+                }
             }
             WireMessage::SyncRequest { from_height } => {
                 let (reply_tx, reply_rx) = oneshot::channel();
@@ -9054,6 +9902,32 @@ impl PeerManager {
             return false;
         }
         rx.await.unwrap_or(false)
+    }
+
+    /// Whether the peer has sent its quota of useless shares this minute (or is gone).
+    fn useless_share_budget_spent(&self, peer_id: PeerId) -> bool {
+        let mut guard = self.lock();
+        let Some(p) = guard.peers.get_mut(&peer_id) else {
+            return true;
+        };
+        if p.useless_window.elapsed() >= Duration::from_secs(60) {
+            p.useless_window = Instant::now();
+            p.useless_shares = 0;
+        }
+        p.useless_shares >= MAX_USELESS_SHARES_PER_MIN
+    }
+
+    async fn import_share(&self, share: Box<ShareProof>, peer_id: PeerId) -> ShareAck {
+        let (tx, rx) = oneshot::channel();
+        let cmd = ChainCmd::ImportShare {
+            share,
+            origin: Origin::Peer(peer_id),
+            ack: Some(tx),
+        };
+        if self.chain_tx.send(cmd).await.is_err() {
+            return ShareAck::Duplicate;
+        }
+        rx.await.unwrap_or(ShareAck::Duplicate)
     }
 
     async fn import_block(&self, block: Arc<Block>, peer_id: PeerId) -> ImportAck {
@@ -9219,6 +10093,8 @@ struct MiningInfoDto {
     attempts_per_sec: f64,
     shares_found: u64,
     seals_found: u64,
+    /// Verified shares (own and gossiped) waiting for a block.
+    share_pool: usize,
 }
 
 #[derive(Serialize)]
@@ -9292,6 +10168,7 @@ async fn handle_status(State(state): State<RpcState>) -> Json<StatusResponse> {
             attempts_per_sec: (state.engine.attempts_per_sec() * 10.0).round() / 10.0,
             shares_found: state.engine.shares_found(),
             seals_found: state.engine.seals_found(),
+            share_pool: snap.share_pool,
         },
         mempool: MempoolInfoDto { size: mempool_size },
         ledger: LedgerInfoDto {
@@ -9715,6 +10592,172 @@ async fn handle_submit_job(
             status: "pending",
         }),
     ))
+}
+EOF
+
+cat << 'EOF' > node/src/share_pool.rs
+//! Share pool (`node::share_pool`, §6.7): verified share proofs waiting for a block.
+//!
+//! It holds this node's own shares and the gossiped shares that passed every check,
+//! signature and work included, one per `work_id`. Templates pick from it
+//! (`chain::build_template`), so any miner can include any owner's share.
+
+use std::collections::HashSet;
+
+use chain::SignedShare;
+use wire::Digest;
+
+/// Maximum pooled shares. The inclusion window holds far fewer in a healthy network
+/// (about `share_ratio` shares per height).
+pub const SHARE_POOL_CAPACITY: usize = 1_024;
+
+/// Verified shares by `work_id`.
+pub struct SharePool {
+    shares: Vec<SignedShare>,
+    work_ids: HashSet<Digest>,
+    capacity: usize,
+}
+
+impl SharePool {
+    /// An empty pool holding at most `capacity` shares.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            shares: Vec::new(),
+            work_ids: HashSet::new(),
+            capacity,
+        }
+    }
+
+    /// Number of pooled shares.
+    pub fn len(&self) -> usize {
+        self.shares.len()
+    }
+
+    /// Whether the pool is empty.
+    pub fn is_empty(&self) -> bool {
+        self.shares.is_empty()
+    }
+
+    /// Whether a share with this `work_id` is pooled.
+    pub fn contains(&self, work_id: &Digest) -> bool {
+        self.work_ids.contains(work_id)
+    }
+
+    /// The pooled shares, in no particular order.
+    pub fn as_slice(&self) -> &[SignedShare] {
+        &self.shares
+    }
+
+    /// Adds a share; returns false if its `work_id` is already pooled. A full pool
+    /// evicts its oldest share (lowest height, then lowest `work_id`), unless the new
+    /// share would be that oldest one, in which case it is not added.
+    pub fn insert(&mut self, share: SignedShare) -> bool {
+        let work_id = share.proof().work_id;
+        if self.work_ids.contains(&work_id) {
+            return false;
+        }
+        if self.shares.len() >= self.capacity {
+            let key = |s: &SignedShare| (s.proof().context.height, s.proof().work_id);
+            let Some(oldest) = self
+                .shares
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| key(s))
+                .map(|(i, _)| i)
+            else {
+                return false;
+            };
+            if key(&share) <= key(&self.shares[oldest]) {
+                return false;
+            }
+            let evicted = self.shares.swap_remove(oldest);
+            self.work_ids.remove(&evicted.proof().work_id);
+        }
+        self.work_ids.insert(work_id);
+        self.shares.push(share);
+        true
+    }
+
+    /// Drops the shares mined below `min_height` (outside the inclusion window) and
+    /// those for which `registered` holds (already included on the canonical chain).
+    pub fn prune(&mut self, min_height: u64, registered: impl Fn(&Digest) -> bool) {
+        let work_ids = &mut self.work_ids;
+        self.shares.retain(|s| {
+            let keep = s.proof().context.height >= min_height && !registered(&s.proof().work_id);
+            if !keep {
+                work_ids.remove(&s.proof().work_id);
+            }
+            keep
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chain::OwnerKeypair;
+    use chain::keys::unsigned;
+    use wire::{FwContext, ShareProof, Target};
+
+    fn share(owner: &OwnerKeypair, height: u64, tag: u8) -> SignedShare {
+        let zero = Digest::ZERO;
+        let mut proof = ShareProof {
+            context: FwContext {
+                chain_id: 0,
+                genesis_id: zero,
+                protocol_version: 0,
+                crypto_suite_id: 0,
+                program_id: zero,
+                air_id: zero,
+                generator_version: 0,
+                parent_canonical_id: zero,
+                stable_anchor_id: zero,
+                height,
+                miner_policy_digest: zero,
+                payout_policy_digest: zero,
+                attempt_nonce: 0,
+                body_core_root: zero,
+                parent_derived_difficulty_context: zero,
+                time_bucket: 0,
+            },
+            owner_key: owner.public_key().clone(),
+            output_root: zero,
+            work_id: Digest([tag; 64]),
+            share_ticket: zero,
+            share_target: Target(1 << 120),
+            signature: unsigned(),
+        };
+        owner.sign_share(&mut proof).unwrap();
+        SignedShare::verify(proof).unwrap()
+    }
+
+    #[test]
+    fn dedupes_by_work_id_evicts_oldest_and_prunes() {
+        let owner = OwnerKeypair::from_seed(&[1; 32]);
+        let mut pool = SharePool::new(3);
+        assert!(pool.insert(share(&owner, 5, 1)));
+        assert!(!pool.insert(share(&owner, 5, 1)), "one share per work_id");
+        assert!(pool.insert(share(&owner, 3, 2)));
+        assert!(pool.insert(share(&owner, 7, 3)));
+        assert_eq!(pool.len(), 3);
+
+        // Full: a share older than everything pooled is not added...
+        assert!(!pool.insert(share(&owner, 2, 4)));
+        // ...a newer one evicts the oldest (height 3).
+        assert!(pool.insert(share(&owner, 6, 5)));
+        assert!(!pool.contains(&Digest([2; 64])));
+        assert!(pool.contains(&Digest([5; 64])));
+
+        // Pruning: below the window, or already registered on the chain.
+        pool.prune(6, |w| *w == Digest([3; 64]));
+        let left: Vec<Digest> = pool.as_slice().iter().map(|s| s.proof().work_id).collect();
+        assert_eq!(left, vec![Digest([5; 64])]);
+        assert!(!pool.contains(&Digest([1; 64])));
+        assert!(
+            pool.insert(share(&owner, 5, 1)),
+            "a pruned work_id may return"
+        );
+    }
 }
 EOF
 
@@ -10150,6 +11193,7 @@ tr.flash-row { animation: rowflash 1.2s ease; }
     <span>Epoch: <b id="h-epoch">0</b></span>
     <span>Rate: <b id="h-rate">0.0</b> att/s (E[seal]=<b id="h-exp">-</b>)</span>
     <span>Mempool: <b id="h-mempool">0</b></span>
+    <span>Share pool: <b id="h-sharepool">0</b></span>
   </div>
 </header>
 
@@ -10544,6 +11588,7 @@ tr.flash-row { animation: rowflash 1.2s ease; }
       document.getElementById("h-rate").textContent = st.mining.attempts_per_sec.toFixed(1);
       document.getElementById("h-exp").textContent = st.tip.expected_attempts_per_seal;
       document.getElementById("h-mempool").textContent = st.mempool.size;
+      document.getElementById("h-sharepool").textContent = st.mining.share_pool;
       document.getElementById("s-cw").textContent = st.commercial_consensus_weight;
 
       renderLedger(st.ledger);
@@ -10574,11 +11619,13 @@ tr.flash-row { animation: rowflash 1.2s ease; }
 EOF
 
 cat << 'EOF' > node/tests/relay_poisoning.rs
-//! Relay poisoning: a peer that relays a copy of a block or job with a forged
-//! signature first must not stop the genuine copy from being accepted.
+//! Relay poisoning and share gossip over raw P2P connections.
 //!
-//! `block_id` and `tx_id` deliberately exclude signatures, so the node's relay and
-//! rejection caches must key on the full signed encoding instead.
+//! A peer that relays a copy of a block, job or share with a forged signature (or a
+//! block with a forged body) first must not stop the genuine copy from being accepted:
+//! `block_id`, `tx_id` and `work_id` deliberately exclude signatures, so the node's
+//! relay and rejection caches key on the full signed encoding instead. Gossiped shares are pooled and relayed
+//! only once verified, and a peer sending an invalid one is banned.
 
 #![forbid(unsafe_code)]
 
@@ -10590,7 +11637,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use chain::core_adapter::fw_context_to_core;
 use chain::keys::unsigned;
-use chain::{BlockTree, OwnerKeypair, build_template};
+use chain::{BlockTree, OwnerKeypair, SignedShare, build_template};
 use futures::{SinkExt, StreamExt};
 use node::cli::RunArgs;
 use node::mempool::MempoolCmd;
@@ -10600,8 +11647,8 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use wire::{
-    Block, DifficultyMode, GenesisConfig, JobPayload, JobTransaction, MAX_FRAME_BYTES, Target,
-    WIRE_VERSION, WireMessage, codec,
+    Block, DifficultyMode, Digest, GenesisConfig, JobPayload, JobTransaction, MAX_FRAME_BYTES,
+    ShareProof, Target, WIRE_VERSION, WireMessage, codec,
 };
 use work::FreshWorkIds;
 
@@ -10652,24 +11699,63 @@ fn now_secs_nanos() -> u128 {
 
 /// Mines the next block on the local replica `tree` for `miner`.
 fn mine_next(tree: &BlockTree, miner: &Arc<OwnerKeypair>) -> Block {
-    let tip = tree.tip_meta().clone();
-    let tpl = build_template(
-        1,
-        tree.genesis(),
-        tree.genesis_id(),
-        tree,
-        tip.height,
-        &tree.tip_state(),
-        &[],
-        &[],
-        miner,
-        now_secs(),
-    )
-    .unwrap();
+    mine_on(tree, tree.tip_id(), miner, &[])
+}
+
+/// Mines a block on `parent` (any branch of the replica) including `pool` shares.
+fn mine_on(
+    tree: &BlockTree,
+    parent: Digest,
+    miner: &Arc<OwnerKeypair>,
+    pool: &[ShareProof],
+) -> Block {
+    let tpl = template_on(tree, parent, miner, pool);
     let ctx = fw_context_to_core(&tpl.context_with_nonce(0)).unwrap();
     let inst = ctx.instance();
     let z = inst.x.product(&inst.y);
     tpl.seal(0, &FreshWorkIds::derive(&ctx, &z)).unwrap()
+}
+
+/// Mines a share for `owner` with `nonce` on top of the replica's tip.
+fn mine_share(tree: &BlockTree, owner: &Arc<OwnerKeypair>, nonce: u64) -> ShareProof {
+    let tpl = template_on(tree, tree.tip_id(), owner, &[]);
+    let ctx = fw_context_to_core(&tpl.context_with_nonce(nonce)).unwrap();
+    let inst = ctx.instance();
+    let z = inst.x.product(&inst.y);
+    tpl.share(nonce, &FreshWorkIds::derive(&ctx, &z)).unwrap()
+}
+
+fn template_on(
+    tree: &BlockTree,
+    parent: Digest,
+    miner: &Arc<OwnerKeypair>,
+    pool: &[ShareProof],
+) -> chain::Template {
+    let view = tree.ancestor_view(parent).unwrap();
+    let meta = tree.get_meta(&parent).unwrap();
+    let pool: Vec<SignedShare> = pool
+        .iter()
+        .map(|sh| SignedShare::verify(sh.clone()).unwrap())
+        .collect();
+    build_template(
+        1,
+        tree.genesis(),
+        tree.genesis_id(),
+        &view,
+        meta.height,
+        &tree.get_state(&parent).unwrap(),
+        &[],
+        &pool,
+        miner,
+        now_secs(),
+    )
+    .unwrap()
+}
+
+/// Validates and applies `block` on the local replica.
+fn extend(tree: &mut BlockTree, block: &Block) {
+    tree.pre_validate(block, None).unwrap();
+    tree.apply_verified_block(Arc::new(block.clone())).unwrap();
 }
 
 /// A raw P2P connection that has completed the handshake.
@@ -10707,6 +11793,14 @@ impl RawPeer {
         let bytes = codec::encode(msg).unwrap();
         self.framed.send(Bytes::from(bytes)).await.unwrap();
     }
+
+    /// The next frame within `wait`, or `None`.
+    async fn recv(&mut self, wait: Duration) -> Option<WireMessage> {
+        let frame = tokio::time::timeout(wait, self.framed.next())
+            .await
+            .ok()??;
+        Some(codec::decode(&frame.unwrap()).unwrap())
+    }
 }
 
 async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
@@ -10737,17 +11831,20 @@ async fn forged_copies_do_not_shadow_genuine_blocks_and_jobs() {
     assert_eq!(tree.genesis_id(), node.status_rx.borrow().genesis_id);
     let miner = Arc::new(OwnerKeypair::from_seed(&[1; 32]));
     let height = |n: &NodeHandle| n.status_rx.borrow().tip.height;
+    let peers = || node.peer_manager.peer_count();
 
-    // 1. Same connection, back to back: a forged-signature copy of block 1 (same
-    //    block_id) is still being verified when the genuine copy arrives.
+    // 1. A forged-signature copy of block 1 (same block_id) is still being verified
+    //    when the genuine copy arrives from an honest peer.
     let b1 = mine_next(&tree, &miner);
     let mut forged_b1 = b1.clone();
     forged_b1.header.signature.0[0] ^= 0x01;
     let mut attacker = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    let mut first_honest = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    wait_until("both peers registered", || peers() == 2).await;
     attacker
         .send(&WireMessage::GossipBlock(Box::new(forged_b1)))
         .await;
-    attacker
+    first_honest
         .send(&WireMessage::GossipBlock(Box::new(b1.clone())))
         .await;
     wait_until("block 1 despite a forged copy in flight", || {
@@ -10755,8 +11852,8 @@ async fn forged_copies_do_not_shadow_genuine_blocks_and_jobs() {
     })
     .await;
     assert_eq!(node.status_rx.borrow().tip.id, b1.header.block_id);
-    tree.pre_validate(&b1, None).unwrap();
-    tree.apply_verified_block(Arc::new(b1)).unwrap();
+    wait_until("the first attacker banned", || peers() == 1).await;
+    extend(&mut tree, &b1);
 
     // 2. The forged copy of block 2 is rejected first (its sender is banned and
     //    dropped); the genuine copy then arrives from another peer.
@@ -10764,18 +11861,11 @@ async fn forged_copies_do_not_shadow_genuine_blocks_and_jobs() {
     let mut forged_b2 = b2.clone();
     forged_b2.header.signature = unsigned();
     let mut attacker = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
-    wait_until("the attacker to be registered", || {
-        node.peer_manager.peer_count() >= 1
-    })
-    .await;
-    let before = node.peer_manager.peer_count();
+    wait_until("the attacker to be registered", || peers() == 2).await;
     attacker
         .send(&WireMessage::GossipBlock(Box::new(forged_b2)))
         .await;
-    wait_until("the forged block 2 to be rejected", || {
-        node.peer_manager.peer_count() < before
-    })
-    .await;
+    wait_until("the forged block 2 to be rejected", || peers() == 1).await;
     let mut honest = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
     honest
         .send(&WireMessage::GossipBlock(Box::new(b2.clone())))
@@ -10785,8 +11875,53 @@ async fn forged_copies_do_not_shadow_genuine_blocks_and_jobs() {
     })
     .await;
     assert_eq!(node.status_rx.borrow().tip.id, b2.header.block_id);
+    extend(&mut tree, &b2);
 
-    // 3. Jobs: a forged-signature copy (same tx_id) is refused, and the genuine job
+    // 3. Genuine headers with forged bodies. A copy of block 4 arrives while block 3 is
+    //    unknown and is parked as an orphan; the genuine block 4 must still be parked
+    //    beside it. A copy of block 3 fails its body_core_root check at once (its
+    //    sender is banned), and the genuine block 3 must still be accepted.
+    let b3 = mine_next(&tree, &miner);
+    let mut tree3 = BlockTree::new(genesis.clone()).unwrap();
+    extend(&mut tree3, &b1);
+    extend(&mut tree3, &b2);
+    extend(&mut tree3, &b3);
+    let b4 = mine_next(&tree3, &miner);
+    let forge_body = |b: &Block| {
+        let mut forged = b.clone();
+        forged.body.ledger_digest.0[0] ^= 0x01;
+        forged
+    };
+    let mut attacker = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    wait_until("the attacker beside both honest peers", || peers() == 3).await;
+    attacker
+        .send(&WireMessage::GossipBlock(Box::new(forge_body(&b4))))
+        .await;
+    // The orphan makes the node ask its sender for the missing blocks.
+    loop {
+        match attacker.recv(Duration::from_secs(30)).await {
+            Some(WireMessage::SyncRequest { .. }) => break,
+            Some(_) => continue,
+            None => panic!("the forged orphan was never processed"),
+        }
+    }
+    honest
+        .send(&WireMessage::GossipBlock(Box::new(b4.clone())))
+        .await;
+    attacker
+        .send(&WireMessage::GossipBlock(Box::new(forge_body(&b3))))
+        .await;
+    wait_until("the forged-body sender banned", || peers() == 2).await;
+    honest
+        .send(&WireMessage::GossipBlock(Box::new(b3.clone())))
+        .await;
+    wait_until("blocks 3 and 4 despite forged bodies", || {
+        height(&node) == 4
+    })
+    .await;
+    assert_eq!(node.status_rx.borrow().tip.id, b4.header.block_id);
+
+    // 4. Jobs: a forged-signature copy (same tx_id) is refused, and the genuine job
     //    relayed right after it still reaches the mempool.
     let client = OwnerKeypair::from_seed(&[2; 32]);
     let mut job = JobTransaction {
@@ -10823,6 +11958,346 @@ async fn forged_copies_do_not_shadow_genuine_blocks_and_jobs() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Gossiped shares, one path per step: a forged copy gets its sender banned (after
+/// the signature check) without shadowing the genuine share, which is pooled and
+/// relayed; a malformed share gets its sender banned at once; a share that arrives
+/// while its parent block is in Stage A waits for it; a share whose parent is unknown
+/// is ignored without penalty; a validly signed share with bogus work gets its sender
+/// banned and is never relayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossiped_shares_are_verified_relayed_and_invalid_ones_banned() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let mut tree = BlockTree::new(genesis.clone()).unwrap();
+    let owner = Arc::new(OwnerKeypair::from_seed(&[3; 32]));
+    let miner = Arc::new(OwnerKeypair::from_seed(&[4; 32]));
+    let pooled = |n: &NodeHandle| n.status_rx.borrow().share_pool;
+    let peers = || node.peer_manager.peer_count();
+    let closed = |end: Result<Option<Result<bytes::BytesMut, std::io::Error>>, _>| {
+        matches!(end, Ok(None) | Ok(Some(Err(_))))
+    };
+
+    let mut listener = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    let mut attacker = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    let mut sender = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    wait_until("three peers registered", || peers() == 3).await;
+
+    // 1. A forged-signature copy (same work_id) gets the attacker banned and dropped...
+    let share = mine_share(&tree, &owner, 11);
+    let mut forged = share.clone();
+    forged.signature.0[42] ^= 0x01;
+    attacker
+        .send(&WireMessage::GossipShare(Box::new(forged)))
+        .await;
+    wait_until("the attacker banned", || peers() == 2).await;
+    let end = tokio::time::timeout(Duration::from_secs(5), attacker.framed.next()).await;
+    assert!(
+        closed(end),
+        "the node closes the banned attacker's connection"
+    );
+
+    // 2. ...and the genuine share is still pooled and relayed.
+    sender
+        .send(&WireMessage::GossipShare(Box::new(share.clone())))
+        .await;
+    match listener.recv(Duration::from_secs(30)).await {
+        Some(WireMessage::GossipShare(relayed)) => {
+            assert_eq!(*relayed, share, "only the genuine share is relayed")
+        }
+        other => panic!("expected the relayed share, got {other:?}"),
+    }
+    wait_until("the share in the pool", || pooled(&node) == 1).await;
+
+    // 3. A malformed share (wrong share_target, validly signed) is caught by the
+    //    no-work checks: banned at once, no tile recomputed.
+    let mut wrong_target = mine_share(&tree, &owner, 12);
+    wrong_target.share_target = Target(u128::MAX - 1);
+    owner.sign_share(&mut wrong_target).unwrap();
+    let mut second_attacker = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    wait_until("the second attacker registered", || peers() == 3).await;
+    second_attacker
+        .send(&WireMessage::GossipShare(Box::new(wrong_target)))
+        .await;
+    let end = tokio::time::timeout(Duration::from_secs(5), second_attacker.framed.next()).await;
+    assert!(
+        closed(end),
+        "a malformed share closes the connection at once"
+    );
+    wait_until("the second attacker banned", || peers() == 2).await;
+
+    // 4. Block 1, and right behind it on the same connection a share mined on it: the
+    //    share waits while block 1 is in Stage A, then is verified, pooled, relayed.
+    let p1 = mine_next(&tree, &miner);
+    extend(&mut tree, &p1);
+    let on_p1 = mine_share(&tree, &owner, 13);
+    sender
+        .send(&WireMessage::GossipBlock(Box::new(p1.clone())))
+        .await;
+    sender
+        .send(&WireMessage::GossipShare(Box::new(on_p1.clone())))
+        .await;
+    loop {
+        match listener.recv(Duration::from_secs(30)).await {
+            Some(WireMessage::GossipBlock(b)) => assert_eq!(b.header.block_id, p1.header.block_id),
+            Some(WireMessage::GossipShare(relayed)) => {
+                assert_eq!(*relayed, on_p1);
+                break;
+            }
+            other => panic!("expected block 1 and its share, got {other:?}"),
+        }
+    }
+    wait_until("both shares pooled", || pooled(&node) == 2).await;
+
+    // 5. A share with an unknown parent is ignored: no relay, no ban.
+    let mut orphan = mine_share(&tree, &owner, 14);
+    orphan.context.parent_canonical_id = Digest([9; 64]);
+    owner.sign_share(&mut orphan).unwrap();
+    sender
+        .send(&WireMessage::GossipShare(Box::new(orphan)))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(peers(), 2, "no penalty for an orphan");
+
+    // 6. Validly signed but with a ticket its work does not produce: the work check
+    //    fails, the sender is banned and the share is neither pooled nor relayed.
+    let mut bogus = mine_share(&tree, &owner, 15);
+    bogus.share_ticket = Digest::ZERO;
+    owner.sign_share(&mut bogus).unwrap();
+    sender
+        .send(&WireMessage::GossipShare(Box::new(bogus)))
+        .await;
+    wait_until("the sender of the bogus share banned", || peers() == 1).await;
+    assert_eq!(pooled(&node), 2);
+    assert!(
+        listener.recv(Duration::from_millis(500)).await.is_none(),
+        "nothing else is relayed"
+    );
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A share parked behind a bad copy of its parent is dropped when that copy fails
+/// Stage A, without being remembered as seen: relayed again once the genuine parent
+/// is in, it is pooled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_share_parked_behind_a_bad_parent_copy_can_return() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let mut tree = BlockTree::new(genesis.clone()).unwrap();
+    let owner = Arc::new(OwnerKeypair::from_seed(&[11; 32]));
+    let miner = Arc::new(OwnerKeypair::from_seed(&[12; 32]));
+    let pooled = |n: &NodeHandle| n.status_rx.borrow().share_pool;
+    let peers = || node.peer_manager.peer_count();
+
+    // The bad copy keeps block 1's block_id and a valid signature (its miner signed
+    // it), so it fails only at its tile recomputation, well after the share arrives.
+    let p1 = mine_next(&tree, &miner);
+    let mut forged_p1 = p1.clone();
+    forged_p1.header.seal_ticket.0[0] ^= 0x01;
+    miner.sign_header(&mut forged_p1.header).unwrap();
+    extend(&mut tree, &p1);
+    let on_p1 = mine_share(&tree, &owner, 51);
+
+    let mut attacker = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    let mut honest = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    wait_until("both peers registered", || peers() == 2).await;
+    // The share follows the bad copy, so it parks while that copy is in Stage A; the
+    // copy fails and the share is dropped with it.
+    attacker
+        .send(&WireMessage::GossipBlock(Box::new(forged_p1)))
+        .await;
+    attacker
+        .send(&WireMessage::GossipShare(Box::new(on_p1.clone())))
+        .await;
+    wait_until("the attacker banned", || peers() == 1).await;
+    assert_eq!(pooled(&node), 0);
+
+    honest
+        .send(&WireMessage::GossipBlock(Box::new(p1.clone())))
+        .await;
+    wait_until("the genuine block 1", || {
+        node.status_rx.borrow().tip.id == p1.header.block_id
+    })
+    .await;
+    honest
+        .send(&WireMessage::GossipShare(Box::new(on_p1)))
+        .await;
+    wait_until("the share pooled once relayed again", || pooled(&node) == 1).await;
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A reorg returns the shares of the abandoned blocks to the pool, so they can still
+/// be included on the new branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shares_of_abandoned_blocks_return_to_the_pool() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let mut tree = BlockTree::new(genesis.clone()).unwrap();
+    let (miner_a, miner_b, owner) = (
+        Arc::new(OwnerKeypair::from_seed(&[5; 32])),
+        Arc::new(OwnerKeypair::from_seed(&[6; 32])),
+        Arc::new(OwnerKeypair::from_seed(&[7; 32])),
+    );
+    let genesis_id = tree.genesis_id();
+    let pooled = |n: &NodeHandle| n.status_rx.borrow().share_pool;
+    let tip = |n: &NodeHandle| n.status_rx.borrow().tip.id;
+
+    // Branch A: a1, then a2 including a share mined at height 1.
+    let share = mine_share(&tree, &owner, 21);
+    let a1 = mine_on(&tree, genesis_id, &miner_a, &[]);
+    extend(&mut tree, &a1);
+    let a2 = mine_on(
+        &tree,
+        a1.header.block_id,
+        &miner_a,
+        std::slice::from_ref(&share),
+    );
+    assert_eq!(a2.body.shares, vec![share.clone()]);
+    extend(&mut tree, &a2);
+    // Branch B: three blocks from genesis without the share, so it is heavier.
+    let b1 = mine_on(&tree, genesis_id, &miner_b, &[]);
+    extend(&mut tree, &b1);
+    let b2 = mine_on(&tree, b1.header.block_id, &miner_b, &[]);
+    extend(&mut tree, &b2);
+    let b3 = mine_on(&tree, b2.header.block_id, &miner_b, &[]);
+    extend(&mut tree, &b3);
+
+    let mut peer = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    for blk in [&a1, &a2] {
+        peer.send(&WireMessage::GossipBlock(Box::new(blk.clone())))
+            .await;
+    }
+    wait_until("branch A", || tip(&node) == a2.header.block_id).await;
+    assert_eq!(pooled(&node), 0, "the share is registered on branch A");
+
+    for blk in [&b1, &b2, &b3] {
+        peer.send(&WireMessage::GossipBlock(Box::new(blk.clone())))
+            .await;
+    }
+    wait_until("the reorg to branch B", || tip(&node) == b3.header.block_id).await;
+    wait_until("the abandoned share back in the pool", || {
+        pooled(&node) == 1
+    })
+    .await;
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only the work check ties a work_id to its owner, so pending shares are keyed by
+/// (owner, work_id): a validly signed claim to an honest share's work_id under another
+/// key cannot shadow the genuine share, and the claimant is banned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_to_another_owners_work_does_not_shadow_it() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let tree = BlockTree::new(genesis.clone()).unwrap();
+    let honest_owner = Arc::new(OwnerKeypair::from_seed(&[8; 32]));
+    let thief = Arc::new(OwnerKeypair::from_seed(&[9; 32]));
+    let peers = || node.peer_manager.peer_count();
+    let pooled = |n: &NodeHandle| n.status_rx.borrow().share_pool;
+
+    let share = mine_share(&tree, &honest_owner, 31);
+    // The thief's own valid share context, with the honest work_id and ticket copied in.
+    let mut claim = mine_share(&tree, &thief, 32);
+    claim.work_id = share.work_id;
+    claim.share_ticket = share.share_ticket;
+    claim.output_root = share.output_root;
+    thief.sign_share(&mut claim).unwrap();
+
+    let mut listener = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    let mut attacker = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    let mut sender = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    wait_until("three peers registered", || peers() == 3).await;
+    attacker
+        .send(&WireMessage::GossipShare(Box::new(claim)))
+        .await;
+    sender
+        .send(&WireMessage::GossipShare(Box::new(share.clone())))
+        .await;
+    match listener.recv(Duration::from_secs(30)).await {
+        Some(WireMessage::GossipShare(relayed)) => assert_eq!(*relayed, share),
+        other => panic!("expected the genuine share, got {other:?}"),
+    }
+    wait_until("the genuine share pooled", || pooled(&node) == 1).await;
+    wait_until("the thief banned", || peers() == 2).await;
+
+    node.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Useless shares (ignored, or duplicates under a new encoding) cost checks but no
+/// work to make: past its budget a peer's shares are dropped unread. It is throttled,
+/// not banned, since honest peers that are syncing send many useless shares too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_of_useless_shares_throttles_the_peer_without_a_ban() {
+    let genesis = test_genesis();
+    let (node, dir) = start(&genesis).await;
+    let tree = BlockTree::new(genesis.clone()).unwrap();
+    let owner = Arc::new(OwnerKeypair::from_seed(&[10; 32]));
+    let mut orphan = mine_share(&tree, &owner, 41);
+    orphan.context.parent_canonical_id = Digest([7; 64]);
+    owner.sign_share(&mut orphan).unwrap();
+    let genuine = mine_share(&tree, &owner, 42);
+    let pooled = |n: &NodeHandle| n.status_rx.borrow().share_pool;
+
+    let mut flooder = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    let mut honest = RawPeer::connect(node.p2p_addr, &genesis, &tree).await;
+    wait_until("both peers registered", || {
+        node.peer_manager.peer_count() == 2
+    })
+    .await;
+    // Ignored shares are not remembered as seen, so even the same bytes count again.
+    for _ in 0..300 {
+        flooder
+            .send(&WireMessage::GossipShare(Box::new(orphan.clone())))
+            .await;
+    }
+    // Over budget: a valid share from the flooder is dropped unread. The sync reply
+    // shows that the node has handled every frame sent before it.
+    flooder
+        .send(&WireMessage::GossipShare(Box::new(genuine.clone())))
+        .await;
+    flooder
+        .send(&WireMessage::SyncRequest { from_height: 1 })
+        .await;
+    loop {
+        match flooder.recv(Duration::from_secs(30)).await {
+            Some(WireMessage::SyncResponse { .. }) => break,
+            Some(_) => continue,
+            None => panic!("the flooding peer was disconnected"),
+        }
+    }
+
+    // The same share from another peer is pooled and relayed to the flooder, which is
+    // still connected. Had the flooder's own copy been imported, the node would never
+    // relay the share back to it.
+    honest
+        .send(&WireMessage::GossipShare(Box::new(genuine.clone())))
+        .await;
+    wait_until("the share pooled from the other peer", || {
+        pooled(&node) == 1
+    })
+    .await;
+    loop {
+        match flooder.recv(Duration::from_secs(30)).await {
+            Some(WireMessage::GossipShare(sh)) => {
+                assert_eq!(*sh, genuine);
+                break;
+            }
+            Some(_) => continue,
+            None => panic!("the share was not relayed to the throttled peer"),
+        }
+    }
+    assert_eq!(node.peer_manager.peer_count(), 2, "no one was banned");
 
     node.stop().await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -11104,6 +12579,50 @@ async fn acceptance_criteria_a2_to_a6() {
         assert_eq!(st.total, u128::from(TOTAL_SUPPLY.get()));
         assert_eq!(st.balances[2], 0, "E_esc drains once the job has settled");
     }
+
+    // GossipShare: a share found by node 2 is included in a block mined by node 3. From
+    // here on one node mines at a time, so there is no fork and no reorg (which could
+    // otherwise return another node's shares to a pool): only gossip can carry a share
+    // mined after h0 from node 2 into node 3's blocks.
+    let h0 = height(&n1);
+    let (n2_key, n3_key) = (n2.miner_key_id.to_hex(), n3.miner_key_id.to_hex());
+    let tips_agree = || tip_id(&n1) == tip_id(&n2) && tip_id(&n2) == tip_id(&n3);
+    let deadline = Instant::now() + PHASE_TIMEOUT;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no share of node 2 reached a block of node 3"
+        );
+        let found = n2.engine.shares_found();
+        n2.engine.set_enabled(true);
+        wait_until("node 2 finds a share", || n2.engine.shares_found() > found).await;
+        n2.engine.set_enabled(false);
+        wait_until("all nodes on node 2's tip", tips_agree).await;
+        // Gossip, the share's work check and node 3's template rebuild.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        // A share mined at height s fits blocks from s + 1 on: node 3 mines two.
+        let h = height(&n3);
+        n3.engine.set_enabled(true);
+        wait_until("node 3 mines two blocks", || height(&n3) >= h + 2).await;
+        n3.engine.set_enabled(false);
+        wait_until("all nodes on node 3's tip", tips_agree).await;
+
+        let (code, blocks) = http(n1.rpc_addr, "GET", "/api/blocks?limit=100", None).await;
+        assert_eq!(code, 200);
+        let blocks: Value = serde_json::from_str(&blocks).unwrap();
+        let gossiped =
+            blocks["blocks"].as_array().unwrap().iter().any(|b| {
+                b["miner_owner"] == n3_key.as_str()
+                    && b["shares"].as_array().unwrap().iter().any(|sh| {
+                        sh["owner"] == n2_key.as_str() && sh["height"].as_u64().unwrap() > h0
+                    })
+            });
+        if gossiped {
+            break;
+        }
+    }
+    let st = status_json(&n3).await;
+    assert!(st["mining"]["share_pool"].is_u64());
 
     // A4: stop node 3, mine 10 blocks on nodes 1 and 2, restart node 3 on its data dir.
     let pre_stop_h = height(&n3);
@@ -13728,8 +15247,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub mod consts {
     use core::time::Duration;
 
-    /// P2P protocol version in `Handshake` (2: ML-DSA-87 keys and signatures on the wire).
-    pub const WIRE_VERSION: u32 = 2;
+    /// P2P protocol version in `Handshake` (2: ML-DSA-87 keys and signatures on the wire;
+    /// 3: `GossipShare`).
+    pub const WIRE_VERSION: u32 = 3;
     /// `protocol_version` context field (core `*/v2` labels).
     pub const CORE_PROTOCOL_VERSION: u64 = 2;
     /// `crypto_suite_id` 1: SHA3-512 and SHAKE256 (FIPS 202) with ML-DSA-87 (FIPS 204).
@@ -13743,6 +15263,10 @@ pub mod consts {
     pub const PUBLIC_KEY_LEN: usize = 2_592;
     /// Bytes per encoded ML-DSA-87 signature (FIPS 204 `sigEncode`).
     pub const SIGNATURE_LEN: usize = 4_627;
+    /// Encoded `BlockHeader` length (every field is fixed-width).
+    pub const ENCODED_HEADER_LEN: usize = 8_203;
+    /// Encoded `ShareProof` length (every field is fixed-width).
+    pub const ENCODED_SHARE_LEN: usize = 8_059;
     /// Lower clamp for any lottery target.
     pub const MIN_TARGET: u128 = 1u128 << 64;
     /// Operand length of an `ExactDot` job (`= work::TILE_DIM`).
@@ -14681,6 +16205,10 @@ pub enum WireMessage {
         /// Blocks in ascending height order.
         blocks: Vec<Block>,
     },
+    /// A Fresh Work share proof the sender has verified (signature and work), so any
+    /// miner can include it in its next block (v3). Appended last to keep the
+    /// discriminants of the earlier variants; boxed like `GossipBlock`.
+    GossipShare(Box<ShareProof>),
 }
 
 #[cfg(test)]
@@ -14755,10 +16283,10 @@ cat << 'EOF' > wire/tests/wire_vectors.rs
 #![forbid(unsafe_code)]
 
 use wire::{
-    Block, BlockBody, BlockHeader, DIGEST_LEN, DOT_LEN, DifficultyMode, Digest, FeeTransition,
-    FwContext, GenesisConfig, JobPayload, JobTransaction, LeaseAssignment, MAX_FRAME_BYTES,
-    MAX_JOB_BYTES, OwnerReward, PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN, SettlementReceipt,
-    ShareProof, Signature, Target, WireMessage, codec,
+    Block, BlockBody, BlockHeader, DIGEST_LEN, DOT_LEN, DifficultyMode, Digest, ENCODED_HEADER_LEN,
+    ENCODED_SHARE_LEN, FeeTransition, FwContext, GenesisConfig, JobPayload, JobTransaction,
+    LeaseAssignment, MAX_FRAME_BYTES, MAX_JOB_BYTES, OwnerReward, PUBLIC_KEY_LEN, PublicKey,
+    SIGNATURE_LEN, SettlementReceipt, ShareProof, Signature, Target, WireMessage, codec,
 };
 
 fn sample_digest(seed: u8) -> Digest {
@@ -14856,7 +16384,7 @@ fn appendix_b_encoded_sizes_and_round_trips() {
     // v0 sizes plus the ML-DSA-87 key (2,592 B) and signature (4,627 B) that
     // replace the 8-byte owner (header, share) or the 64-byte client tag (job).
     assert_eq!(header_bytes.len(), 992 - 8 + PUBLIC_KEY_LEN + SIGNATURE_LEN);
-    assert_eq!(header_bytes.len(), 8_203);
+    assert_eq!(header_bytes.len(), ENCODED_HEADER_LEN);
     assert_eq!(codec::decode::<BlockHeader>(&header_bytes).unwrap(), header);
 
     let job = sample_job();
@@ -14872,7 +16400,7 @@ fn appendix_b_encoded_sizes_and_round_trips() {
     let share = sample_share();
     let share_bytes = codec::encode(&share).unwrap();
     assert_eq!(share_bytes.len(), 848 - 8 + PUBLIC_KEY_LEN + SIGNATURE_LEN);
-    assert_eq!(share_bytes.len(), 8_059);
+    assert_eq!(share_bytes.len(), ENCODED_SHARE_LEN);
     assert_eq!(codec::decode::<ShareProof>(&share_bytes).unwrap(), share);
 
     let genesis = GenesisConfig::default_testnet(1_792_281_600);
@@ -14967,6 +16495,7 @@ fn appendix_b_encoded_sizes_and_round_trips() {
         },
         WireMessage::GossipBlock(Box::new(block.clone())),
         WireMessage::GossipJob(job),
+        WireMessage::GossipShare(Box::new(sample_share())),
         WireMessage::SyncRequest { from_height: 10 },
         WireMessage::SyncResponse {
             blocks: vec![block],
@@ -15024,6 +16553,24 @@ fn unsigned_encoding_is_the_encoding_without_the_signature() {
     assert_ne!(
         codec::encode(&resigned).unwrap(),
         codec::encode(&share).unwrap()
+    );
+}
+
+/// `GossipShare` is variant 5: appending it kept the discriminants 0..=4 of v2.
+#[test]
+fn gossip_share_is_appended_as_variant_5() {
+    let share = sample_share();
+    let encoded = codec::encode(&WireMessage::GossipShare(Box::new(share.clone()))).unwrap();
+    assert_eq!(encoded[..4], 5u32.to_le_bytes());
+    assert_eq!(encoded[4..], codec::encode(&share).unwrap()[..]);
+    assert_eq!(encoded.len(), 4 + 8_059);
+    assert_eq!(
+        codec::decode::<WireMessage>(&encoded).unwrap(),
+        WireMessage::GossipShare(Box::new(share))
+    );
+    assert_eq!(
+        codec::encode(&WireMessage::SyncRequest { from_height: 1 }).unwrap()[..4],
+        3u32.to_le_bytes()
     );
 }
 
@@ -15766,34 +17313,35 @@ else
 44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb  .gitignore
 c0a5f5bf3d800d366ab192dc2e5a9268b5aa3c29561cb462494ce9a8d79ae46e  Cargo.lock
 b635b428c7b6b12ea5d6e288a18a72442f93d98904744dc55ac9467cb0cad814  Cargo.toml
-6cf211d1cfe2d46d44a45022c946de2a051a8602526a3d6740ca80237c84be78  README.md
+375f481fc547c2eb52f8ce6fb74db9412863a6f746917b123ecc71dd8fb94971  README.md
 8c12e8600ddd2b133139d47f55bf0df16404a77754785a3d4247a1eb84e66f0e  chain/Cargo.toml
-4052e938a283f43560f2272dde83bc7d4d74ceecbf5aa3bfd359a1689b6c2d59  chain/src/core_adapter.rs
+74033c03a7541a684494111f76cde8ed0970ed5fcde719b61022de0a4fbf979f  chain/src/core_adapter.rs
 27e77bedf168a87d2f7be150ec740b615d70a8e495cd87a77248bfedd4bac328  chain/src/difficulty.rs
 42869ca13744560f79dff3c3f44b16c0f318fd02a418100b0c932303e27e84d7  chain/src/keys.rs
-cc4795b540fc10d2e97b7c821c058fe16ea60f8b8a6697796b0a0d44e4e6617b  chain/src/lib.rs
-a7abb5977d99940ee77dd3cb891090b2ea9393222b5bf7d40a0a9b1424ad424a  chain/src/stf.rs
-16d3508a6b8b32559835c74cda4c6395bd473b5facd37e122ca8fc4763dfc80e  chain/src/template.rs
-7596c4bee6569c22e32c34d3582327669c64066ca428dc870bb318ab72d23f24  chain/src/tree.rs
-555a78a4ec5b701537531cbe019cf036180a4cc5a8f5d4a3e9219329f4bef866  chain/tests/consensus_suite.rs
+0a0f950d25adf55f37cdba59f05114eb295244c55ab2f9e7b7f225160a92748e  chain/src/lib.rs
+24c488177b961436be2a16924e6b2edfb5de81e3c914480f049ed234e655b24a  chain/src/stf.rs
+ea9d4dad93fa875a0474b51286d57f6d0a3e21cd4d718b14e45296927aaf144d  chain/src/template.rs
+35c1d7ea997ec15e88eaa7e21b02d116e8286bd49f593234d4e991dba694ed8d  chain/src/tree.rs
+1d1e6d1a1f103c9efdef64447be2dbff1a09d2d47cb9497b851983ba80fd9b07  chain/tests/consensus_suite.rs
 65bd285d17233a31a3fd881a831a686d223d888c811452b66dde78c7b521b340  chain/tests/vectors/ml_dsa_87_openssl.sig.hex
 9ceb5af43ddb447cd5961932125163e4eea86a731fbddd96d4dba9eaa8e59169  ledger/Cargo.toml
 fb6c260bdbe36066b7515b05752651760f0360ea0a6eea296b2a677d9eb744bc  ledger/src/lib.rs
 9f079355c1d4981271e3158a5037a4603dcbc25f392fc9cd4789c2f6593105f2  node/Cargo.toml
 f0ea71a79f68ae43a8ca1bb5e39cf287f5fd3051399fc9e8384a9fd0f923de3f  node/genesis.testnet.json
-69246a8bbc300008acbdf46d29bb38046dbb5e4635df45482bc34b314c97ce04  node/src/chain_actor.rs
-a8aeece54c336badcc3f2e20f7e94b70d74901210c36d8b87dbf7ef4c59cb898  node/src/cli.rs
+edee80ef5dd5fd1550abe0bde84d36b960197549a370245c87007974e36abef5  node/src/chain_actor.rs
+c7effd64399c75af01ddec01b3f6a7dfeb1f9349d388844e63489e38bccb9f19  node/src/cli.rs
 edecdb75e2543f08599cdd7ac1e6d8345d7e5d0df4ce0384bf2d8f0e5f8c00b5  node/src/engine.rs
 c2200f30a09e52699e1381b2f46d7bab6c0d90a7a42c6f8f1cb0f357f0ce17f7  node/src/keystore.rs
-15cf91aef18a62da4236a02a44e39f3845733c04c36e0fde3e54154d6e6d929d  node/src/lib.rs
+0a0021a6823bd48f781582e8dc903aab594e7ba73e6ef49ce30e626c45903075  node/src/lib.rs
 0b4c8e027b628b1e9e9fa51055b5811355d3b84fcc52d3237fdc96fcc1d96130  node/src/main.rs
 2e7554d9c35c9bde318606735fbbdaef672ff4e325b86fee2e31fd80b207d861  node/src/mempool.rs
-513562e9763339f9a8e46d8aa1af77491bcef769342ec9477fd6473691c8b348  node/src/net.rs
-39318c4c3873d42d2250767469b6c5b03ecc7bb0ee140fae7e47d25af02afb7c  node/src/rpc.rs
+d732703ec0db989dc52e27607edaafbfb61f28fdcf504e2dfd3771d0e37ee715  node/src/net.rs
+d62f63b51fcb041622f95cffdafc7b61d5c4ea5f75e0d56961c2d60e96dd3f18  node/src/rpc.rs
+5840cbb11331db925c34059bed9ccc1cee66444bd5d7c0f45d1689195c30bbeb  node/src/share_pool.rs
 ce5a79658fd8cfa555ab3bdeda8358c377af8a49de4c596f912b6a2ffbaadec3  node/src/store.rs
-86ddc5ccd395215f75ad3a6d6583faa37e18da26978f69abc63e419e2de0a375  node/static/index.html
-61c3cf8b1d2afde2579f0e2a9b0a89e37fbc1159fd2ef4c8b5bc2358bc302fd0  node/tests/relay_poisoning.rs
-9064a8d90c4814d8bc737790333aee1c9284ff54b6bee66bac48c17b8b3c3972  node/tests/testnet_integration.rs
+0f48a606f16f2eb177ca37d0e9958d9d202f0ad621c5f550651416f26277f9ed  node/static/index.html
+160dfc94980ff849d71d44c6a455e83d305be1c08e7d81adacc4a36efc7c4633  node/tests/relay_poisoning.rs
+89798528568fc159d5f68be7b3dc61419a306370afada15916c98c73f7d9e9f7  node/tests/testnet_integration.rs
 3ca9fae7abbf0b49160c37901ae153b6d0b7410e00cfcc540dbc70694112ec53  poc/Cargo.toml
 43d9643efbf07a4a126b707d72e2a947e32256454556ebf66d39b075acee98bf  poc/src/main.rs
 29d2e54e16fec1aa63d176c26cd68a3c771b6d29f15b4730f5f993b6a39537bb  primitives/Cargo.toml
@@ -15805,8 +17353,8 @@ ce5a79658fd8cfa555ab3bdeda8358c377af8a49de4c596f912b6a2ffbaadec3  node/src/store
 bd7133a0a452740b7b27a6e10d57c42f6642122b6552e030c543513a9131a715  scripts/local_testnet.sh
 3cc8a5c5baf12f376dd0ef92da64e1d5c9daa34f88a042428fea93741d6e0b14  scripts/make_all_in_one.sh
 1226d97292355a06bd7a58e839c38c4e260e158411dce16d8340db0893f0f7b8  wire/Cargo.toml
-96c2554b815caac616be0eb1e31df49fc33b359074a478d88b2d5816ae8e9d13  wire/src/lib.rs
-85dce0f0abcf9e71d9c78d8109c163d432856726c727021fc351707c0d71e4de  wire/tests/wire_vectors.rs
+468a44b359e9e9b728e84d3a5410f3ff1fc1d25f943ec1033251310559f6f61b  wire/src/lib.rs
+8da70059cf4894dcb9e6a4e96e331c888d155d207b6ddf0af4aca3c65fc15bf4  wire/tests/wire_vectors.rs
 f2ac56bd414d80276268bf1363a2c9fb4f62927a9af99dfaed3c4dd0a942f4c5  work/Cargo.toml
 575c24059305bc5ddeb119f67b630e299b275fcf0e04170128f89b76e1b4ccb0  work/src/lib.rs
 EOF
@@ -15814,7 +17362,7 @@ EOF
     echo "error: this copy of plauthium_all_in_one.sh is incomplete or altered; download it again" >&2
     exit 1
   fi
-  echo "All 46 files written and verified (b9c7004)."
+  echo "All 47 files written and verified (1ca6131)."
 fi
 
 if [ "$EXTRACT_ONLY" = 1 ]; then
