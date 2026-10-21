@@ -7,7 +7,7 @@ testnet crates wrap it into a multi-node P2P network, as specified in
 and every public item is documented.
 
 ```sh
-cargo test --workspace --release   # 64 tests, including the 3-node integration test (~2 min)
+cargo test --workspace --release   # 75 tests, including the 3-node integration test (~2 min)
 cargo run -p poc                   # core: mock block transition + ASCII summary
 scripts/local_testnet.sh           # 3 mining nodes on localhost with live explorers
 ```
@@ -24,9 +24,9 @@ Run the tests in release mode. Every block involves at least one real 512×512 t
 | `scheduler`  | §6.1–6.5  | `ShareID`, sequential D'Hondt (`w_s/(a_s+1)` by exact cross-multiplication, ties to least ShareID), owner capacity, persistent cohort counters |
 | `ledger`     | §7.1–7.8  | 8 disjoint `StateCategory` balances, atomic zero-sum deltas, `FounderVesting` (1,460 daily tranches × 720 blocks), `FeeLot` with ceiling budgets, floor payouts and segregated dust |
 | `poc`        | —         | Binary that runs Genesis → Fresh Work → D'Hondt → Base Fee lock/maturation/payout |
-| `wire`       | blueprint §3–§5 | The five P2P messages, block/job/share types, `Digest`/`Target`, fixed-width ML-DSA-87 `PublicKey`/`Signature`, the bincode 1.3.3 codec (fixed-width little-endian, trailing bytes rejected), protocol constants |
+| `wire`       | blueprint §3–§5 | The six P2P messages (incl. `GossipShare`), block/job/share types, `Digest`/`Target`, fixed-width ML-DSA-87 `PublicKey`/`Signature`, the bincode 1.3.3 codec (fixed-width little-endian, trailing bytes rejected), protocol constants |
 | `chain`      | blueprint §6–§7 | Genesis validation, Stage A (signatures, then VerifyFW by recomputing the tile) and Stage B (context checks), windowed retarget, `apply_body` (the state transition on `ledger::Ledger`), D'Hondt leases, templates, `BlockTree` with heaviest-seal-weight fork choice, ML-DSA-87 owner keys (`chain::keys`) |
-| `node`       | blueprint §8–§10 | `plauthium-node`: ChainState / Mempool actors, multi-threaded ConsensusEngine, length-delimited TCP PeerManager with sync, append-only `blocks.log`, persistent miner key, axum JSON RPC and the embedded explorer |
+| `node`       | blueprint §8–§10 | `plauthium-node`: ChainState / Mempool actors, multi-threaded ConsensusEngine, length-delimited TCP PeerManager with sync, append-only `blocks.log`, persistent miner key, share pool with `GossipShare` relay, axum JSON RPC and the embedded explorer |
 
 ## Local 3-node testnet
 
@@ -86,14 +86,54 @@ seed. Its **key id** is `H(PLAU/TESTNET/OWNER/v1, public key)`.
 - **Relay ids:** `block_id` and `tx_id` leave out signatures, so anyone can forge an invalid
   copy that shares an honest object's id. The node's relay and rejection caches therefore
   key on a hash of the full signed encoding (`chain::block_relay_id`, `chain::job_relay_id`),
-  and a forged copy cannot shadow the genuine block or job.
+  and a forged copy cannot shadow the genuine block or job. A block's relay id covers its
+  body as well, so a genuine header carrying a forged body cannot shadow the block either.
 
-`crypto_suite_id` is 1 (SHA3-512 + SHAKE256 + ML-DSA-87) and `WIRE_VERSION` is 2.
+`crypto_suite_id` is 1 (SHA3-512 + SHAKE256 + ML-DSA-87).
+
+## Share gossip (v1)
+
+`WIRE_VERSION` 3 adds `GossipShare(ShareProof)`. Every node keeps a share pool (`node::share_pool`)
+of verified shares, its own and gossiped ones, one per `work_id`. Templates take up to
+`max_shares_per_block` of them, whoever mined them, oldest height first, and emit them sorted by
+`work_id`, so a share counts for rewards and leases even if its owner never seals a block.
+
+A gossiped share enters the pool, and is relayed onward, only after every check passes,
+cheapest first:
+
+1. Dedupe: by relay id (`chain::share_relay_id`, the full signed encoding), by `work_id`
+   against the pool (work-checked shares only), and by (owner key id, `work_id`) against
+   shares still awaiting their work check. A slot is only taken once the owner signature
+   verified, so a forged copy, or a claim to another owner's `work_id`, cannot shadow the
+   genuine share, and re-signed copies (ML-DSA signing is randomized) cost nothing.
+2. No-work checks (`BlockTree::check_gossip_share`): context constants, owner binding,
+   height, anchor and target on the share's own branch, inclusion window, not yet
+   registered.
+3. Limits on shares awaiting their work check: 8 per peer, 64 in total.
+4. The ML-DSA-87 signature, checked on the spot.
+5. Its tile, recomputed off the chain actor on a separate, smaller verification budget,
+   so a block's Stage A never queues behind share gossip.
+
+A share whose parent block is in Stage A waits for it (signature already checked, counted
+in the limits), and is dropped if that block fails. Such a share, a stale one and one whose
+parent is unknown are dropped without penalty and not remembered as seen, so a later relay
+can still deliver them. Useless shares (ignored for any reason, including the limits above,
+or duplicates under a new encoding) are budgeted at 256 a minute per peer; past that, the
+peer's shares are dropped unread until the minute is up. The peer is throttled, not banned,
+since an honest peer that is syncing sends many such shares. A peer that sends an invalid
+share is banned, even if it disconnected first, and a ban closes every connection under its
+key (the IP for remote peers). Inbound connections are limited to 16 per remote IP, and a
+dialer backs off unless the remote side completes the handshake.
+
+Templates include only fully verified shares, and `validate_genesis` requires every block
+to fit a full set of `max_shares_per_block` shares plus 16 KiB of headroom. The pool is
+pruned when shares leave the inclusion window or are registered on the canonical chain,
+and the shares of abandoned blocks return to it on a reorg.
 
 ## Known gaps (blueprint §1.2)
 
-Gaps 1 (placeholder hashing) and 2 (self-declared integer owners, no signatures) are closed
-in v1. The numbering of the remaining gaps follows the blueprint.
+Gaps 1 (placeholder hashing), 2 (self-declared integer owners, no signatures) and 4 (shares
+not gossiped) are closed in v1. The numbering of the remaining gaps follows the blueprint.
 
 - **Shared faucet.** The core ledger has no per-account balances (see
   `ledger/src/lib.rs` lines 18–21), so a job's signature authenticates its client, but its
@@ -101,8 +141,6 @@ in v1. The numbering of the remaining gaps follows the blueprint.
 
 3. **VerifyFW by recomputation.** Validators recompute every claimed tile instead of
    verifying a Circle STARK. There is no P-DAL (Reed–Solomon layer).
-4. **Shares are not gossiped.** A miner includes only its own shares in its own blocks, so
-   reward fairness is approximate. `GossipShare` is deferred to v1.
 5. **Commercial execution is replicated.** Every validator recomputes each job's result.
    The lessee is the executor by attribution only. Commercial weight stays 0
    (`scivm::CONSENSUS_WEIGHT`).

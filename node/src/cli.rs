@@ -6,9 +6,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const KNOWN_GAPS_HELP: &str = "\
-KNOWN TESTNET GAPS (blueprint §1.2; gaps 1 and 2 are closed in v1):
+KNOWN TESTNET GAPS (blueprint §1.2; gaps 1, 2 and 4 are closed in v1):
   3. VerifyFW by recomputation: validators recompute 512x512 INT8 tiles (no Circle STARK, no P-DAL).
-  4. Shares are not gossiped: miners include only their own shares in their own blocks.
   5. Commercial execution is replicated: every validator recomputes Ozaki-II dot products (consensus weight 0).
   6. No refunds or timeouts: every admitted job settles deterministically after settle_delay blocks.
   7. Founder vesting is tied to BLOCKS_PER_DAY = 720 blocks regardless of the target block time.
@@ -18,7 +17,8 @@ KNOWN TESTNET GAPS (blueprint §1.2; gaps 1 and 2 are closed in v1):
 
 CLOSED IN V1:
   1. Hashing is SHA3-512 and SHAKE256 (FIPS 202).
-  2. Owners are ML-DSA-87 keys (FIPS 204) that sign every block header, share proof and job.";
+  2. Owners are ML-DSA-87 keys (FIPS 204) that sign every block header, share proof and job.
+  4. Shares are gossiped (GossipShare): verified shares from every node enter each miner's blocks.";
 
 /// Plauthium multi-node P2P testnet daemon.
 #[derive(Debug, Parser)]
@@ -108,7 +108,8 @@ pub struct RunArgs {
     /// Disable block mining on this node.
     #[arg(long, default_value_t = false)]
     pub no_mine: bool,
-    /// Number of concurrent Stage A verification tasks (default: CPUs / 2).
+    /// Number of concurrent Stage A verification tasks (default: CPUs / 2). Gossiped
+    /// shares get half as many again (at least one) for their work checks.
     #[arg(long)]
     pub verify_threads: Option<usize>,
     /// Delete the chain data in the data directory before starting. The miner key file

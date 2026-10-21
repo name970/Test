@@ -273,6 +273,50 @@ async fn acceptance_criteria_a2_to_a6() {
         assert_eq!(st.balances[2], 0, "E_esc drains once the job has settled");
     }
 
+    // GossipShare: a share found by node 2 is included in a block mined by node 3. From
+    // here on one node mines at a time, so there is no fork and no reorg (which could
+    // otherwise return another node's shares to a pool): only gossip can carry a share
+    // mined after h0 from node 2 into node 3's blocks.
+    let h0 = height(&n1);
+    let (n2_key, n3_key) = (n2.miner_key_id.to_hex(), n3.miner_key_id.to_hex());
+    let tips_agree = || tip_id(&n1) == tip_id(&n2) && tip_id(&n2) == tip_id(&n3);
+    let deadline = Instant::now() + PHASE_TIMEOUT;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no share of node 2 reached a block of node 3"
+        );
+        let found = n2.engine.shares_found();
+        n2.engine.set_enabled(true);
+        wait_until("node 2 finds a share", || n2.engine.shares_found() > found).await;
+        n2.engine.set_enabled(false);
+        wait_until("all nodes on node 2's tip", tips_agree).await;
+        // Gossip, the share's work check and node 3's template rebuild.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        // A share mined at height s fits blocks from s + 1 on: node 3 mines two.
+        let h = height(&n3);
+        n3.engine.set_enabled(true);
+        wait_until("node 3 mines two blocks", || height(&n3) >= h + 2).await;
+        n3.engine.set_enabled(false);
+        wait_until("all nodes on node 3's tip", tips_agree).await;
+
+        let (code, blocks) = http(n1.rpc_addr, "GET", "/api/blocks?limit=100", None).await;
+        assert_eq!(code, 200);
+        let blocks: Value = serde_json::from_str(&blocks).unwrap();
+        let gossiped =
+            blocks["blocks"].as_array().unwrap().iter().any(|b| {
+                b["miner_owner"] == n3_key.as_str()
+                    && b["shares"].as_array().unwrap().iter().any(|sh| {
+                        sh["owner"] == n2_key.as_str() && sh["height"].as_u64().unwrap() > h0
+                    })
+            });
+        if gossiped {
+            break;
+        }
+    }
+    let st = status_json(&n3).await;
+    assert!(st["mining"]["share_pool"].is_u64());
+
     // A4: stop node 3, mine 10 blocks on nodes 1 and 2, restart node 3 on its data dir.
     let pre_stop_h = height(&n3);
     let (flush_tx, flush_rx) = oneshot::channel();

@@ -12,10 +12,14 @@ use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa87, VerifyingKey};
 use primitives::{DomainSeparatedHash, labels, pq_sizes};
 use scivm::{OzakiIIProfile, RoundingMode};
 use wire::{
-    BlockBody, BlockHeader, DOT_LEN, Digest, FwContext, GenesisConfig, JobPayload, JobTransaction,
-    MAX_JOB_BYTES, MIN_TARGET, PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN, ShareProof, Signature,
-    Target, codec,
+    Block, BlockBody, BlockHeader, DOT_LEN, Digest, ENCODED_HEADER_LEN, ENCODED_SHARE_LEN,
+    FwContext, GenesisConfig, JobPayload, JobTransaction, MAX_JOB_BYTES, MIN_TARGET,
+    PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN, ShareProof, Signature, Target, codec,
 };
+
+/// Bytes `validate_genesis` requires beyond the header and a full set of shares: room
+/// for the body's framing (vector lengths, `ledger_digest`) and its derived fields.
+pub const BLOCK_HEADROOM: u64 = 16_384;
 use work::{FreshWorkContext, FreshWorkIds, TILE_DIM};
 
 // ---------------------------------------------------------------------------
@@ -50,6 +54,8 @@ pub const SIGNATURE_CONTEXT: &[u8] = labels::PLAU_TX.as_bytes();
 pub const LABEL_RELAY_BLOCK: &str = "PLAU/TESTNET/RELAY/BLOCK/v1";
 /// Label of a job's relay id (local, not consensus).
 pub const LABEL_RELAY_JOB: &str = "PLAU/TESTNET/RELAY/JOB/v1";
+/// Label of a share proof's relay id (local, not consensus).
+pub const LABEL_RELAY_SHARE: &str = "PLAU/TESTNET/RELAY/SHARE/v1";
 /// Label of `ledger_digest`.
 pub const LABEL_LEDGER: &str = "PLAU/TESTNET/LEDGER/v1";
 /// Label of `result_digest`.
@@ -192,6 +198,17 @@ pub fn validate_genesis(config: &GenesisConfig) -> Result<(LedgerParams, Ledger,
         && window < 2
     {
         return Err("retarget window must be >= 2 when Windowed".to_string());
+    }
+    // A full set of shares must always fit, or a template holding them (every node
+    // picks the same gossiped shares) would be too large to be a valid block.
+    let full_shares = config
+        .max_shares_per_block
+        .checked_mul(ENCODED_SHARE_LEN as u64)
+        .and_then(|b| b.checked_add(ENCODED_HEADER_LEN as u64 + BLOCK_HEADROOM));
+    if full_shares.is_none_or(|need| need > config.max_block_bytes) {
+        return Err(format!(
+            "max_block_bytes must hold the header, max_shares_per_block shares of {ENCODED_SHARE_LEN} bytes and {BLOCK_HEADROOM} bytes of headroom"
+        ));
     }
 
     let emission_rate = EmissionRate::new(config.emission_numerator, config.emission_denominator)
@@ -375,15 +392,16 @@ impl fmt::Display for SignatureError {
 
 impl std::error::Error for SignatureError {}
 
-/// Relay id of a block: a hash of its full encoded header, signature included. The
-/// header commits to the body through `body_core_root`, so this names the exact block
-/// bytes.
+/// Relay id of a block: a hash of its full encoding, header (signature included) and
+/// body, so it names the exact block bytes.
 ///
 /// `block_id` leaves out the signature (and other claimed fields), so anyone can make
 /// an invalid copy that shares an honest block's `block_id`. Relay and rejection
-/// caches must key on this id, or such a copy would shadow the genuine block.
-pub fn block_relay_id(header: &BlockHeader) -> Result<Digest, String> {
-    let bytes = codec::encode(header).map_err(|e| e.to_string())?;
+/// caches must key on this id, or such a copy would shadow the genuine block. The body
+/// is hashed too: `body_core_root` binds it only once checked, so a genuine header
+/// with a forged body must not share the genuine block's relay id either.
+pub fn block_relay_id(block: &Block) -> Result<Digest, String> {
+    let bytes = codec::encode(block).map_err(|e| e.to_string())?;
     Ok(domain_hash(LABEL_RELAY_BLOCK, &[&bytes]))
 }
 
@@ -393,6 +411,14 @@ pub fn block_relay_id(header: &BlockHeader) -> Result<Digest, String> {
 pub fn job_relay_id(tx: &JobTransaction) -> Result<Digest, String> {
     let bytes = codec::encode(tx).map_err(|e| e.to_string())?;
     Ok(domain_hash(LABEL_RELAY_JOB, &[&bytes]))
+}
+
+/// Relay id of a share proof: a hash of its full encoding, signature included. Relay
+/// and rejection caches key on it for the reason given at [`block_relay_id`]; the
+/// share pool keeps one share per `work_id`.
+pub fn share_relay_id(share: &ShareProof) -> Result<Digest, String> {
+    let bytes = codec::encode(share).map_err(|e| e.to_string())?;
+    Ok(domain_hash(LABEL_RELAY_SHARE, &[&bytes]))
 }
 
 /// An owner whose ML-DSA-87 signature over a specific object has been verified.

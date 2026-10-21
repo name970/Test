@@ -15,8 +15,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub mod consts {
     use core::time::Duration;
 
-    /// P2P protocol version in `Handshake` (2: ML-DSA-87 keys and signatures on the wire).
-    pub const WIRE_VERSION: u32 = 2;
+    /// P2P protocol version in `Handshake` (2: ML-DSA-87 keys and signatures on the wire;
+    /// 3: `GossipShare`).
+    pub const WIRE_VERSION: u32 = 3;
     /// `protocol_version` context field (core `*/v2` labels).
     pub const CORE_PROTOCOL_VERSION: u64 = 2;
     /// `crypto_suite_id` 1: SHA3-512 and SHAKE256 (FIPS 202) with ML-DSA-87 (FIPS 204).
@@ -30,6 +31,10 @@ pub mod consts {
     pub const PUBLIC_KEY_LEN: usize = 2_592;
     /// Bytes per encoded ML-DSA-87 signature (FIPS 204 `sigEncode`).
     pub const SIGNATURE_LEN: usize = 4_627;
+    /// Encoded `BlockHeader` length (every field is fixed-width).
+    pub const ENCODED_HEADER_LEN: usize = 8_203;
+    /// Encoded `ShareProof` length (every field is fixed-width).
+    pub const ENCODED_SHARE_LEN: usize = 8_059;
     /// Lower clamp for any lottery target.
     pub const MIN_TARGET: u128 = 1u128 << 64;
     /// Operand length of an `ExactDot` job (`= work::TILE_DIM`).
@@ -968,6 +973,10 @@ pub enum WireMessage {
         /// Blocks in ascending height order.
         blocks: Vec<Block>,
     },
+    /// A Fresh Work share proof the sender has verified (signature and work), so any
+    /// miner can include it in its next block (v3). Appended last to keep the
+    /// discriminants of the earlier variants; boxed like `GossipBlock`.
+    GossipShare(Box<ShareProof>),
 }
 
 #[cfg(test)]

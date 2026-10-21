@@ -242,6 +242,7 @@ tr.flash-row { animation: rowflash 1.2s ease; }
     <span>Epoch: <b id="h-epoch">0</b></span>
     <span>Rate: <b id="h-rate">0.0</b> att/s (E[seal]=<b id="h-exp">-</b>)</span>
     <span>Mempool: <b id="h-mempool">0</b></span>
+    <span>Share pool: <b id="h-sharepool">0</b></span>
   </div>
 </header>
 
@@ -636,6 +637,7 @@ tr.flash-row { animation: rowflash 1.2s ease; }
       document.getElementById("h-rate").textContent = st.mining.attempts_per_sec.toFixed(1);
       document.getElementById("h-exp").textContent = st.tip.expected_attempts_per_seal;
       document.getElementById("h-mempool").textContent = st.mempool.size;
+      document.getElementById("h-sharepool").textContent = st.mining.share_pool;
       document.getElementById("s-cw").textContent = st.commercial_consensus_weight;
 
       renderLedger(st.ledger);

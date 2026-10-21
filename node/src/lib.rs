@@ -13,6 +13,7 @@ pub mod keystore;
 pub mod mempool;
 pub mod net;
 pub mod rpc;
+pub mod share_pool;
 pub mod store;
 
 use std::net::SocketAddr;

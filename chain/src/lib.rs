@@ -23,17 +23,17 @@ pub use core_adapter::{
     validate_job_stateless, verify_fresh_work, verify_header_miner, verify_job_client,
     verify_ml_dsa_87, verify_share_owner,
 };
-pub use core_adapter::{block_relay_id, job_relay_id};
+pub use core_adapter::{block_relay_id, job_relay_id, share_relay_id};
 pub use difficulty::{
     ChainView, expected_targets, scale_target, seal_weight, share_target_for, share_weight, work_of,
 };
 pub use keys::OwnerKeypair;
 pub use stf::{
-    DerivedBody, NodeState, OpenJob, ShareRecord, StfError, VerifiedShare, apply_body,
+    DerivedBody, NodeState, OpenJob, ShareRecord, SignedShare, StfError, VerifiedShare, apply_body,
     compute_ledger_digest, to_category_delta,
 };
 pub use template::{Template, build_template};
 pub use tree::{
     AncestorChainView, BlockMeta, BlockSummary, BlockTree, InsertOutcome, JobSummary,
-    ReceiptSummary, ShareSummary, TreeError,
+    ReceiptSummary, ShareCheck, ShareSummary, TreeError,
 };

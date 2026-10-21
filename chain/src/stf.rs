@@ -162,6 +162,34 @@ impl VerifiedShare {
     }
 }
 
+/// A share proof together with its [`VerifiedShare`] view, as kept in a share pool.
+///
+/// [`SignedShare::verify`] is the only constructor, so the two always belong
+/// together and the owner signature is checked exactly once, on entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedShare {
+    proof: ShareProof,
+    verified: VerifiedShare,
+}
+
+impl SignedShare {
+    /// Verifies the proof's owner signature (not its work) and pairs it with its view.
+    pub fn verify(proof: ShareProof) -> Result<Self, SignatureError> {
+        let verified = VerifiedShare::verify(&proof)?;
+        Ok(Self { proof, verified })
+    }
+
+    /// The share proof.
+    pub fn proof(&self) -> &ShareProof {
+        &self.proof
+    }
+
+    /// Its verified `apply_body` view.
+    pub fn verified(&self) -> &VerifiedShare {
+        &self.verified
+    }
+}
+
 /// Derived body commitments produced by `apply_body` (§5.3, §7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DerivedBody {

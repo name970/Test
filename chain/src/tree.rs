@@ -231,6 +231,21 @@ fn invalid(reason: impl Into<String>) -> TreeError {
     TreeError::Invalid(reason.into())
 }
 
+/// Outcome of the checks a gossiped share passes before its work is verified
+/// ([`BlockTree::check_gossip_share`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShareCheck {
+    /// Every check that needs no work passed: verify the signature and the work next.
+    Verify,
+    /// The share's parent block is not in the tree; it may still be on its way.
+    UnknownParent(Digest),
+    /// Possibly honest but of no use here (stale, already registered, ...): drop it
+    /// without penalizing the sender.
+    Ignore(&'static str),
+    /// No honest node relays this share: penalize the sender.
+    Invalid(String),
+}
+
 /// Outcome of inserting a verified block into `BlockTree`.
 #[derive(Clone, Debug)]
 pub struct InsertOutcome {
@@ -567,6 +582,62 @@ impl BlockTree {
             return Err(invalid("share difficulty context mismatch"));
         }
         Ok(())
+    }
+
+    /// Checks a gossiped share against everything that needs no work recomputation,
+    /// before it may enter the share pool.
+    ///
+    /// Context constants and the owner binding must hold on any chain. If the parent is
+    /// known, the height, anchor and targets are checked on the parent's own branch, so
+    /// an honest share from a side branch still passes. Shares outside the inclusion
+    /// window of the canonical tip, or already registered on it, are ignored. Whether a
+    /// pooled share fits a given template is decided again when the template is built.
+    pub fn check_gossip_share(&self, sh: &ShareProof) -> ShareCheck {
+        let (program_id, air_id) = compute_program_and_air_ids();
+        let c = &sh.context;
+        if let Err(e) = self.check_context_constants(c, program_id, air_id) {
+            return ShareCheck::Invalid(format!("share: {e}"));
+        }
+        let owner_key_id = owner_key_id(&sh.owner_key);
+        if c.miner_policy_digest != compute_miner_policy_digest(&owner_key_id)
+            || c.payout_policy_digest != compute_payout_policy_digest(&owner_key_id)
+        {
+            return ShareCheck::Invalid("share policy digest mismatch".into());
+        }
+        let s = c.height;
+        if s < 1 {
+            return ShareCheck::Invalid("share height 0".into());
+        }
+        let next = self.tip_meta().height + 1;
+        if s < next.saturating_sub(self.genesis.share_inclusion_window) {
+            return ShareCheck::Ignore("share is outside the inclusion window");
+        }
+        if self.tip_state().shares.contains_key(&sh.work_id) {
+            return ShareCheck::Ignore("share already registered");
+        }
+        let Some(parent) = self.metas.get(&c.parent_canonical_id) else {
+            return ShareCheck::UnknownParent(c.parent_canonical_id);
+        };
+        if parent.height + 1 != s {
+            return ShareCheck::Invalid(format!(
+                "share height {s} does not follow its parent at {}",
+                parent.height
+            ));
+        }
+        let Some(view) = self.ancestor_view(parent.id) else {
+            return ShareCheck::Ignore("share parent branch unavailable");
+        };
+        if c.stable_anchor_id != view.block_id_at(s.saturating_sub(self.genesis.anchor_depth)) {
+            return ShareCheck::Invalid("share stable_anchor_id mismatch".into());
+        }
+        let (exp_seal, exp_share) = expected_targets(s, &view, &self.genesis);
+        if sh.share_target != exp_share {
+            return ShareCheck::Invalid("share_target mismatch".into());
+        }
+        if c.parent_derived_difficulty_context != compute_difficulty_context(exp_seal, exp_share) {
+            return ShareCheck::Invalid("share difficulty context mismatch".into());
+        }
+        ShareCheck::Verify
     }
 
     /// Verifies the ML-DSA-87 signatures of the header, every job and every share.

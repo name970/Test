@@ -16,10 +16,12 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 use wire::{
     Block, Digest, HANDSHAKE_TIMEOUT, MAX_FRAME_BYTES, MAX_REORG_DEPTH, MAX_SYNC_BLOCKS,
-    MAX_SYNC_BYTES, SYNC_LOOKBACK, SYNC_TIMEOUT, WIRE_VERSION, WireMessage, codec,
+    MAX_SYNC_BYTES, SYNC_LOOKBACK, SYNC_TIMEOUT, ShareProof, WIRE_VERSION, WireMessage, codec,
 };
 
-use crate::chain_actor::{ChainCmd, ChainEvent, ImportAck, Origin, PeerId, StatusSnapshot};
+use crate::chain_actor::{
+    ChainCmd, ChainEvent, ImportAck, Origin, PeerId, ShareAck, StatusSnapshot,
+};
 use crate::mempool::{MempoolCmd, MempoolEvent, MempoolReject};
 
 /// Ban for protocol violations (bad frames, unexpected messages), §4.8.
@@ -28,6 +30,16 @@ const PROTOCOL_BAN: Duration = Duration::from_secs(60);
 const INVALID_BAN: Duration = Duration::from_secs(600);
 /// Invalid jobs tolerated per connection before a ban.
 const MAX_INVALID_JOBS: u32 = 10;
+/// Gossiped shares a peer may send per minute that turn out useless (ignored, or a
+/// duplicate under a new encoding). Past it, the peer's shares are dropped unread for
+/// the rest of the minute. Honest peers relay a few shares per block.
+const MAX_USELESS_SHARES_PER_MIN: u32 = 256;
+/// Inbound connections accepted per remote IP (loopback is exempt: local testnets).
+/// Generous, for honest nodes sharing a NAT address; it bounds sockets and per-peer
+/// budgets per IP.
+const MAX_INBOUND_PER_IP: usize = 16;
+/// Recently disconnected peers remembered so that a late rejection still bans them.
+const DEPARTED_MEMORY: usize = 1_024;
 /// Accepted blocks more than this far below the tip are not relayed: peers that
 /// need them fetch them with `SyncRequest`.
 const RELAY_DEPTH: u64 = 2 * SYNC_LOOKBACK;
@@ -54,6 +66,8 @@ struct PeerHandle {
     tx: mpsc::Sender<WireMessage>,
     best_height: u64,
     invalid_jobs: u32,
+    useless_shares: u32,
+    useless_window: Instant,
 }
 
 #[derive(Default)]
@@ -82,6 +96,11 @@ impl<T: Copy + Eq + std::hash::Hash> LruSeen<T> {
         }
     }
 
+    /// Whether `item` was seen.
+    fn contains(&self, item: &T) -> bool {
+        self.set.contains(item)
+    }
+
     /// Records `item`; returns false if it was already seen.
     fn mark_seen(&mut self, item: T) -> bool {
         if !self.set.insert(item) {
@@ -101,10 +120,16 @@ struct NetShared {
     peers: HashMap<PeerId, PeerHandle>,
     bans: HashMap<BanKey, Instant>,
     /// Relay ids (`chain::block_relay_id`), not block ids: a copy with a forged
-    /// signature has the honest `block_id` and must not shadow the genuine block.
+    /// signature or body has the honest `block_id` and must not shadow the genuine block.
     seen_blocks: LruSeen<Digest>,
     /// Relay ids (`chain::job_relay_id`), not tx ids, for the same reason.
     seen_jobs: LruSeen<Digest>,
+    /// Relay ids (`chain::share_relay_id`), not work ids, for the same reason.
+    seen_shares: LruSeen<Digest>,
+    /// Addresses of recently disconnected peers, newest last.
+    departed: VecDeque<(PeerId, SocketAddr)>,
+    /// Open inbound connections per remote IP (loopback not counted).
+    inbound_per_ip: HashMap<IpAddr, usize>,
     paused: bool,
 }
 
@@ -124,6 +149,46 @@ pub struct PeerManager {
     mempool_tx: mpsc::Sender<MempoolCmd>,
     status_rx: watch::Receiver<Arc<StatusSnapshot>>,
     shutdown_rx: watch::Receiver<bool>,
+}
+
+/// One inbound connection counted against its IP's limit; released on drop.
+struct InboundSlot {
+    mgr: Arc<PeerManager>,
+    ip: IpAddr,
+}
+
+impl InboundSlot {
+    /// Counts a new inbound connection from `ip`, or `None` if the IP is at its limit.
+    /// Loopback connections are not limited (they carry a dummy slot).
+    fn reserve(mgr: &Arc<PeerManager>, ip: IpAddr) -> Option<Self> {
+        if !ip.is_loopback() {
+            let mut guard = mgr.lock();
+            let count = guard.inbound_per_ip.entry(ip).or_insert(0);
+            if *count >= MAX_INBOUND_PER_IP {
+                return None;
+            }
+            *count += 1;
+        }
+        Some(Self {
+            mgr: mgr.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for InboundSlot {
+    fn drop(&mut self) {
+        if self.ip.is_loopback() {
+            return;
+        }
+        let mut guard = self.mgr.lock();
+        if let Some(count) = guard.inbound_per_ip.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                guard.inbound_per_ip.remove(&self.ip);
+            }
+        }
+    }
 }
 
 fn is_shutdown(rx: &watch::Receiver<bool>) -> bool {
@@ -163,6 +228,9 @@ impl PeerManager {
                 bans: HashMap::new(),
                 seen_blocks: LruSeen::new(8_192),
                 seen_jobs: LruSeen::new(16_384),
+                seen_shares: LruSeen::new(16_384),
+                departed: VecDeque::new(),
+                inbound_per_ip: HashMap::new(),
                 paused: false,
             }),
             chain_tx,
@@ -183,8 +251,15 @@ impl PeerManager {
                         if mgr.is_banned_or_paused(addr) {
                             continue;
                         }
+                        let Some(slot) = InboundSlot::reserve(&mgr, addr.ip()) else {
+                            debug!(%addr, "Too many inbound connections from this IP");
+                            continue;
+                        };
                         let conn = mgr.clone();
-                        tokio::spawn(async move { conn.run_connection(stream, addr, false).await });
+                        tokio::spawn(async move {
+                            conn.run_connection(stream, addr, false).await;
+                            drop(slot);
+                        });
                     }
                 }
             }
@@ -262,13 +337,17 @@ impl PeerManager {
             let mut backoff_secs = 1u64;
             while !is_shutdown(&sd) {
                 if !mgr.has_peer_addr(peer_addr) && !mgr.is_banned_or_paused(peer_addr) {
-                    match TcpStream::connect(peer_addr).await {
-                        Ok(stream) => {
-                            backoff_secs = 1;
-                            mgr.run_connection(stream, peer_addr, true).await;
-                        }
-                        Err(_) => backoff_secs = (backoff_secs * 2).min(30),
-                    }
+                    // Back off unless the peer accepted us: one that refuses the
+                    // connection (e.g. at its per-IP limit) gets no 1 Hz redial.
+                    let registered = match TcpStream::connect(peer_addr).await {
+                        Ok(stream) => mgr.run_connection(stream, peer_addr, true).await,
+                        Err(_) => false,
+                    };
+                    backoff_secs = if registered {
+                        1
+                    } else {
+                        (backoff_secs * 2).min(30)
+                    };
                 }
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
@@ -288,11 +367,27 @@ impl PeerManager {
         guard.bans.contains_key(&ban_key(addr)) || guard.bans.contains_key(&BanKey::Addr(addr))
     }
 
+    /// Bans the peer's key and drops every connection under it (their loops notice
+    /// within one poll tick).
     fn ban(&self, addr: SocketAddr, duration: Duration, reason: &str) {
         warn!(%addr, secs = duration.as_secs(), reason, "Banning peer");
-        self.lock()
-            .bans
-            .insert(ban_key(addr), Instant::now() + duration);
+        let key = ban_key(addr);
+        let mut guard = self.lock();
+        guard.bans.insert(key, Instant::now() + duration);
+        guard.peers.retain(|_, p| ban_key(p.addr) != key);
+    }
+
+    /// The address to penalize for `pid`: removes a connected peer, or finds one that
+    /// disconnected before its block or share was rejected.
+    fn take_peer_addr(&self, pid: PeerId) -> Option<SocketAddr> {
+        let mut guard = self.lock();
+        guard.peers.remove(&pid).map(|p| p.addr).or_else(|| {
+            guard
+                .departed
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, a)| *a)
+        })
     }
 
     fn has_peer_addr(&self, addr: SocketAddr) -> bool {
@@ -324,7 +419,7 @@ impl PeerManager {
                 };
                 let tip_height = self.status_rx.borrow().tip.height;
                 let height = block.header.context.height;
-                if let Ok(relay_id) = chain::block_relay_id(&block.header) {
+                if let Ok(relay_id) = chain::block_relay_id(&block) {
                     self.lock().seen_blocks.mark_seen(relay_id);
                 }
                 if height + RELAY_DEPTH >= tip_height {
@@ -337,9 +432,31 @@ impl PeerManager {
                 origin: Origin::Peer(pid),
                 reason,
             } => {
-                let addr = self.lock().peers.remove(&pid).map(|p| p.addr);
-                if let Some(addr) = addr {
+                if let Some(addr) = self.take_peer_addr(pid) {
                     warn!(peer = pid, id = ?block_id, %reason, "Peer sent an invalid block");
+                    self.ban(addr, INVALID_BAN, &reason);
+                }
+            }
+            // Own shares go to every peer; verified gossip to every peer but its sender.
+            ChainEvent::ShareAccepted { share, origin } => {
+                let exclude = match origin {
+                    Origin::Peer(pid) => Some(pid),
+                    _ => None,
+                };
+                if let Ok(relay_id) = chain::share_relay_id(&share) {
+                    self.lock().seen_shares.mark_seen(relay_id);
+                }
+                self.broadcast(
+                    &WireMessage::GossipShare(Box::new((*share).clone())),
+                    exclude,
+                );
+            }
+            ChainEvent::ShareRejected {
+                origin: Origin::Peer(pid),
+                reason,
+            } => {
+                if let Some(addr) = self.take_peer_addr(pid) {
+                    warn!(peer = pid, %reason, "Peer sent an invalid share");
                     self.ban(addr, INVALID_BAN, &reason);
                 }
             }
@@ -359,7 +476,9 @@ impl PeerManager {
         self.broadcast(&WireMessage::GossipJob(tx), exclude);
     }
 
-    async fn run_connection(&self, stream: TcpStream, addr: SocketAddr, outbound: bool) {
+    /// Runs one connection to its end. Returns whether the peer completed the
+    /// handshake and was registered.
+    async fn run_connection(&self, stream: TcpStream, addr: SocketAddr, outbound: bool) -> bool {
         let _ = stream.set_nodelay(true);
         let codec = LengthDelimitedCodec::builder()
             .length_field_type::<u32>()
@@ -379,10 +498,10 @@ impl PeerManager {
             }
         };
         let Ok(hs_bytes) = codec::encode(&our_hs) else {
-            return;
+            return false;
         };
         if framed.send(Bytes::from(hs_bytes)).await.is_err() {
-            return;
+            return false;
         }
 
         // Wait at most HANDSHAKE_TIMEOUT for the peer's Handshake (§4.5 step 3).
@@ -402,22 +521,22 @@ impl PeerManager {
                 }) => {
                     if version != WIRE_VERSION || chain_id != self.chain_id {
                         debug!(%addr, version, chain_id, "Handshake version or chain_id mismatch");
-                        return;
+                        return false;
                     }
                     (best_height, best_block_id)
                 }
                 _ => {
                     self.ban(addr, PROTOCOL_BAN, "first frame is not a valid Handshake");
-                    return;
+                    return false;
                 }
             },
             Ok(Some(Err(e))) if e.kind() == std::io::ErrorKind::InvalidData => {
                 self.ban(addr, PROTOCOL_BAN, "oversize frame");
-                return;
+                return false;
             }
             _ => {
                 debug!(%addr, "No handshake from peer");
-                return;
+                return false;
             }
         };
 
@@ -429,7 +548,7 @@ impl PeerManager {
             if guard.paused
                 || (outbound && guard.peers.values().any(|p| p.outbound && p.addr == addr))
             {
-                return;
+                return false;
             }
             guard.peers.insert(
                 peer_id,
@@ -439,6 +558,8 @@ impl PeerManager {
                     tx: write_tx.clone(),
                     best_height: peer_best_height,
                     invalid_jobs: 0,
+                    useless_shares: 0,
+                    useless_window: Instant::now(),
                 },
             );
         }
@@ -506,8 +627,13 @@ impl PeerManager {
                     sync = SyncState::default();
                 }
                 _ = poll.tick() => {
-                    if self.lock().paused {
-                        break Disconnect::Closed;
+                    // Paused, or banned meanwhile: a block or share rejected after its
+                    // asynchronous check removes the peer (ChainEvent::*Rejected).
+                    {
+                        let guard = self.lock();
+                        if guard.paused || !guard.peers.contains_key(&peer_id) {
+                            break Disconnect::Closed;
+                        }
                     }
                     if let Some((await_id, last_h)) = sync.awaiting
                         && self.has_block(await_id).await
@@ -521,11 +647,19 @@ impl PeerManager {
         };
 
         write_task.abort();
-        self.lock().peers.remove(&peer_id);
+        {
+            let mut guard = self.lock();
+            guard.peers.remove(&peer_id);
+            if guard.departed.len() >= DEPARTED_MEMORY {
+                guard.departed.pop_front();
+            }
+            guard.departed.push_back((peer_id, addr));
+        }
         match reason {
             Disconnect::Closed => debug!(peer = peer_id, %addr, "Disconnected peer"),
             Disconnect::Ban(duration, why) => self.ban(addr, duration, &why),
         }
+        true
     }
 
     async fn handle_peer_message(
@@ -541,7 +675,7 @@ impl PeerManager {
             }
             WireMessage::GossipBlock(block) => {
                 let height = block.header.context.height;
-                let Ok(relay_id) = chain::block_relay_id(&block.header) else {
+                let Ok(relay_id) = chain::block_relay_id(&block) else {
                     return Ok(());
                 };
                 {
@@ -594,6 +728,39 @@ impl PeerManager {
                     }
                 }
                 Ok(())
+            }
+            WireMessage::GossipShare(share) => {
+                // Ignored and duplicate shares cost us checks but are free to make (no
+                // signature or work is needed before they are dropped): budget them.
+                // Past the budget the peer is throttled, not banned: an honest peer
+                // that is syncing, or relaying to us while we catch up, sends many.
+                if self.useless_share_budget_spent(peer_id) {
+                    return Ok(());
+                }
+                let Ok(relay_id) = chain::share_relay_id(&share) else {
+                    return Ok(());
+                };
+                if self.lock().seen_shares.contains(&relay_id) {
+                    return Ok(());
+                }
+                let ack = self.import_share(share, peer_id).await;
+                // An ignored share (e.g. its parent had not arrived yet) or a parked one
+                // (its parent may prove a forgery) may be useful when relayed again
+                // later, so only the other outcomes are remembered.
+                if !matches!(ack, ShareAck::Ignored(_) | ShareAck::Parked) {
+                    self.lock().seen_shares.mark_seen(relay_id);
+                }
+                if matches!(ack, ShareAck::Ignored(_) | ShareAck::Duplicate)
+                    && let Some(p) = self.lock().peers.get_mut(&peer_id)
+                {
+                    p.useless_shares = p.useless_shares.saturating_add(1);
+                }
+                // Invalid shares get the peer banned here or, when the work check fails
+                // later, through ChainEvent::ShareRejected.
+                match ack {
+                    ShareAck::Invalid(reason) => Err(Disconnect::Ban(INVALID_BAN, reason)),
+                    _ => Ok(()),
+                }
             }
             WireMessage::SyncRequest { from_height } => {
                 let (reply_tx, reply_rx) = oneshot::channel();
@@ -716,6 +883,32 @@ impl PeerManager {
             return false;
         }
         rx.await.unwrap_or(false)
+    }
+
+    /// Whether the peer has sent its quota of useless shares this minute (or is gone).
+    fn useless_share_budget_spent(&self, peer_id: PeerId) -> bool {
+        let mut guard = self.lock();
+        let Some(p) = guard.peers.get_mut(&peer_id) else {
+            return true;
+        };
+        if p.useless_window.elapsed() >= Duration::from_secs(60) {
+            p.useless_window = Instant::now();
+            p.useless_shares = 0;
+        }
+        p.useless_shares >= MAX_USELESS_SHARES_PER_MIN
+    }
+
+    async fn import_share(&self, share: Box<ShareProof>, peer_id: PeerId) -> ShareAck {
+        let (tx, rx) = oneshot::channel();
+        let cmd = ChainCmd::ImportShare {
+            share,
+            origin: Origin::Peer(peer_id),
+            ack: Some(tx),
+        };
+        if self.chain_tx.send(cmd).await.is_err() {
+            return ShareAck::Duplicate;
+        }
+        rx.await.unwrap_or(ShareAck::Duplicate)
     }
 
     async fn import_block(&self, block: Arc<Block>, peer_id: PeerId) -> ImportAck {

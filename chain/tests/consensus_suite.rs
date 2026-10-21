@@ -7,9 +7,9 @@ use std::sync::Arc;
 use chain::core_adapter::fw_context_to_core;
 use chain::keys::unsigned;
 use chain::{
-    BlockTree, OwnerKeypair, SignatureError, StfError, TreeError, VerifiedShare, WorkError,
-    apply_body, build_template, compute_body_root, compute_difficulty_context, compute_job_ids,
-    verify_ml_dsa_87,
+    BlockTree, OwnerKeypair, ShareCheck, SignatureError, SignedShare, StfError, TreeError,
+    VerifiedShare, WorkError, apply_body, build_template, compute_body_root,
+    compute_difficulty_context, compute_job_ids, verify_ml_dsa_87,
 };
 use ledger::{LedgerError, StateCategory};
 use primitives::{Atoms, TOTAL_SUPPLY};
@@ -117,6 +117,11 @@ fn template_on(
     let anc = tree.ancestor_view(parent_id).unwrap();
     let parent_meta = tree.get_meta(&parent_id).unwrap();
     let parent_state = tree.get_state(&parent_id).unwrap();
+    // As a share pool would: only signature-checked shares enter.
+    let pool: Vec<SignedShare> = shares
+        .iter()
+        .filter_map(|sh| SignedShare::verify(sh.clone()).ok())
+        .collect();
     build_template(
         1,
         tree.genesis(),
@@ -125,7 +130,7 @@ fn template_on(
         parent_meta.height,
         &parent_state,
         mempool,
-        shares,
+        &pool,
         owner,
         parent_meta.time_bucket + 1,
     )
@@ -572,17 +577,10 @@ fn signatures_bind_headers_shares_and_jobs() {
     ));
     assert!(tree.apply_verified_block(Arc::new(forged_share)).is_err());
 
-    // A template never includes a share whose signature fails.
+    // A share whose signature fails never enters a share pool, so no template sees it.
     let mut bad_sig_share = share.clone();
     bad_sig_share.signature.0[0] ^= 0x01;
-    let tpl = template_on(
-        &tree,
-        tree.tip_id(),
-        &miner,
-        &[],
-        std::slice::from_ref(&bad_sig_share),
-    );
-    assert!(tpl.body.shares.is_empty());
+    assert!(SignedShare::verify(bad_sig_share).is_err());
 
     // Job: signed for another genesis, or carrying another client's key.
     let other_genesis = Digest([0xee; DIGEST_LEN]);
@@ -661,4 +659,195 @@ fn ml_dsa_87_matches_an_independent_implementation() {
     corrupted.0[4_000] ^= 0x10;
     assert!(verify_ml_dsa_87(kp.public_key(), &digest, &corrupted).is_err());
     assert!(verify_ml_dsa_87(kp.public_key(), &digest, &unsigned()).is_err());
+}
+
+/// Templates draw shares from the pool, whoever mined them: shares of several owners
+/// are included oldest height first, capped at `max_shares_per_block`, and emitted
+/// strictly sorted by `work_id`. The rest follow in the next block.
+#[test]
+fn templates_include_pool_shares_from_every_owner() {
+    let mut g = fast_genesis();
+    g.max_shares_per_block = 4;
+    let mut tree = BlockTree::new(g).unwrap();
+    let (miner, alice, bob) = (key(1), key(2), key(3));
+    for h in 1..=3 {
+        let blk = mine_block_on(&tree, tree.tip_id(), &miner, &[], &[], h);
+        extend(&mut tree, blk);
+    }
+
+    // Six shares by two other owners, mined at heights 1..=3 on the canonical chain.
+    let mut pool_proofs = Vec::new();
+    for (owner, parent_h, nonce) in [
+        (&alice, 0, 100),
+        (&alice, 1, 101),
+        (&bob, 1, 102),
+        (&alice, 2, 103),
+        (&bob, 2, 104),
+        (&bob, 2, 105),
+    ] {
+        let parent = tree.canonical_id_at(parent_h).unwrap();
+        pool_proofs.push(mine_share_on(&tree, parent, owner, nonce));
+    }
+    let mut expected = pool_proofs.clone();
+    expected.sort_by_key(|sh| (sh.context.height, sh.work_id));
+    expected.truncate(4);
+    expected.sort_by_key(|sh| sh.work_id);
+
+    let blk = mine_block_on(&tree, tree.tip_id(), &miner, &[], &pool_proofs, 4);
+    assert_eq!(blk.body.shares, expected, "oldest four, sorted by work_id");
+    assert!(
+        blk.body
+            .shares
+            .windows(2)
+            .all(|w| w[0].work_id < w[1].work_id)
+    );
+    extend(&mut tree, blk);
+    let state = tree.tip_state();
+    for sh in &expected {
+        let owner = state.shares[&sh.work_id].owner.key_id();
+        assert_eq!(owner, chain::owner_key_id(&sh.owner_key));
+        assert_ne!(owner, miner.key_id(), "included by another node's miner");
+    }
+
+    // The two left out are included next, while still inside the window.
+    let next = mine_block_on(&tree, tree.tip_id(), &miner, &[], &pool_proofs, 5);
+    assert_eq!(next.body.shares.len(), 2);
+    assert!(next.body.shares.iter().all(|sh| !expected.contains(sh)));
+    extend(&mut tree, next);
+    assert!(
+        template_on(&tree, tree.tip_id(), &miner, &[], &pool_proofs)
+            .body
+            .shares
+            .is_empty(),
+        "registered shares are never included twice"
+    );
+}
+
+/// `check_gossip_share`: honest shares (also from a side branch) go on to work
+/// verification; malformed ones are Invalid (their sender is penalized); stale,
+/// registered or unknown-parent shares are harmless.
+#[test]
+fn gossip_share_checks_sort_honest_stale_and_invalid_shares() {
+    let mut g = fast_genesis();
+    g.share_inclusion_window = 4;
+    let mut tree = BlockTree::new(g).unwrap();
+    let (miner, alice) = (key(1), key(2));
+    for h in 1..=3 {
+        let blk = mine_block_on(&tree, tree.tip_id(), &miner, &[], &[], h);
+        extend(&mut tree, blk);
+    }
+    let tip = tree.tip_id();
+    let honest = mine_share_on(&tree, tip, &alice, 7);
+    assert_eq!(tree.check_gossip_share(&honest), ShareCheck::Verify);
+
+    // An honest share mined on a side branch is checked on its own branch.
+    let side_parent = mine_block_on(
+        &tree,
+        tree.canonical_id_at(2).unwrap(),
+        &alice,
+        &[],
+        &[],
+        50,
+    );
+    tree.pre_validate(&side_parent, None).unwrap();
+    let side_id = side_parent.header.block_id;
+    assert!(
+        !tree
+            .apply_verified_block(Arc::new(side_parent))
+            .unwrap()
+            .tip_changed
+    );
+    let side_share = mine_share_on(&tree, side_id, &alice, 8);
+    assert_eq!(tree.check_gossip_share(&side_share), ShareCheck::Verify);
+
+    let invalid = |sh: &ShareProof| matches!(tree.check_gossip_share(sh), ShareCheck::Invalid(_));
+    let mut other_owner = honest.clone();
+    key(9).sign_share(&mut other_owner).unwrap();
+    assert!(invalid(&other_owner), "the work binds the owner's key id");
+    let mut easy_target = honest.clone();
+    easy_target.share_target = Target(u128::MAX - 1);
+    alice.sign_share(&mut easy_target).unwrap();
+    assert!(invalid(&easy_target));
+    let mut bad_anchor = honest.clone();
+    bad_anchor.context.stable_anchor_id = Digest([3; DIGEST_LEN]);
+    assert!(invalid(&bad_anchor));
+    let mut wrong_chain = honest.clone();
+    wrong_chain.context.chain_id ^= 1;
+    assert!(invalid(&wrong_chain));
+    let mut wrong_height = honest.clone();
+    wrong_height.context.height += 1;
+    assert!(invalid(&wrong_height));
+
+    let mut orphan = honest.clone();
+    orphan.context.parent_canonical_id = Digest([4; DIGEST_LEN]);
+    assert_eq!(
+        tree.check_gossip_share(&orphan),
+        ShareCheck::UnknownParent(Digest([4; DIGEST_LEN]))
+    );
+
+    // Registered once included (the height-4 share fits from block 5 on), stale once it
+    // leaves the window (4 blocks).
+    let b4 = mine_block_on(&tree, tip, &miner, &[], &[], 4);
+    extend(&mut tree, b4);
+    assert_eq!(tree.check_gossip_share(&honest), ShareCheck::Verify);
+    let with_share = mine_block_on(
+        &tree,
+        tree.tip_id(),
+        &miner,
+        &[],
+        std::slice::from_ref(&honest),
+        5,
+    );
+    assert_eq!(with_share.body.shares.len(), 1);
+    extend(&mut tree, with_share);
+    assert!(matches!(
+        tree.check_gossip_share(&honest),
+        ShareCheck::Ignore(_)
+    ));
+    let old = mine_share_on(&tree, tree.canonical_id_at(0).unwrap(), &alice, 9);
+    assert!(matches!(
+        tree.check_gossip_share(&old),
+        ShareCheck::Ignore(_)
+    ));
+}
+
+/// A genesis whose blocks could not hold a full set of shares is rejected: every node
+/// picks the same gossiped shares, so such a template could never be a valid block.
+#[test]
+fn genesis_must_fit_a_full_set_of_shares() {
+    let mut g = fast_genesis();
+    let need = g.max_shares_per_block * wire::ENCODED_SHARE_LEN as u64
+        + wire::ENCODED_HEADER_LEN as u64
+        + chain::core_adapter::BLOCK_HEADROOM;
+    g.max_block_bytes = need;
+    assert!(chain::validate_genesis(&g).is_ok());
+    g.max_block_bytes = need - 1;
+    assert!(chain::validate_genesis(&g).is_err());
+    g.max_shares_per_block = u64::MAX;
+    assert!(chain::validate_genesis(&g).is_err(), "no overflow");
+}
+
+/// At the smallest `max_block_bytes` that `validate_genesis` accepts, a block still
+/// holds a full set of pooled shares.
+#[test]
+fn a_full_set_of_shares_fits_the_smallest_valid_block() {
+    let mut g = fast_genesis();
+    g.max_shares_per_block = 4;
+    g.max_block_bytes = 4 * wire::ENCODED_SHARE_LEN as u64
+        + wire::ENCODED_HEADER_LEN as u64
+        + chain::core_adapter::BLOCK_HEADROOM;
+    let mut tree = BlockTree::new(g).unwrap();
+    let (miner, alice) = (key(1), key(2));
+    for h in 1..=2 {
+        let blk = mine_block_on(&tree, tree.tip_id(), &miner, &[], &[], h);
+        extend(&mut tree, blk);
+    }
+    let shares: Vec<ShareProof> = (0..4)
+        .map(|i| mine_share_on(&tree, tree.canonical_id_at(i % 2).unwrap(), &alice, 300 + i))
+        .collect();
+    let blk = mine_block_on(&tree, tree.tip_id(), &miner, &[], &shares, 3);
+    assert_eq!(blk.body.shares.len(), 4, "no share was trimmed");
+    let size = wire::codec::encode(&blk).unwrap().len() as u64;
+    assert!(size <= tree.genesis().max_block_bytes);
+    extend(&mut tree, blk);
 }

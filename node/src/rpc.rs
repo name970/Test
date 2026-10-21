@@ -145,6 +145,8 @@ struct MiningInfoDto {
     attempts_per_sec: f64,
     shares_found: u64,
     seals_found: u64,
+    /// Verified shares (own and gossiped) waiting for a block.
+    share_pool: usize,
 }
 
 #[derive(Serialize)]
@@ -218,6 +220,7 @@ async fn handle_status(State(state): State<RpcState>) -> Json<StatusResponse> {
             attempts_per_sec: (state.engine.attempts_per_sec() * 10.0).round() / 10.0,
             shares_found: state.engine.shares_found(),
             seals_found: state.engine.seals_found(),
+            share_pool: snap.share_pool,
         },
         mempool: MempoolInfoDto { size: mempool_size },
         ledger: LedgerInfoDto {

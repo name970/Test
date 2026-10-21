@@ -14,7 +14,7 @@ use crate::core_adapter::{
 };
 use crate::difficulty::{ChainView, expected_targets};
 use crate::keys::{OwnerKeypair, unsigned};
-use crate::stf::{NodeState, StfError, VerifiedShare, apply_body};
+use crate::stf::{NodeState, SignedShare, StfError, VerifiedShare, apply_body};
 
 /// Mining template published to the `ConsensusEngine` (§7.4, §8.5).
 #[derive(Clone, Debug)]
@@ -90,21 +90,29 @@ impl Template {
     }
 }
 
-/// Own shares that satisfy the §6.7 inclusion rules for a block at height `h` on `chain`
-/// and carry a valid owner signature, sorted by `work_id`, unique, at most
-/// `max_shares_per_block`, each with its `VerifiedShare`.
+/// The pool shares to include in a block at height `h` on `chain`.
+///
+/// A share qualifies if it satisfies the §6.7 inclusion rules on this branch: inside
+/// the inclusion window, not yet registered, and mined on this chain's ancestor with
+/// its context and target. Pool shares are signature-checked on entry
+/// ([`SignedShare`]) and gossiped ones also work-checked, so neither is redone here.
+///
+/// Up to `max_shares_per_block` shares are taken, oldest height first (those leave the
+/// window soonest), then lowest `work_id`; the result is sorted by `work_id` as
+/// `apply_body` requires.
 fn includable_shares(
     genesis: &GenesisConfig,
     genesis_id: Digest,
     chain: &impl ChainView,
     tip_state: &NodeState,
-    own_shares: &[ShareProof],
+    pool: &[SignedShare],
     h: u64,
-) -> Vec<(ShareProof, VerifiedShare)> {
+) -> Vec<SignedShare> {
     let (program_id, air_id) = compute_program_and_air_ids();
-    let mut shares: Vec<&ShareProof> = own_shares
+    let mut shares: Vec<&SignedShare> = pool
         .iter()
-        .filter(|sh| {
+        .filter(|signed| {
+            let sh = signed.proof();
             let s = sh.context.height;
             if s < 1 || s >= h || s < h.saturating_sub(genesis.share_inclusion_window) {
                 return false;
@@ -131,13 +139,12 @@ fn includable_shares(
                 && sh.share_target == exp_share
         })
         .collect();
-    shares.sort_by_key(|s| s.work_id);
-    shares.dedup_by_key(|s| s.work_id);
-    shares
-        .into_iter()
-        .filter_map(|sh| VerifiedShare::verify(sh).ok().map(|v| (sh.clone(), v)))
-        .take(genesis.max_shares_per_block as usize)
-        .collect()
+    shares.sort_by_key(|s| (s.proof().work_id, s.proof().context.height));
+    shares.dedup_by_key(|s| s.proof().work_id);
+    shares.sort_by_key(|s| (s.proof().context.height, s.proof().work_id));
+    shares.truncate(genesis.max_shares_per_block as usize);
+    shares.sort_by_key(|s| s.proof().work_id);
+    shares.into_iter().cloned().collect()
 }
 
 /// Runs `apply_body` and assembles the body with its derived fields.
@@ -162,7 +169,8 @@ fn derive_body(
 
 /// Builds a new mining `Template` on top of the tip at `tip_height` of `chain` (§7.4).
 ///
-/// Jobs are taken in FIFO order (no fee priority, WP 6.16) as long as the body stays
+/// Shares come from `share_pool`, which holds this node's own shares and the verified
+/// gossiped ones (see `includable_shares`). Jobs are taken in FIFO order (no fee priority, WP 6.16) as long as the body stays
 /// valid; unfundable jobs are skipped and stay in the mempool. Errors only if even an
 /// empty body cannot be derived, which would indicate a corrupted tip state.
 #[allow(clippy::too_many_arguments)]
@@ -174,14 +182,15 @@ pub fn build_template(
     tip_height: u64,
     tip_state: &NodeState,
     mempool_fifo: &[JobTransaction],
-    own_shares: &[ShareProof],
+    share_pool: &[SignedShare],
     miner: &Arc<OwnerKeypair>,
     now_bucket: u64,
 ) -> Result<Template, StfError> {
     let h = tip_height + 1;
     let (mut shares, mut verified): (Vec<ShareProof>, Vec<VerifiedShare>) =
-        includable_shares(genesis, genesis_id, chain, tip_state, own_shares, h)
+        includable_shares(genesis, genesis_id, chain, tip_state, share_pool, h)
             .into_iter()
+            .map(|signed| (signed.proof().clone(), signed.verified().clone()))
             .unzip();
     if apply_body(tip_state, genesis, h, &[], &verified).is_err() {
         shares.clear();
@@ -210,10 +219,23 @@ pub fn build_template(
 
     let mut jobs: Vec<JobTransaction> = selected.into_iter().map(|(_, j)| j).collect();
     let mut body = derive_body(tip_state, genesis, h, jobs.clone(), &shares, &verified)?;
-    // Leave room for the header (8,203 bytes with its key and signature) and framing.
-    let size_limit = genesis.max_block_bytes.saturating_sub(16_384) as usize;
-    while !jobs.is_empty() && codec::encode(&body).map_or(usize::MAX, |b| b.len()) > size_limit {
-        jobs.pop();
+    // A block encodes as its header followed by its body, so the body gets everything
+    // but the fixed-width header.
+    let size_limit = genesis
+        .max_block_bytes
+        .saturating_sub(wire::ENCODED_HEADER_LEN as u64) as usize;
+    let oversized = |body: &BlockBody| codec::encode(body).map_or(true, |b| b.len() > size_limit);
+    while oversized(&body) && !(jobs.is_empty() && shares.is_empty()) {
+        if jobs.pop().is_none() {
+            // validate_genesis leaves BLOCK_HEADROOM beyond a full set of shares for the
+            // body's framing and derived fields, so this needs a degenerate genesis or
+            // huge derived fields. Drop the newest share (most time left in the window).
+            let newest = (0..shares.len())
+                .max_by_key(|&i| (shares[i].context.height, shares[i].work_id))
+                .expect("invariant: shares is not empty here");
+            shares.remove(newest);
+            verified.remove(newest);
+        }
         body = derive_body(tip_state, genesis, h, jobs.clone(), &shares, &verified)?;
     }
 

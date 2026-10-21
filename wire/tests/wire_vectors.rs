@@ -3,10 +3,10 @@
 #![forbid(unsafe_code)]
 
 use wire::{
-    Block, BlockBody, BlockHeader, DIGEST_LEN, DOT_LEN, DifficultyMode, Digest, FeeTransition,
-    FwContext, GenesisConfig, JobPayload, JobTransaction, LeaseAssignment, MAX_FRAME_BYTES,
-    MAX_JOB_BYTES, OwnerReward, PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN, SettlementReceipt,
-    ShareProof, Signature, Target, WireMessage, codec,
+    Block, BlockBody, BlockHeader, DIGEST_LEN, DOT_LEN, DifficultyMode, Digest, ENCODED_HEADER_LEN,
+    ENCODED_SHARE_LEN, FeeTransition, FwContext, GenesisConfig, JobPayload, JobTransaction,
+    LeaseAssignment, MAX_FRAME_BYTES, MAX_JOB_BYTES, OwnerReward, PUBLIC_KEY_LEN, PublicKey,
+    SIGNATURE_LEN, SettlementReceipt, ShareProof, Signature, Target, WireMessage, codec,
 };
 
 fn sample_digest(seed: u8) -> Digest {
@@ -104,7 +104,7 @@ fn appendix_b_encoded_sizes_and_round_trips() {
     // v0 sizes plus the ML-DSA-87 key (2,592 B) and signature (4,627 B) that
     // replace the 8-byte owner (header, share) or the 64-byte client tag (job).
     assert_eq!(header_bytes.len(), 992 - 8 + PUBLIC_KEY_LEN + SIGNATURE_LEN);
-    assert_eq!(header_bytes.len(), 8_203);
+    assert_eq!(header_bytes.len(), ENCODED_HEADER_LEN);
     assert_eq!(codec::decode::<BlockHeader>(&header_bytes).unwrap(), header);
 
     let job = sample_job();
@@ -120,7 +120,7 @@ fn appendix_b_encoded_sizes_and_round_trips() {
     let share = sample_share();
     let share_bytes = codec::encode(&share).unwrap();
     assert_eq!(share_bytes.len(), 848 - 8 + PUBLIC_KEY_LEN + SIGNATURE_LEN);
-    assert_eq!(share_bytes.len(), 8_059);
+    assert_eq!(share_bytes.len(), ENCODED_SHARE_LEN);
     assert_eq!(codec::decode::<ShareProof>(&share_bytes).unwrap(), share);
 
     let genesis = GenesisConfig::default_testnet(1_792_281_600);
@@ -215,6 +215,7 @@ fn appendix_b_encoded_sizes_and_round_trips() {
         },
         WireMessage::GossipBlock(Box::new(block.clone())),
         WireMessage::GossipJob(job),
+        WireMessage::GossipShare(Box::new(sample_share())),
         WireMessage::SyncRequest { from_height: 10 },
         WireMessage::SyncResponse {
             blocks: vec![block],
@@ -272,6 +273,24 @@ fn unsigned_encoding_is_the_encoding_without_the_signature() {
     assert_ne!(
         codec::encode(&resigned).unwrap(),
         codec::encode(&share).unwrap()
+    );
+}
+
+/// `GossipShare` is variant 5: appending it kept the discriminants 0..=4 of v2.
+#[test]
+fn gossip_share_is_appended_as_variant_5() {
+    let share = sample_share();
+    let encoded = codec::encode(&WireMessage::GossipShare(Box::new(share.clone()))).unwrap();
+    assert_eq!(encoded[..4], 5u32.to_le_bytes());
+    assert_eq!(encoded[4..], codec::encode(&share).unwrap()[..]);
+    assert_eq!(encoded.len(), 4 + 8_059);
+    assert_eq!(
+        codec::decode::<WireMessage>(&encoded).unwrap(),
+        WireMessage::GossipShare(Box::new(share))
+    );
+    assert_eq!(
+        codec::encode(&WireMessage::SyncRequest { from_height: 1 }).unwrap()[..4],
+        3u32.to_le_bytes()
     );
 }
 

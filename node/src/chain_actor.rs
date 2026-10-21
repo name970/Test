@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chain::{
-    BlockMeta, BlockSummary, BlockTree, ClaimedWork, Lottery, OwnerKeypair, Template, TreeError,
-    WorkError, block_relay_id, build_template, verify_fresh_work,
+    BlockMeta, BlockSummary, BlockTree, ClaimedWork, Lottery, OwnerKeypair, ShareCheck,
+    SignedShare, Template, TreeError, WorkError, block_relay_id, build_template, owner_key_id,
+    share_relay_id, verify_fresh_work,
 };
 use ledger::StateCategory;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
@@ -22,7 +23,19 @@ use wire::{
 };
 
 use crate::mempool::MempoolView;
+use crate::share_pool::{SHARE_POOL_CAPACITY, SharePool};
 use crate::store::BlockLogWriter;
+
+/// Maximum gossiped shares awaiting their work check (one tile recomputation each),
+/// parked or running. Parked shares count too, so releasing them never exceeds it.
+const SHARE_CHECK_LIMIT: usize = 64;
+/// Per peer: shares parked or awaiting their work check. Honest gossip stays far below.
+const SHARE_PEER_LIMIT: usize = 8;
+
+/// A pending share's slot: (owner key id, work_id). Keyed by owner too because only
+/// the work check ties a work_id to its owner: a validly signed claim to another
+/// owner's work_id must not hold that owner's slot.
+type ShareSlot = (Digest, Digest);
 
 /// Identifier of a connected peer.
 pub type PeerId = u64;
@@ -57,6 +70,22 @@ pub enum ImportAck {
     TooDeep,
 }
 
+/// Immediate acknowledgment of `ChainCmd::ImportShare`, sent before the work check runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShareAck {
+    /// Accepted for verification.
+    Queued,
+    /// Waiting for its parent block, which is being verified. The share is dropped
+    /// without penalty if that block turns out invalid, so it may be relayed again.
+    Parked,
+    /// Already pooled, registered, in flight, parked or rejected before.
+    Duplicate,
+    /// Of no use here (stale, unknown parent, ...); the sender is not penalized.
+    Ignored(&'static str),
+    /// No honest node relays this share; the sender is penalized.
+    Invalid(String),
+}
+
 /// Commands accepted by `ChainActor` (§8.2).
 pub enum ChainCmd {
     /// Imports a block from a peer, the miner or disk.
@@ -70,8 +99,28 @@ pub enum ChainCmd {
     },
     /// A block sealed by the local miner.
     SubmitLocalBlock(Box<Block>),
-    /// A share found by the local miner.
+    /// A share found by the local miner: pooled and gossiped to every peer.
     SubmitLocalShare(Box<ShareProof>),
+    /// A share gossiped by a peer.
+    ImportShare {
+        /// The share.
+        share: Box<ShareProof>,
+        /// Where it came from.
+        origin: Origin,
+        /// Immediate acknowledgment.
+        ack: Option<oneshot::Sender<ShareAck>>,
+    },
+    /// Internal: the work check of a gossiped share finished.
+    ShareVerified {
+        /// The share's (owner key id, work_id).
+        slot: (Digest, Digest),
+        /// The share's relay id.
+        relay_id: Digest,
+        /// Where it came from.
+        origin: Origin,
+        /// The verified share, or why it was rejected.
+        result: Result<Box<SignedShare>, String>,
+    },
     /// Internal: Stage A finished for a block.
     WorkVerified {
         /// The verified block.
@@ -137,6 +186,20 @@ pub enum ChainEvent {
         /// Why.
         reason: String,
     },
+    /// A share entered the pool (own or verified gossip); peers relay it.
+    ShareAccepted {
+        /// The share.
+        share: Arc<ShareProof>,
+        /// Where it came from.
+        origin: Origin,
+    },
+    /// A gossiped share was rejected as invalid; the origin peer is penalized.
+    ShareRejected {
+        /// Where it came from.
+        origin: Origin,
+        /// Why.
+        reason: String,
+    },
     /// The canonical tip changed.
     TipChanged {
         /// New tip (boxed: it carries the 64-byte miner key id).
@@ -191,10 +254,21 @@ pub struct StatusSnapshot {
     pub open_jobs: usize,
     /// Parked blocks waiting for their parent.
     pub orphan_count: usize,
+    /// Verified shares waiting for a block (own and gossiped).
+    pub share_pool: usize,
 }
 
 struct ParkedBlock {
     block: Arc<Block>,
+    relay_id: Digest,
+    origin: Origin,
+}
+
+/// A gossiped share whose signature verified, waiting for its parent's Stage A.
+struct ParkedShare {
+    parent: Digest,
+    slot: ShareSlot,
+    signed: Box<SignedShare>,
     relay_id: Digest,
     origin: Origin,
 }
@@ -256,12 +330,22 @@ pub struct ChainActor {
     status_tx: watch::Sender<Arc<StatusSnapshot>>,
     mempool_view: watch::Receiver<Arc<MempoolView>>,
     verify_sem: Arc<Semaphore>,
+    // Shares get their own, smaller verification budget, so a block's Stage A never
+    // queues behind share gossip.
+    share_verify_sem: Arc<Semaphore>,
     start_instant: Instant,
     template_gen: u64,
-    own_shares: Vec<ShareProof>,
+    share_pool: SharePool,
+    // Work checks in flight by slot. Only a share whose owner signature verified can
+    // take a slot, so a forged copy cannot shadow the genuine share, and re-signed
+    // copies of a pending share (ML-DSA signing is randomized) are dropped before
+    // costing a verification.
+    share_checks: HashMap<ShareSlot, Origin>,
+    parked_shares: VecDeque<ParkedShare>, // oldest first
+    invalid_shares: LruIdCache,           // relay ids
     // Blocks awaiting validation are deduplicated by relay id (`chain::block_relay_id`),
-    // not by block_id: a copy with a forged signature shares the honest block_id and
-    // must not shadow, or get cached as invalid in place of, the genuine block.
+    // not by block_id: a copy with a forged signature or body shares the honest block_id
+    // and must not shadow, or get cached as invalid in place of, the genuine block.
     in_flight: HashMap<Digest, Digest>, // relay_id -> block_id
     parked_by_parent: HashMap<Digest, Vec<ParkedBlock>>,
     parked_order: VecDeque<(Digest, Digest, Digest)>, // (relay_id, block_id, parent_id), oldest first
@@ -284,8 +368,10 @@ impl ChainActor {
         verify_sem: Arc<Semaphore>,
     ) -> Result<(Self, watch::Receiver<Arc<StatusSnapshot>>), String> {
         let tree = BlockTree::new(genesis)?;
+        let share_verify_sem =
+            Arc::new(Semaphore::new((verify_sem.available_permits() / 2).max(1)));
         let start_instant = Instant::now();
-        let status = build_status_snapshot(&tree, &miner, start_instant, 0);
+        let status = build_status_snapshot(&tree, &miner, start_instant, 0, 0);
         let (status_tx, status_rx) = watch::channel(Arc::new(status));
         let mut actor = Self {
             tree,
@@ -298,9 +384,13 @@ impl ChainActor {
             status_tx,
             mempool_view,
             verify_sem,
+            share_verify_sem,
             start_instant,
             template_gen: 0,
-            own_shares: Vec::new(),
+            share_pool: SharePool::new(SHARE_POOL_CAPACITY),
+            share_checks: HashMap::new(),
+            parked_shares: VecDeque::new(),
+            invalid_shares: LruIdCache::new(4_096),
             in_flight: HashMap::new(),
             parked_by_parent: HashMap::new(),
             parked_order: VecDeque::new(),
@@ -401,9 +491,29 @@ impl ChainActor {
                 }
             }
             ChainCmd::SubmitLocalShare(share) => {
-                if !self.own_shares.iter().any(|s| s.work_id == share.work_id) {
-                    self.own_shares.push(*share);
-                    return true;
+                // Our own template's work, Freivalds-checked by the miner: only the
+                // signature check that every pooled share carries.
+                match SignedShare::verify(*share) {
+                    Ok(signed) => return self.admit_share(signed, Origin::Local),
+                    Err(e) => warn!(error = %e, "Local share has an invalid signature"),
+                }
+            }
+            ChainCmd::ImportShare { share, origin, ack } => {
+                let res = self.import_share(share, origin);
+                if let Some(tx) = ack {
+                    let _ = tx.send(res);
+                }
+            }
+            ChainCmd::ShareVerified {
+                slot,
+                relay_id,
+                origin,
+                result,
+            } => {
+                self.share_checks.remove(&slot);
+                match result {
+                    Ok(signed) => return self.admit_share(*signed, origin),
+                    Err(reason) => self.reject_share(relay_id, origin, reason),
                 }
             }
             ChainCmd::WorkVerified {
@@ -484,7 +594,7 @@ impl ChainActor {
 
     fn import_block(&mut self, block: Arc<Block>, origin: Origin) -> ImportAck {
         let block_id = block.header.block_id;
-        let relay_id = match block_relay_id(&block.header) {
+        let relay_id = match block_relay_id(&block) {
             Ok(id) => id,
             Err(e) => return ImportAck::Invalid(format!("unencodable header: {e}")),
         };
@@ -544,6 +654,189 @@ impl ChainActor {
         });
     }
 
+    /// Admits a gossiped share for verification, cheapest checks first: dedupe, the
+    /// no-work checks, per-peer and global limits, then the owner signature here on the
+    /// actor (well under a millisecond). The tile recomputation follows off the actor
+    /// (`ChainCmd::ShareVerified`), or once the parent block passes Stage A if the share
+    /// arrived while it was being verified.
+    fn import_share(&mut self, share: Box<ShareProof>, origin: Origin) -> ShareAck {
+        let relay_id = match share_relay_id(&share) {
+            Ok(id) => id,
+            Err(e) => return ShareAck::Invalid(format!("unencodable share: {e}")),
+        };
+        // The pool holds work-checked shares only, so a work_id there is settled.
+        let slot = (owner_key_id(&share.owner_key), share.work_id);
+        if self.share_pool.contains(&share.work_id)
+            || self.share_checks.contains_key(&slot)
+            || self.parked_shares.iter().any(|p| p.slot == slot)
+            || self.invalid_shares.contains(&relay_id)
+        {
+            return ShareAck::Duplicate;
+        }
+        let parent = match self.tree.check_gossip_share(&share) {
+            ShareCheck::Verify => None,
+            // Shares follow their parent closely: wait if it is in Stage A, so it has
+            // passed Stage B. A parked orphan block's id is unauthenticated and does not
+            // qualify.
+            ShareCheck::UnknownParent(parent) if self.in_flight.values().any(|b| *b == parent) => {
+                Some(parent)
+            }
+            ShareCheck::UnknownParent(_) => return ShareAck::Ignored("share parent is unknown"),
+            ShareCheck::Ignore(why) => return ShareAck::Ignored(why),
+            ShareCheck::Invalid(reason) => {
+                self.reject_share(relay_id, origin, reason.clone());
+                return ShareAck::Invalid(reason);
+            }
+        };
+        if self.share_checks.len() + self.parked_shares.len() >= SHARE_CHECK_LIMIT
+            || self.peer_share_load(origin) >= SHARE_PEER_LIMIT
+        {
+            return ShareAck::Ignored("too many shares awaiting verification");
+        }
+        let signed = match SignedShare::verify(*share) {
+            Ok(signed) => Box::new(signed),
+            Err(e) => {
+                let reason = format!("share signature: {e}");
+                self.reject_share(relay_id, origin, reason.clone());
+                return ShareAck::Invalid(reason);
+            }
+        };
+        match parent {
+            None => {
+                self.spawn_share_work_check(slot, signed, relay_id, origin);
+                ShareAck::Queued
+            }
+            Some(parent) => {
+                self.parked_shares.push_back(ParkedShare {
+                    parent,
+                    slot,
+                    signed,
+                    relay_id,
+                    origin,
+                });
+                ShareAck::Parked
+            }
+        }
+    }
+
+    /// Shares from `origin` that are parked or awaiting their work check.
+    fn peer_share_load(&self, origin: Origin) -> usize {
+        self.share_checks.values().filter(|o| **o == origin).count()
+            + self
+                .parked_shares
+                .iter()
+                .filter(|p| p.origin == origin)
+                .count()
+    }
+
+    /// Takes the share's slot and recomputes its tile off the actor.
+    fn spawn_share_work_check(
+        &mut self,
+        slot: ShareSlot,
+        signed: Box<SignedShare>,
+        relay_id: Digest,
+        origin: Origin,
+    ) {
+        self.share_checks.insert(slot, origin);
+        let sem = self.share_verify_sem.clone();
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
+                tokio::task::spawn_blocking(move || {
+                    let proof = signed.proof();
+                    verify_fresh_work(
+                        &proof.context,
+                        &ClaimedWork::from_share(proof),
+                        proof.share_target,
+                        Lottery::Share,
+                    )
+                    .map_err(|e| format!("share VerifyFW failed: {e}"))?;
+                    Ok(signed)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            }
+            .await;
+            let _ = tx
+                .send(ChainCmd::ShareVerified {
+                    slot,
+                    relay_id,
+                    origin,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    /// Pools a verified share that is still useful and announces it for relay.
+    /// Returns true when the pool changed (a template rebuild is due).
+    fn admit_share(&mut self, signed: SignedShare, origin: Origin) -> bool {
+        let proof = signed.proof();
+        let min_height = (self.tree.tip_meta().height + 1)
+            .saturating_sub(self.tree.genesis().share_inclusion_window);
+        if proof.context.height < min_height
+            || self.tree.tip_state().shares.contains_key(&proof.work_id)
+        {
+            return false;
+        }
+        let share = Arc::new(proof.clone());
+        if !self.share_pool.insert(signed) {
+            return false;
+        }
+        let _ = self
+            .event_tx
+            .send(ChainEvent::ShareAccepted { share, origin });
+        self.publish_status();
+        true
+    }
+
+    fn reject_share(&mut self, relay_id: Digest, origin: Origin, reason: String) {
+        debug!(?origin, %reason, "Rejected share");
+        self.invalid_shares.insert(relay_id);
+        let _ = self
+            .event_tx
+            .send(ChainEvent::ShareRejected { origin, reason });
+    }
+
+    /// Resumes the shares parked for `parent`, now that it is in the tree: the no-work
+    /// checks run again (now on the parent's branch), then the work check.
+    fn release_parked_shares(&mut self, parent: Digest) {
+        let (ready, waiting): (VecDeque<_>, VecDeque<_>) = self
+            .parked_shares
+            .drain(..)
+            .partition(|p| p.parent == parent);
+        self.parked_shares = waiting;
+        for p in ready {
+            if self.share_pool.contains(&p.slot.1) || self.share_checks.contains_key(&p.slot) {
+                continue;
+            }
+            match self.tree.check_gossip_share(p.signed.proof()) {
+                ShareCheck::Verify => {
+                    self.spawn_share_work_check(p.slot, p.signed, p.relay_id, p.origin)
+                }
+                ShareCheck::Invalid(reason) => self.reject_share(p.relay_id, p.origin, reason),
+                ShareCheck::UnknownParent(_) | ShareCheck::Ignore(_) => {}
+            }
+        }
+    }
+
+    /// After a tip change: return the shares of abandoned blocks to the pool, then drop
+    /// what is outside the inclusion window or registered on the new canonical chain.
+    fn refresh_share_pool(&mut self, tip_height: u64, disconnected: &[Arc<Block>]) {
+        for share in disconnected.iter().flat_map(|blk| &blk.body.shares) {
+            // These passed Stage A inside their block; only the signature is rechecked.
+            if let Ok(signed) = SignedShare::verify(share.clone()) {
+                self.share_pool.insert(signed);
+            }
+        }
+        let min_height =
+            (tip_height + 1).saturating_sub(self.tree.genesis().share_inclusion_window);
+        let tip_state = self.tree.tip_state();
+        self.share_pool
+            .prune(min_height, |work_id| tip_state.shares.contains_key(work_id));
+    }
+
     fn spawn_stage_a(&self, block: Arc<Block>, origin: Origin) {
         let sem = self.verify_sem.clone();
         let tx = self.self_tx.clone();
@@ -566,7 +859,7 @@ impl ChainActor {
         result: Result<(), WorkError>,
     ) {
         let block_id = block.header.block_id;
-        let Ok(relay_id) = block_relay_id(&block.header) else {
+        let Ok(relay_id) = block_relay_id(&block) else {
             return;
         };
         self.in_flight.remove(&relay_id);
@@ -575,12 +868,24 @@ impl ChainActor {
             // A Stage A failure shows these bytes are bad, not that no valid block has
             // this block_id (the claims checked here are not all bound by it), so
             // children parked under the block_id stay parked for the genuine parent.
-            Err(err) => self.reject(
-                block_id,
-                relay_id,
-                origin,
-                format!("Stage A VerifyFW failed: {err}"),
-            ),
+            Err(err) => {
+                self.reject(
+                    block_id,
+                    relay_id,
+                    origin,
+                    format!("Stage A VerifyFW failed: {err}"),
+                );
+                self.drop_parked_shares_unless_pending(block_id);
+            }
+        }
+    }
+
+    /// Drops, without penalty, the shares parked for `block_id` unless another copy
+    /// of that block is still in Stage A. A block id is unauthenticated until Stage A
+    /// passes, so shares parked behind a block that fails it may name a fabricated one.
+    fn drop_parked_shares_unless_pending(&mut self, block_id: Digest) {
+        if !self.in_flight.values().any(|b| *b == block_id) {
+            self.parked_shares.retain(|p| p.parent != block_id);
         }
     }
 
@@ -608,7 +913,7 @@ impl ChainActor {
                     origin,
                 });
                 if outcome.tip_changed {
-                    self.prune_own_shares(outcome.meta.height);
+                    self.refresh_share_pool(outcome.meta.height, &outcome.disconnected);
                     self.publish_status();
                     self.rebuild_and_publish_template();
                     let _ = self.event_tx.send(ChainEvent::TipChanged {
@@ -617,30 +922,27 @@ impl ChainActor {
                         disconnected: outcome.disconnected,
                     });
                 }
-                // Re-submit the parked blocks whose parent is this block (§8.3).
+                // Re-submit the parked blocks and shares whose parent is this block (§8.3).
                 for child in self.take_parked_children(block_id) {
                     let _ = self.import_block(child.block, child.origin);
                 }
+                self.release_parked_shares(block_id);
             }
             // After Stage A the header's claims match its block_id, and the body is bound
             // by body_core_root, so this failure condemns every block with this block_id.
             Err(TreeError::Invalid(reason)) => {
-                if let Ok(relay_id) = block_relay_id(&block.header) {
+                if let Ok(relay_id) = block_relay_id(&block) {
                     self.reject(block_id, relay_id, origin, reason);
                 }
                 self.drop_parked_children(block_id);
+                // Shares mined on an invalid block can never be included.
+                self.parked_shares.retain(|p| p.parent != block_id);
             }
-            Err(other) => debug!(id = ?block_id, error = %other, "Block not applied"),
+            Err(other) => {
+                debug!(id = ?block_id, error = %other, "Block not applied");
+                self.drop_parked_shares_unless_pending(block_id);
+            }
         }
-    }
-
-    fn prune_own_shares(&mut self, tip_height: u64) {
-        let min_share_h =
-            (tip_height + 1).saturating_sub(self.tree.genesis().share_inclusion_window);
-        let tip_state = self.tree.tip_state();
-        self.own_shares.retain(|sh| {
-            sh.context.height >= min_share_h && !tip_state.shares.contains_key(&sh.work_id)
-        });
     }
 
     fn park(&mut self, parent: Digest, block: Arc<Block>, relay_id: Digest, origin: Origin) {
@@ -707,6 +1009,7 @@ impl ChainActor {
             &self.miner,
             self.start_instant,
             self.parked_order.len(),
+            self.share_pool.len(),
         );
         let _ = self.status_tx.send(Arc::new(snap));
     }
@@ -724,7 +1027,7 @@ impl ChainActor {
             tip_meta.height,
             &tip_state,
             &mempool_txs,
-            &self.own_shares,
+            self.share_pool.as_slice(),
             &self.miner,
             now_bucket,
         );
@@ -808,6 +1111,7 @@ fn build_status_snapshot(
     miner: &OwnerKeypair,
     start_instant: Instant,
     orphan_count: usize,
+    share_pool: usize,
 ) -> StatusSnapshot {
     let state = tree.tip_state();
     let ledger = &state.ledger;
@@ -833,5 +1137,6 @@ fn build_status_snapshot(
         pending_payout: state.pending_payout,
         open_jobs: state.open_jobs.len(),
         orphan_count,
+        share_pool,
     }
 }
