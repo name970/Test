@@ -181,15 +181,16 @@ run_public() {
   local p2p=${PLAUTHIUM_P2P_LISTEN:-0.0.0.0:30333}
   local rpc=${PLAUTHIUM_RPC_LISTEN:-127.0.0.1:8080}
   local bootnodes=${PLAUTHIUM_BOOTNODES-$DEFAULT_BOOTNODES}
-  local args=() b
-  bootnodes=${bootnodes//,/ }
-  for b in $bootnodes; do
+  local args=() b list=
+  for b in ${bootnodes//,/ }; do
     args+=(--peer "$b")
+    list="${list:+$list }$b"
   done
+  bootnodes=$list
   if [ "$MODE" = join ]; then
     args+=(--mining-threads "${PLAUTHIUM_MINING_THREADS:-1}")
     # Mining before reaching the network would build a private fork from genesis.
-    if [ -n "${bootnodes// /}" ]; then
+    if [ -n "$bootnodes" ]; then
       args+=(--mine-when-synced)
     fi
   else
@@ -205,14 +206,22 @@ run_public() {
 
   mkdir -p "$data_dir"
   echo "============================================================"
-  if [ "$MODE" = join ]; then
+  if [ "$MODE" = join ] && [ -n "$bootnodes" ]; then
     echo "Joining Plauthium Public Testnet v1 (mining once connected and caught up)"
+  elif [ "$MODE" = join ]; then
+    echo "Running Plauthium Public Testnet v1 without bootnodes (mining from the start)"
   else
     echo "Joining Plauthium Public Testnet v1 (verification only)"
   fi
   show_key "$data_dir" "$key_file"
   echo "  Chain:     $data_dir (kept across runs; PLAUTHIUM_RESET=1 wipes it)"
-  echo "  Bootnodes: ${bootnodes:-none (mining alone)}"
+  if [ -n "$bootnodes" ]; then
+    echo "  Bootnodes: $bootnodes"
+  elif [ "$MODE" = join ]; then
+    echo "  Bootnodes: none (mining alone)"
+  else
+    echo "  Bootnodes: none"
+  fi
   echo "  P2P:       $p2p"
   echo "  Explorer:  http://$rpc/"
   echo "Press Ctrl-C to stop."
