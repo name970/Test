@@ -7,7 +7,7 @@ testnet crates wrap it into a multi-node P2P network, as specified in
 and every public item is documented.
 
 ```sh
-cargo test --workspace --release   # 53 tests, including the 3-node integration test (~1 min)
+cargo test --workspace --release   # 55 tests, including the 3-node integration test (~1 min)
 cargo run -p poc                   # core: mock block transition + ASCII summary
 scripts/local_testnet.sh           # 3 mining nodes on localhost with live explorers
 ```
@@ -18,7 +18,7 @@ Run the tests in release mode. Every block involves at least one real 512×512 t
 
 | Crate        | Spec      | Contents |
 |--------------|-----------|----------|
-| `primitives` | §1.3–1.4, Table 3, §7.10 | `Atoms` (1 PLAU = 10^8 atoms), supply `M = 1.5·10^15`, `Mersenne61` field (`p = 2^61 − 1`), `DomainSeparatedHash` + `MockXof`, `BlockResourceVector` (5 components), PQ object sizes |
+| `primitives` | §1.3–1.4, Table 3, §7.10 | `Atoms` (1 PLAU = 10^8 atoms), supply `M = 1.5·10^15`, `Mersenne61` field (`p = 2^61 − 1`), `DomainSeparatedHash` (SHA3-512) + `Shake256Xof` (SHAKE256), `BlockResourceVector` (5 components), PQ object sizes |
 | `work`       | §3.1–3.2, §5.1–5.2 | 512×512 INT8 `WorkUnit` over `[-127, 127]`, INT32 `AccumulationTarget` with `\|z\| ≤ 8,258,048 < 2^23`, exact tile product, 16-field Fresh Work context, seed expansion by byte rejection, `verify_freivalds_rounds` (`r_F = 6`) |
 | `scivm`      | §3.6      | `OzakiIIProfile` (pairwise-coprime moduli ≤ 255, `Q > 2·B_rec`), `split_residues`, centered CRT, exact residue dot product, zero consensus weight |
 | `scheduler`  | §6.1–6.5  | `ShareID`, sequential D'Hondt (`w_s/(a_s+1)` by exact cross-multiplication, ties to least ShareID), owner capacity, persistent cohort counters |
@@ -60,9 +60,9 @@ the CLI.
 
 ## Known gaps accepted for testnet v0 (blueprint §1.2)
 
-1. **Placeholder cryptography.** `DomainSeparatedHash` and the XOF are non-cryptographic
-   placeholders (`poc/src/main.rs` line 11), so no identifier is collision resistant. The
-   testnet assumes honest participants.
+1. ~~**Placeholder cryptography.**~~ Closed in v1: `DomainSeparatedHash` is SHA3-512 and
+   the XOF is SHAKE256 (FIPS 202, RustCrypto `sha3`/`shake`). Signatures are still missing
+   (gap 2), so the testnet still assumes honest participants.
 2. **No signatures.** Owners are self-declared integers. Jobs debit the aggregate `U` (the
    core ledger has no per-account ownership; see `ledger/src/lib.rs` lines 18–21), so `U`
    acts as a shared testnet faucet.
@@ -82,7 +82,9 @@ the CLI.
 
 ## Core adapter (blueprint §13.2 A1)
 
-The core crates are unchanged except for one additive method in `primitives`:
+The core math is unchanged. `primitives` gained one additive method, and v1 swapped its
+hash backend to SHA3-512/SHAKE256 behind the same interface (the XOF type is now
+`Shake256Xof`, formerly `MockXof`):
 
 ```rust
 impl DomainSeparatedHash {
@@ -96,9 +98,9 @@ hashes lives in `chain::core_adapter`.
 
 ## PoC placeholders in the core
 
-- **Hashing:** `DomainSeparatedHash` and `MockXof` are deterministic but *not cryptographic*.
-  They stand in for SHA3-512 and SHAKE256 and keep the normative interface: a domain label,
-  an injective length-prefixed encoding, and 64-byte digests.
+- **Hashing (real since v1):** `DomainSeparatedHash` is SHA3-512 and `Shake256Xof` is
+  SHAKE256, both over the normative encoding: a domain label, an injective length-prefixed
+  encoding, and 64-byte digests.
 - **Not implemented:** ML-DSA-87, SLH-DSA, ML-KEM, the Circle STARK, P-DAL and zk-TWL notes.
 - **Share weights:** `ShareWeight` is `u64`. The normative `w_s = ⌊2^640/Θ_S⌋` needs a bignum.
   With `u64` weights, every D'Hondt and payout cross-product is exact in `u128`.

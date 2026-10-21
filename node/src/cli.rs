@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const KNOWN_GAPS_HELP: &str = "\
 KNOWN V0 TESTNET GAPS (blueprint §1.2):
-  1. Placeholder cryptography: DomainSeparatedHash and the XOF are non-cryptographic placeholders.
+  1. (Closed in v1) Hashing is SHA3-512 and SHAKE256 (FIPS 202); signatures are still missing (gap 2).
   2. No signatures: owner IDs are self-declared integers; Circulating (U) acts as a shared testnet faucet.
   3. VerifyFW by recomputation: validators recompute 512x512 INT8 tiles (no Circle STARK, no P-DAL).
   4. Shares are not gossiped: miners include only their own shares in their own blocks.

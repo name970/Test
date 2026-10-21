@@ -9,7 +9,7 @@
 
 use core::fmt;
 
-use primitives::{DomainHasher, DomainSeparatedHash, Mersenne61, MockXof, labels};
+use primitives::{DomainHasher, DomainSeparatedHash, Mersenne61, Shake256Xof, labels};
 
 /// Tile dimension `n = 512`.
 pub const TILE_DIM: usize = 512;
@@ -329,9 +329,9 @@ pub struct FreshWorkInstance {
 /// `Map(b) = b - 127` for `b` in `{0, ..., 254}`, and `b = 255` is rejected,
 /// so entries are exactly uniform on `[-127, 127]`.
 ///
-/// The byte stream is the [`MockXof`] placeholder for SHAKE256.
+/// The byte stream is [`Shake256Xof`], `SHAKE256(Enc(label, seed))`.
 pub fn expand_seed(label: &str, seed: &DomainSeparatedHash) -> WorkUnit {
-    let mut xof = MockXof::new(label, seed);
+    let mut xof = Shake256Xof::new(label, seed);
     let mut data = Vec::with_capacity(TILE_ELEMS);
     while data.len() < TILE_ELEMS {
         let byte = xof.next_byte();
@@ -395,9 +395,6 @@ impl FreshWorkIds {
 /// Returns `false` for `rounds == 0`. Consensus uses [`DEFAULT_FREIVALDS_ROUNDS`].
 /// The matrix types already enforce the tile domains, which is what makes
 /// agreement modulo `p` imply equality over the integers (eq. 3.3).
-///
-/// **PoC status:** the transcript hash and XOF are placeholders (see
-/// [`primitives::DomainSeparatedHash`]); the field arithmetic is exact.
 pub fn verify_freivalds_rounds(
     a: &Matrix<i8>,
     b: &Matrix<i8>,
@@ -426,7 +423,7 @@ pub fn verify_freivalds_rounds(
 fn challenge_vector(transcript: &DomainSeparatedHash, round: u64) -> Vec<Mersenne61> {
     let mut round_seed = DomainHasher::new(labels::FW_FREIVALDS);
     round_seed.field_digest(transcript).field_u64(round);
-    let mut xof = MockXof::new(labels::FW_FREIVALDS, &round_seed.finalize());
+    let mut xof = Shake256Xof::new(labels::FW_FREIVALDS, &round_seed.finalize());
     let mut v = Vec::with_capacity(TILE_DIM);
     while v.len() < TILE_DIM {
         let candidate = xof.next_u64() & Mersenne61::P;

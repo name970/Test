@@ -4,13 +4,15 @@
 //! field arithmetic is over [`Mersenne61`], and every committed object is a
 //! 512-bit [`DomainSeparatedHash`] of a typed, length-prefixed encoding.
 //!
-//! **PoC status:** [`DomainSeparatedHash`] and [`MockXof`] are deterministic,
-//! *non-cryptographic* placeholders for SHA3-512 and SHAKE256. They keep the
-//! normative interface (label, injective encoding, 64-byte digests) so that the
-//! real primitives can be swapped in without touching callers.
+//! Hashing is FIPS 202: [`DomainSeparatedHash`] is SHA3-512 and [`Shake256Xof`]
+//! is SHAKE256, both over the same injective `Enc(label, f_1, ..., f_k)`.
 
 use core::fmt;
 use core::ops::{Add, AddAssign, Mul, Neg, Sub};
+
+use sha3::Sha3_512;
+use sha3::digest::{ExtendableOutput, FixedOutput, Update, XofReader};
+use shake::{Shake256, Shake256Reader};
 
 // ---------------------------------------------------------------------------
 // Amounts and supply (spec §7.6, eq. 7.18)
@@ -182,11 +184,17 @@ impl Mul for Mersenne61 {
 }
 
 // ---------------------------------------------------------------------------
-// Domain-separated hashing (spec §1.4, eq. 1.3) — PLACEHOLDER for SHA3-512
+// Domain-separated hashing (spec §1.4, eq. 1.3): SHA3-512 and SHAKE256 (FIPS 202)
 // ---------------------------------------------------------------------------
 
 /// Digest length of SHA3-512 in bytes.
 pub const DIGEST_LEN: usize = 64;
+
+/// SHAKE256 rate in bytes: one Keccak-f[1600] permutation squeezes this many.
+const SHAKE256_RATE: usize = 136;
+
+/// Bytes staged per sponge update when encoding integer slices.
+const STAGING_BYTES: usize = 4096;
 
 /// Versioned domain labels fixed by the specification.
 pub mod labels {
@@ -215,14 +223,12 @@ pub mod labels {
     pub const FW_FREIVALDS: &str = "FW/FREIVALDS/v2";
 }
 
-/// A 512-bit digest `H_512(Enc(LABEL/v2, f_1, ..., f_k))`.
+/// A 512-bit digest `H_512(Enc(LABEL/v2, f_1, ..., f_k))`, where `H_512` is
+/// SHA3-512 (FIPS 202).
 ///
 /// Ordering is lexicographic over the 64 bytes, which equals the numeric order
 /// of the digest read as a big-endian integer (spec §1.4) and the canonical
 /// 64-byte-string order used for ShareID tie-breaks (spec §6.3).
-///
-/// **PLACEHOLDER:** the compression function is a non-cryptographic mixer.
-/// Replace with SHA3-512 (FIPS 202) before any security claim is made.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DomainSeparatedHash([u8; DIGEST_LEN]);
 
@@ -277,24 +283,17 @@ impl fmt::Debug for DomainSeparatedHash {
 /// length as a big-endian `u64`, and the field count is bound at finalization.
 /// Field order is fixed by each call site, as the spec requires.
 #[derive(Clone)]
-pub struct DomainHasher {
-    sponge: MockSponge,
-    fields: u64,
-}
+pub struct DomainHasher(Encoder<Sha3_512>);
 
 impl DomainHasher {
     /// Starts a hash under a versioned domain label.
     pub fn new(label: &str) -> Self {
-        let mut sponge = MockSponge::new();
-        sponge.absorb(&(label.len() as u64).to_be_bytes());
-        sponge.absorb(label.as_bytes());
-        DomainHasher { sponge, fields: 0 }
+        DomainHasher(Encoder::new(label))
     }
 
     /// Appends one length-prefixed byte field.
     pub fn field(&mut self, bytes: &[u8]) -> &mut Self {
-        self.begin_field(bytes.len());
-        self.sponge.absorb(bytes);
+        self.0.field(bytes);
         self
     }
 
@@ -310,67 +309,49 @@ impl DomainHasher {
 
     /// Appends a field of `i8` values, one byte each (two's complement).
     pub fn field_i8s(&mut self, values: &[i8]) -> &mut Self {
-        self.begin_field(values.len());
-        for &v in values {
-            self.sponge.absorb_byte(v as u8);
-        }
+        self.0.field_i8s(values);
         self
     }
 
     /// Appends a field of `i32` values, four big-endian bytes each.
     pub fn field_i32s(&mut self, values: &[i32]) -> &mut Self {
-        self.begin_field(values.len() * 4);
-        for &v in values {
-            self.sponge.absorb(&v.to_be_bytes());
-        }
+        self.0.field_i32s(values);
         self
     }
 
     /// Completes the encoding and returns the digest.
     pub fn finalize(&self) -> DomainSeparatedHash {
-        let mut sponge = self.sponge.clone();
-        sponge.absorb(&self.fields.to_be_bytes());
-        DomainSeparatedHash(sponge.squeeze())
-    }
-
-    fn begin_field(&mut self, byte_len: usize) {
-        self.fields += 1;
-        self.sponge.absorb(&(byte_len as u64).to_be_bytes());
+        DomainSeparatedHash(self.0.clone().finish().finalize_fixed().into())
     }
 }
 
-/// Extendable-output stream bound to a label and a seed.
+/// Extendable-output stream `SHAKE256(Enc(label, seed))` (FIPS 202).
 ///
-/// **PLACEHOLDER** for `SHAKE256(Enc(label, seed))`; output block `i` is
-/// `H_512(Enc(label, seed, i))` of the placeholder hash.
+/// The input uses the same injective encoding as [`DomainHasher`], with the
+/// seed as its single field.
 #[derive(Clone)]
-pub struct MockXof {
-    prefix: DomainHasher,
-    counter: u64,
-    block: [u8; DIGEST_LEN],
+pub struct Shake256Xof {
+    reader: Shake256Reader,
+    block: [u8; SHAKE256_RATE],
     offset: usize,
 }
 
-impl MockXof {
+impl Shake256Xof {
     /// Starts a stream for `label` and `seed`.
     pub fn new(label: &str, seed: &DomainSeparatedHash) -> Self {
-        let mut prefix = DomainHasher::new(label);
-        prefix.field_digest(seed);
-        MockXof {
-            prefix,
-            counter: 0,
-            block: [0; DIGEST_LEN],
-            offset: DIGEST_LEN,
+        let mut encoder = Encoder::<Shake256>::new(label);
+        encoder.field(seed.as_bytes());
+        Shake256Xof {
+            reader: encoder.finish().finalize_xof(),
+            block: [0; SHAKE256_RATE],
+            offset: SHAKE256_RATE,
         }
     }
 
     /// Next output byte.
     pub fn next_byte(&mut self) -> u8 {
-        if self.offset == DIGEST_LEN {
-            let mut block = self.prefix.clone();
-            block.field_u64(self.counter);
-            self.block = *block.finalize().as_bytes();
-            self.counter += 1;
+        if self.offset == SHAKE256_RATE {
+            self.reader.read(&mut self.block);
             self.offset = 0;
         }
         let byte = self.block[self.offset];
@@ -388,78 +369,59 @@ impl MockXof {
     }
 }
 
-const SPONGE_LANES: usize = 8;
-const GOLDEN_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
-
-/// Non-cryptographic 512-bit state used by the hashing placeholders.
+/// Streams `Enc(label, f_1, ..., f_k)` into a FIPS 202 sponge. This is the only
+/// place the encoding is defined, so SHA3-512 and SHAKE256 inputs cannot drift.
 #[derive(Clone)]
-struct MockSponge {
-    lanes: [u64; SPONGE_LANES],
-    buffer: [u8; 8],
-    buffered: usize,
-    absorbed: u64,
+struct Encoder<S> {
+    sponge: S,
+    fields: u64,
 }
 
-impl MockSponge {
-    fn new() -> Self {
-        let mut lanes = [0u64; SPONGE_LANES];
-        for (i, lane) in lanes.iter_mut().enumerate() {
-            *lane = mix64(GOLDEN_GAMMA.wrapping_mul(i as u64 + 1));
-        }
-        MockSponge {
-            lanes,
-            buffer: [0; 8],
-            buffered: 0,
-            absorbed: 0,
+impl<S: Default + Update> Encoder<S> {
+    fn new(label: &str) -> Self {
+        let mut sponge = S::default();
+        sponge.update(&(label.len() as u64).to_be_bytes());
+        sponge.update(label.as_bytes());
+        Encoder { sponge, fields: 0 }
+    }
+
+    fn field(&mut self, bytes: &[u8]) {
+        self.begin_field(bytes.len());
+        self.sponge.update(bytes);
+    }
+
+    fn field_i8s(&mut self, values: &[i8]) {
+        self.begin_field(values.len());
+        let mut staged = [0u8; STAGING_BYTES];
+        for chunk in values.chunks(STAGING_BYTES) {
+            for (byte, &v) in staged.iter_mut().zip(chunk) {
+                *byte = v as u8;
+            }
+            self.sponge.update(&staged[..chunk.len()]);
         }
     }
 
-    fn absorb(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.absorb_byte(b);
+    fn field_i32s(&mut self, values: &[i32]) {
+        self.begin_field(values.len() * 4);
+        let mut staged = [0u8; STAGING_BYTES];
+        for chunk in values.chunks(STAGING_BYTES / 4) {
+            for (bytes, v) in staged.chunks_exact_mut(4).zip(chunk) {
+                bytes.copy_from_slice(&v.to_be_bytes());
+            }
+            self.sponge.update(&staged[..chunk.len() * 4]);
         }
     }
 
-    fn absorb_byte(&mut self, byte: u8) {
-        self.buffer[self.buffered] = byte;
-        self.buffered += 1;
-        self.absorbed = self.absorbed.wrapping_add(1);
-        if self.buffered == 8 {
-            self.absorb_word(u64::from_le_bytes(self.buffer));
-            self.buffered = 0;
-        }
+    /// Binds the field count and returns the sponge, ready to finalize.
+    fn finish(mut self) -> S {
+        self.sponge.update(&self.fields.to_be_bytes());
+        self.sponge
     }
 
-    fn absorb_word(&mut self, word: u64) {
-        for i in 0..SPONGE_LANES {
-            let neighbour = self.lanes[(i + SPONGE_LANES - 1) % SPONGE_LANES];
-            self.lanes[i] = mix64(self.lanes[i] ^ word ^ neighbour.rotate_left(17));
-        }
+    fn begin_field(&mut self, byte_len: usize) {
+        self.fields += 1;
+        self.sponge.update(&(byte_len as u64).to_be_bytes());
     }
-
-    fn squeeze(mut self) -> [u8; DIGEST_LEN] {
-        let absorbed = self.absorbed;
-        self.absorb_byte(0x80);
-        while self.buffered != 0 {
-            self.absorb_byte(0);
-        }
-        self.absorb_word(absorbed);
-        for _ in 0..SPONGE_LANES {
-            self.absorb_word(GOLDEN_GAMMA);
-        }
-        let mut out = [0u8; DIGEST_LEN];
-        for (chunk, lane) in out.chunks_exact_mut(8).zip(self.lanes) {
-            chunk.copy_from_slice(&lane.to_be_bytes());
-        }
-        out
-    }
-}
-
-/// SplitMix64 finalizer.
-const fn mix64(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 // ---------------------------------------------------------------------------
@@ -623,14 +585,68 @@ mod tests {
     #[test]
     fn xof_is_deterministic_and_seed_bound() {
         let seed = DomainSeparatedHash::new(labels::FW_INPUT, &[b"x"]);
-        let mut one = MockXof::new(labels::FW_A, &seed);
-        let mut two = MockXof::new(labels::FW_A, &seed);
-        let mut other = MockXof::new(labels::FW_B, &seed);
+        let mut one = Shake256Xof::new(labels::FW_A, &seed);
+        let mut two = Shake256Xof::new(labels::FW_A, &seed);
+        let mut other = Shake256Xof::new(labels::FW_B, &seed);
         let a: Vec<u8> = (0..200).map(|_| one.next_byte()).collect();
         let b: Vec<u8> = (0..200).map(|_| two.next_byte()).collect();
         let c: Vec<u8> = (0..200).map(|_| other.next_byte()).collect();
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn hashing_matches_fips_202_known_answers() {
+        // Expected values come from an independent FIPS 202 implementation
+        // (Python hashlib) over the explicit encoding: u64be(|label|) || label,
+        // then u64be(|f_i|) || f_i for each field, then u64be(field count).
+        assert_eq!(
+            DomainSeparatedHash::new(labels::FW_ID, &[b"abc"]).to_hex(),
+            "0bbb1255d27c9ede113769c8dcd9028660c6ec2ce89f2d8cf8b24957b4f62057\
+             979dad7a89f2b5bb196b0573511be0543dd3ab0930ff95431a6854a69d7ed831"
+        );
+        assert_eq!(
+            DomainSeparatedHash::new(labels::FW_ID, &[]).to_hex(),
+            "9b7a8c1f6c33f951181f03970b17b5b4b245224d48579afa5a3b5b0861bdb877\
+             9fc961acf03fbfcaa0cc91ee3452917b8d107a5b33b169fb23585e4d8019b219"
+        );
+        let mut h = DomainHasher::new(labels::FW_OUTPUT);
+        h.field_i8s(&[-127, 0, 127])
+            .field_i32s(&[-8_258_048, 1])
+            .field_u64(7);
+        assert_eq!(
+            h.finalize().to_hex(),
+            "0296b342b998fe04c9dcaa5eac9b8ae99591dba061909ec5648a99ef7d85e46e\
+             6591b458d83a89b7cf54c4cf8bfeda518d1c9647b8ba5c2ba743cd88d3791c48"
+        );
+
+        let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        let seed = DomainSeparatedHash::from_bytes(core::array::from_fn(|i| i as u8));
+        let mut xof = Shake256Xof::new(labels::FW_A, &seed);
+        let stream: Vec<u8> = (0..288).map(|_| xof.next_byte()).collect();
+        assert_eq!(hex(&stream[..16]), "3e87a59a0f8f451d9f55a6d1ec30bc88");
+        // Offsets 136 and 272 start the second and third squeezed blocks.
+        assert_eq!(hex(&stream[136..152]), "6a79ea70a2473184f15dbba0eb28f0a0");
+        assert_eq!(hex(&stream[272..288]), "6698b5c2f8d8ff674c99ee178145b43c");
+        assert_eq!(
+            Shake256Xof::new(labels::FW_A, &seed).next_u64(),
+            0x3e87_a59a_0f8f_451d
+        );
+    }
+
+    #[test]
+    fn integer_fields_encode_like_their_byte_strings() {
+        // Both lengths cross the 4,096-byte staging buffer.
+        let i8s: Vec<i8> = (0..10_000).map(|i| (i % 255 - 127) as i8).collect();
+        let i32s: Vec<i32> = (0..3_000).map(|i| (i - 1_500) * 5_501).collect();
+        let i8_bytes: Vec<u8> = i8s.iter().map(|&v| v as u8).collect();
+        let i32_bytes: Vec<u8> = i32s.iter().flat_map(|v| v.to_be_bytes()).collect();
+        let mut typed = DomainHasher::new(labels::FW_FREIVALDS);
+        typed.field_i8s(&i8s).field_i32s(&i32s);
+        assert_eq!(
+            typed.finalize(),
+            DomainSeparatedHash::new(labels::FW_FREIVALDS, &[&i8_bytes, &i32_bytes])
+        );
     }
 
     #[test]

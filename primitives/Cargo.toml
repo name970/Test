@@ -2,9 +2,11 @@
 name = "primitives"
 version = "0.1.0"
 edition = "2024"
-description = "Plauthium shared primitives: atoms, supply, Mersenne-61 field, domain-separated hashing, block resources"
+description = "Plauthium shared primitives: atoms, supply, Mersenne-61 field, domain-separated SHA3-512/SHAKE256 hashing, block resources"
 
 [dependencies]
+sha3 = { workspace = true }
+shake = { workspace = true }
 
 [lints]
 workspace = true

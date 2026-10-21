@@ -8,7 +8,7 @@
 //!    Fresh Work rewards from it with segregated rounding dust.
 //! e) ASCII summary.
 //!
-//! Hashes, XOFs and signatures are placeholders (see the `primitives` crate).
+//! Hashing is SHA3-512/SHAKE256 (see the `primitives` crate); signatures are not implemented.
 
 use std::error::Error;
 
@@ -33,7 +33,7 @@ type PocResult<T> = Result<T, Box<dyn Error>>;
 
 fn main() -> PocResult<()> {
     println!("Plauthium PoC - mock block transition");
-    println!("(hash/XOF/signatures are non-cryptographic placeholders)\n");
+    println!("(hash/XOF are SHA3-512/SHAKE256; signatures are not implemented)\n");
 
     // ---------------------------------------------------------------- (a)
     section("a", "Genesis ledger");
