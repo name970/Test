@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plauthium Testnet Explorer</title>
+<style>
+:root {
+  --bg: #f8fafc;
+  --panel: #ffffff;
+  --border: #e2e8f0;
+  --text: #0f172a;
+  --muted: #64748b;
+  --accent: #2563eb;
+  --ok-bg: #dcfce7;
+  --ok-fg: #166534;
+  --err-bg: #fee2e2;
+  --err-fg: #991b1b;
+  --flash: #dbeafe;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b1120;
+    --panel: #111827;
+    --border: #1e293b;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --accent: #3b82f6;
+    --ok-bg: #064e3b;
+    --ok-fg: #a7f3d0;
+    --err-bg: #7f1d1d;
+    --err-fg: #fecaca;
+    --flash: #1e3a8a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.45;
+}
+#offline-banner {
+  display: none;
+  background: var(--err-bg);
+  color: var(--err-fg);
+  padding: 10px 16px;
+  font-weight: 600;
+  text-align: center;
+  border-bottom: 1px solid var(--border);
+}
+header {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 16px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  align-items: center;
+  justify-content: space-between;
+}
+.brand {
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: -0.01em;
+}
+.strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  font-size: 13px;
+}
+.strip span b {
+  font-family: var(--mono);
+}
+main {
+  max-width: 1360px;
+  margin: 0 auto;
+  padding: 16px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+.grid-2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+@media (min-width: 980px) {
+  .grid-2 {
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+  }
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  overflow-x: auto;
+}
+.card h2 {
+  margin: 0 0 12px 0;
+  font-size: 15px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.badge {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+.badge.ok { background: var(--ok-bg); color: var(--ok-fg); }
+.badge.err { background: var(--err-bg); color: var(--err-fg); }
+.stack-bar {
+  display: flex;
+  height: 18px;
+  width: 100%;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--border);
+  margin-bottom: 12px;
+}
+.stack-seg {
+  height: 100%;
+  transition: width 0.25s ease;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th, td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+th { color: var(--muted); font-weight: 600; }
+.num {
+  text-align: right;
+  font-family: var(--mono);
+}
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); font-size: 11px; }
+.log-bar-wrap {
+  width: 90px;
+  height: 8px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.log-bar {
+  height: 100%;
+  background: var(--accent);
+}
+.sub-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.sub-stats b { color: var(--text); font-family: var(--mono); }
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 7px 14px;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 13px;
+}
+button.secondary {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+tr.clickable { cursor: pointer; }
+tr.clickable:hover { background: rgba(100, 116, 139, 0.08); }
+tr.flash-row { animation: rowflash 1.2s ease; }
+@keyframes rowflash {
+  0% { background: var(--flash); }
+  100% { background: transparent; }
+}
+.details-cell {
+  background: var(--bg);
+  padding: 10px 12px;
+  white-space: normal;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+<div id="offline-banner">Node unreachable — retrying every 2s...</div>
+<header>
+  <div class="brand">PLAUTHIUM TESTNET EXPLORER</div>
+  <div class="strip">
+    <span>Chain: <b id="h-chain">-</b> (<b id="h-chain-id">-</b>)</span>
+    <span>Owner: <b id="h-owner">-</b></span>
+    <span>Peers: <b id="h-peers">0</b></span>
+    <span>Tip: <b id="h-height">0</b> (<b id="h-tip-id">-</b>)</span>
+    <span>Epoch: <b id="h-epoch">0</b></span>
+    <span>Rate: <b id="h-rate">0.0</b> att/s (E[seal]=<b id="h-exp">-</b>)</span>
+    <span>Mempool: <b id="h-mempool">0</b></span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>
+      <span>Hybrid Ledger State — 8 Disjoint Balance Categories</span>
+      <span id="inv-badge" class="badge ok">Σ = M = 1,500,000,000,000,000 ✓</span>
+    </h2>
+    <div id="stack-bar" class="stack-bar"></div>
+    <table>
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Category</th>
+          <th class="num">Atoms</th>
+          <th class="num">PLAU (10^8 atoms)</th>
+          <th class="num">Share (ppm)</th>
+          <th>Log10 Scale</th>
+        </tr>
+      </thead>
+      <tbody id="cat-tbody"></tbody>
+    </table>
+    <div class="sub-stats">
+      <span>Founder Locked: <b id="s-flocked">-</b> atoms</span>
+      <span>Segregated Dust: <b id="s-dust">-</b> atoms</span>
+      <span>Fee Lots (R_a): <b id="s-lots">-</b></span>
+      <span>Locked Fees (R_l): <b id="s-locked">-</b></span>
+      <span>Pending Payout: <b id="s-pending">-</b> atoms</span>
+      <span>Open Jobs: <b id="s-openjobs">-</b></span>
+      <span>SciVM Consensus Weight: <b id="s-cw">0</b></span>
+    </div>
+  </section>
+
+  <div class="grid-2">
+    <section class="card">
+      <h2>Live Block Feed (latest 20)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Height</th>
+            <th>BlockID</th>
+            <th>Miner</th>
+            <th class="num">Jobs</th>
+            <th class="num">Receipts</th>
+            <th class="num">Shares</th>
+            <th class="num">ΔU (atoms)</th>
+            <th class="num">ΔR_l (atoms)</th>
+            <th class="num">Δt</th>
+          </tr>
+        </thead>
+        <tbody id="blocks-tbody"></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Submit SciVM Ozaki-II Commercial Job (512-dim ExactDot)</h2>
+      <div class="form-grid">
+        <div><label for="f-client">Client Tag</label><input id="f-client" value="explorer"></div>
+        <div><label for="f-qfee">Queue Fee (PLAU)</label><input id="f-qfee" value="1"></div>
+        <div><label for="f-bfee">Base Fee (PLAU)</label><input id="f-bfee" value="10"></div>
+        <div><label for="f-vexec">v_exec (PLAU)</label><input id="f-vexec" value="80"></div>
+        <div><label for="f-vda">v_da (PLAU)</label><input id="f-vda" value="5"></div>
+        <div><label for="f-vref">v_ref (PLAU)</label><input id="f-vref" value="5"></div>
+        <div><label for="f-seed">Operand Seed</label><input id="f-seed" value="20261018"></div>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="secondary" id="btn-gen">Generate 512 Operands</button>
+        <button type="button" id="btn-submit">Submit Job</button>
+      </div>
+      <div class="sub-stats">
+        <span>Local BigInt Dot Product: <b id="local-dot">-</b></span>
+        <span>Server Expected Result: <b id="server-dot">-</b></span>
+      </div>
+      <div id="submit-msg" style="margin-top:8px;font-size:12px;" class="mono"></div>
+
+      <h2 style="margin-top:18px;">My Submitted Jobs</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Job ID</th>
+            <th>Status</th>
+            <th class="num">Reference Dot</th>
+            <th class="num">Settled Result</th>
+          </tr>
+        </thead>
+        <tbody id="myjobs-tbody"></tbody>
+      </table>
+    </section>
+  </div>
+</main>
+
+<script>
+(function() {
+  const SUPPLY_M = 1500000000000000n;
+  const LOG_M = Math.log10(1 + Number(SUPPLY_M));
+  const COLORS = ["#2563eb", "#64748b", "#d97706", "#94a3b8", "#a855f7", "#10b981", "#f59e0b", "#ec4899"];
+  const INACTIVE = new Set(["S_z", "B_bond", "V_L2"]);
+
+  let lastTipHeight = -1;
+  const knownHeights = new Set();
+  const expandedHeights = new Set();
+  let latestBlocks = [];
+  let xs = [];
+  let ys = [];
+  let localDot = 0n;
+  let myJobs = loadMyJobs();
+
+  function loadMyJobs() {
+    try {
+      const raw = localStorage.getItem("plauthium_my_jobs");
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  function saveMyJobs() {
+    try {
+      localStorage.setItem("plauthium_my_jobs", JSON.stringify(myJobs));
+    } catch (_) {}
+  }
+
+  function esc(value) {
+    return String(value).replace(/[&<>"']/g, ch => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    })[ch]);
+  }
+
+  function groupBigInt(valStr) {
+    const s = String(valStr);
+    const neg = s.startsWith("-");
+    const digits = neg ? s.slice(1) : s;
+    const out = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return neg ? "-" + out : out;
+  }
+
+  function atomsToPlau(atomsStr) {
+    const a = BigInt(atomsStr);
+    const whole = a / 100000000n;
+    const frac = (a % 100000000n).toString().padStart(8, "0");
+    return groupBigInt(whole.toString()) + "." + frac;
+  }
+
+  function plauToAtoms(plauStr) {
+    const s = plauStr.trim();
+    if (!/^\d+(\.\d{1,8})?$/.test(s)) throw new Error("Invalid PLAU amount: " + s);
+    const parts = s.split(".");
+    const whole = BigInt(parts[0]) * 100000000n;
+    const frac = parts[1] ? BigInt(parts[1].padEnd(8, "0")) : 0n;
+    return (whole + frac).toString();
+  }
+
+  // xorshift64* stream; operands stay in [-(2^23 - 1), 2^23 - 1].
+  function generateOperands() {
+    let seed = BigInt(document.getElementById("f-seed").value || "1") & 0xffffffffffffffffn;
+    if (seed === 0n) seed = 1n;
+    function nextRand() {
+      seed ^= seed >> 12n;
+      seed = (seed ^ (seed << 25n)) & 0xffffffffffffffffn;
+      seed ^= seed >> 27n;
+      const r = (seed * 2685821657736338717n) & 0xffffffffffffffffn;
+      return Number(r & 0xffffffn) - 8388607;
+    }
+    xs = [];
+    ys = [];
+    localDot = 0n;
+    for (let i = 0; i < 512; i++) {
+      const a = Math.max(-8388607, Math.min(8388607, nextRand()));
+      const b = Math.max(-8388607, Math.min(8388607, nextRand()));
+      xs.push(a);
+      ys.push(b);
+      localDot += BigInt(a) * BigInt(b);
+    }
+    document.getElementById("local-dot").textContent = groupBigInt(localDot.toString());
+  }
+
+  document.getElementById("btn-gen").addEventListener("click", generateOperands);
+
+  document.getElementById("btn-submit").addEventListener("click", async function() {
+    const msgEl = document.getElementById("submit-msg");
+    msgEl.textContent = "Submitting...";
+    try {
+      const body = {
+        client: document.getElementById("f-client").value.trim(),
+        queue_fee: plauToAtoms(document.getElementById("f-qfee").value),
+        base_fee: plauToAtoms(document.getElementById("f-bfee").value),
+        v_exec: plauToAtoms(document.getElementById("f-vexec").value),
+        v_da: plauToAtoms(document.getElementById("f-vda").value),
+        v_ref: plauToAtoms(document.getElementById("f-vref").value),
+        expiry_blocks: 120,
+        payload: { type: "exact_dot", xs: xs, ys: ys }
+      };
+      const resp = await fetch("/api/submit_job", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const text = await resp.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        msgEl.textContent = "Error (HTTP " + resp.status + "): " + text;
+        return;
+      }
+      if (!resp.ok) {
+        msgEl.textContent = "Error (" + data.error + "): " + data.message;
+        return;
+      }
+      document.getElementById("server-dot").textContent = groupBigInt(data.expected_result);
+      const match = BigInt(data.expected_result) === localDot;
+      msgEl.textContent = "Accepted job_id=" + data.job_id + " (Ozaki-II match=" + (match ? "YES ✓" : "NO ✗") + ")";
+      myJobs.unshift({
+        job_id: data.job_id,
+        tx_id: data.tx_id,
+        ref_dot: localDot.toString(),
+        expected_result: data.expected_result
+      });
+      myJobs = myJobs.slice(0, 25);
+      saveMyJobs();
+      renderMyJobs();
+    } catch (e) {
+      msgEl.textContent = "Submit failed: " + e.message;
+    }
+  });
+
+  function renderLedger(ledger) {
+    const stackEl = document.getElementById("stack-bar");
+    const tbody = document.getElementById("cat-tbody");
+    stackEl.innerHTML = "";
+    tbody.innerHTML = "";
+
+    let sum = 0n;
+    ledger.categories.forEach((c, idx) => {
+      const atoms = BigInt(c.atoms);
+      sum += atoms;
+      const pct = Number((atoms * 1000000n) / SUPPLY_M) / 10000;
+      const seg = document.createElement("div");
+      seg.className = "stack-seg";
+      seg.style.background = COLORS[idx % COLORS.length];
+      seg.style.width = pct + "%";
+      if (atoms > 0n) seg.style.minWidth = "2px";
+      seg.title = c.symbol + ": " + groupBigInt(c.atoms) + " atoms";
+      stackEl.appendChild(seg);
+
+      const ppm = ((atoms * 1000000n) / SUPPLY_M).toString();
+      const logPct = atoms > 0n ? Math.min(100, (Math.log10(1 + Number(atoms)) / LOG_M) * 100) : 0;
+      const inactiveNote = INACTIVE.has(c.symbol) ? ' <span class="muted">(inactive in v0)</span>' : "";
+
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        '<td class="mono"><b>' + esc(c.symbol) + '</b></td>' +
+        '<td>' + esc(c.name) + inactiveNote + '</td>' +
+        '<td class="num">' + groupBigInt(c.atoms) + '</td>' +
+        '<td class="num">' + atomsToPlau(c.atoms) + '</td>' +
+        '<td class="num">' + groupBigInt(ppm) + '</td>' +
+        '<td><div class="log-bar-wrap"><div class="log-bar" style="width:' + logPct.toFixed(1) + '%;background:' + COLORS[idx % COLORS.length] + '"></div></div></td>';
+      tbody.appendChild(tr);
+    });
+
+    const badge = document.getElementById("inv-badge");
+    if (sum === SUPPLY_M && ledger.conserved) {
+      badge.className = "badge ok";
+      badge.textContent = "Σ = M = 1,500,000,000,000,000 ✓";
+    } else {
+      badge.className = "badge err";
+      badge.textContent = "INVARIANT ALERT: Σ - M = " + (sum - SUPPLY_M).toString();
+    }
+
+    document.getElementById("s-flocked").textContent = groupBigInt(ledger.founder_locked);
+    document.getElementById("s-dust").textContent = groupBigInt(ledger.segregated_dust);
+    document.getElementById("s-lots").textContent = ledger.fee_lots;
+    document.getElementById("s-locked").textContent = ledger.locked_fees;
+    document.getElementById("s-pending").textContent = groupBigInt(ledger.pending_payout);
+    document.getElementById("s-openjobs").textContent = ledger.open_jobs;
+  }
+
+  function renderBlocks(blocks) {
+    const tbody = document.getElementById("blocks-tbody");
+    tbody.innerHTML = "";
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i];
+      const prev = blocks[i + 1];
+      const dt = prev ? (b.time_bucket - prev.time_bucket) + "s" : "-";
+
+      let dU = 0n;
+      let dRl = 0n;
+      (b.fee_transitions || []).forEach(ft => {
+        if (ft.delta && ft.delta.U) dU += BigInt(ft.delta.U);
+        if (ft.delta && ft.delta.R_l) dRl += BigInt(ft.delta.R_l);
+      });
+
+      const isNew = knownHeights.size > 0 && !knownHeights.has(b.height);
+      knownHeights.add(b.height);
+
+      const tr = document.createElement("tr");
+      tr.className = "clickable" + (isNew ? " flash-row" : "");
+      const star = b.header_share ? " ★" : "";
+      tr.innerHTML =
+        '<td class="mono"><b>' + b.height + '</b></td>' +
+        '<td class="mono">' + esc(b.block_id.slice(0, 12)) + '..</td>' +
+        '<td class="mono">' + esc(b.miner_owner) + '</td>' +
+        '<td class="num">' + b.jobs.length + '</td>' +
+        '<td class="num">' + b.receipts.length + '</td>' +
+        '<td class="num">' + b.shares.length + star + '</td>' +
+        '<td class="num">' + (dU >= 0n ? "+" : "") + groupBigInt(dU.toString()) + '</td>' +
+        '<td class="num">' + (dRl >= 0n ? "+" : "") + groupBigInt(dRl.toString()) + '</td>' +
+        '<td class="num">' + dt + '</td>';
+
+      tr.addEventListener("click", function() {
+        if (expandedHeights.has(b.height)) expandedHeights.delete(b.height);
+        else expandedHeights.add(b.height);
+        renderBlocks(latestBlocks);
+      });
+      tbody.appendChild(tr);
+
+      if (expandedHeights.has(b.height)) {
+        const dtr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 9;
+        td.className = "details-cell";
+        const ftLines = (b.fee_transitions || []).map(ft =>
+          esc(ft.op) + (ft.job_id ? " (job=" + esc(ft.job_id) + ")" : "") +
+          " ΔU=" + esc(ft.delta.U) + " ΔE_esc=" + esc(ft.delta.E_esc) + " ΔR_a=" + esc(ft.delta.R_a) +
+          " ΔR_l=" + esc(ft.delta.R_l) + " ΔP=" + esc(ft.delta.P_pending)
+        ).join("<br>");
+        const rcLines = (b.receipts || []).map(r =>
+          "Receipt job=" + esc(r.job_id) + " executor=" + esc(r.executor_owner) + " result=" + esc(r.result)
+        ).join("<br>");
+        td.innerHTML = (ftLines || "No fee transitions") + (rcLines ? "<br>" + rcLines : "");
+        dtr.appendChild(td);
+        tbody.appendChild(dtr);
+      }
+    }
+  }
+
+  function renderMyJobs() {
+    const tbody = document.getElementById("myjobs-tbody");
+    tbody.innerHTML = "";
+    myJobs.forEach(mj => {
+      let status = "pending";
+      let settledResult = "-";
+      for (const b of latestBlocks) {
+        for (const r of (b.receipts || [])) {
+          if (r.job_id === mj.job_id) {
+            status = "settled @" + b.height + " (owner " + r.executor_owner + ")";
+            settledResult = groupBigInt(r.result) + (r.result === mj.ref_dot ? " ✓" : " ✗");
+          }
+        }
+        if (status === "pending") {
+          for (const j of (b.jobs || [])) {
+            if (j.job_id === mj.job_id) {
+              status = "admitted @" + b.height + " (lease owner " + j.executor_owner + ")";
+            }
+          }
+        }
+      }
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        '<td class="mono">' + esc(mj.job_id) + '</td>' +
+        '<td class="mono">' + esc(status) + '</td>' +
+        '<td class="num">' + groupBigInt(esc(mj.ref_dot)) + '</td>' +
+        '<td class="num">' + esc(settledResult) + '</td>';
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function poll() {
+    if (document.hidden) return;
+    const banner = document.getElementById("offline-banner");
+    try {
+      const resp = await fetch("/api/status");
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const st = await resp.json();
+      banner.style.display = "none";
+
+      document.getElementById("h-chain").textContent = st.chain.name;
+      document.getElementById("h-chain-id").textContent = st.chain.chain_id;
+      document.getElementById("h-owner").textContent = st.node.owner_id;
+      document.getElementById("h-peers").textContent = st.node.peers;
+      document.getElementById("h-height").textContent = st.tip.height;
+      document.getElementById("h-tip-id").textContent = st.tip.block_id.slice(0, 10) + "..";
+      document.getElementById("h-epoch").textContent = st.tip.epoch;
+      document.getElementById("h-rate").textContent = st.mining.attempts_per_sec.toFixed(1);
+      document.getElementById("h-exp").textContent = st.tip.expected_attempts_per_seal;
+      document.getElementById("h-mempool").textContent = st.mempool.size;
+      document.getElementById("s-cw").textContent = st.commercial_consensus_weight;
+
+      renderLedger(st.ledger);
+
+      if (st.tip.height !== lastTipHeight) {
+        lastTipHeight = st.tip.height;
+        const bResp = await fetch("/api/blocks?limit=20");
+        if (bResp.ok) {
+          const bData = await bResp.json();
+          latestBlocks = bData.blocks || [];
+          renderBlocks(latestBlocks);
+          renderMyJobs();
+        }
+      }
+    } catch (_) {
+      banner.style.display = "block";
+    }
+  }
+
+  generateOperands();
+  renderMyJobs();
+  poll();
+  setInterval(poll, 2000);
+})();
+</script>
+</body>
+</html>

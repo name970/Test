@@ -1,0 +1,37 @@
+[package]
+name = "node"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Testnet multi-node P2P daemon, ConsensusEngine, Axum RPC, and Web Explorer"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "plauthium-node"
+path = "src/main.rs"
+
+[dependencies]
+primitives = { workspace = true }
+work = { workspace = true }
+scivm = { workspace = true }
+ledger = { workspace = true }
+wire = { workspace = true }
+chain = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util"] }
+
+[lints]
+workspace = true

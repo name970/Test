@@ -1,0 +1,10 @@
+[package]
+name = "primitives"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium shared primitives: atoms, supply, Mersenne-61 field, domain-separated hashing, block resources"
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "scivm"
+version = "0.1.0"
+edition = "2024"
+description = "Plauthium Module 1 (SciVM): Ozaki-II residue-splitting profile over native INT8 tiles"
+
+[dependencies]
+primitives = { path = "../primitives" }
+work = { path = "../work" }
+
+[lints]
+workspace = true
