@@ -3,7 +3,7 @@ SEED_NODE_IP=""
 if grep -q "$(printf '\r')" "$0" 2>/dev/null; then printf '%s\n' "note: converting Windows (CRLF) line endings into $0.lf" >&2; tr -d '\r' < "$0" > "$0.lf" && exec bash "$0.lf" "$@"; exit 1; fi #
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi #
 #
-# Plauthium_Testnet.sh: the Plauthium Public Testnet v1 workspace in one script.
+# Plauthium_Testnet.sh: the Plauthium Public Testnet.
 # Source: branch claude/gallant-mccarthy-87dbfp, commit 874e8c5 (48 files, 700388 bytes).
 #
 # SEED_NODE_IP (line 2) is the IP address of a public seed node, dialed on port 30333.
