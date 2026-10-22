@@ -174,6 +174,136 @@ fn extend(tree: &mut BlockTree, block: Block) {
     tree.apply_verified_block(Arc::new(block)).unwrap();
 }
 
+/// Two equal-weight shares; the first reward becomes spendable at height 10.
+fn scheduler_state(g: &GenesisConfig) -> (chain::NodeState, Digest, [Digest; 2]) {
+    let (_, ledger, genesis_id) = chain::validate_genesis(g).unwrap();
+    let mut state = chain::NodeState::genesis(ledger);
+    let ids = [Digest([1; DIGEST_LEN]), Digest([2; DIGEST_LEN])];
+    for h in 1..=9 {
+        let shares = if h <= 2 {
+            vec![synthetic_share(&key(h as u8), ids[h as usize - 1], h)]
+        } else {
+            vec![]
+        };
+        state = apply_body(&state, g, h, &[], &shares).unwrap().0;
+    }
+    assert!(state.shares.values().all(|s| s.allocated_slots == 0));
+    (state, genesis_id, ids)
+}
+
+#[test]
+fn dhondt_counters_persist_across_blocks_idle_blocks_and_epochs() {
+    let g = fast_genesis();
+    let (mut state, genesis_id, ids) = scheduler_state(&g);
+    let mut assigned = 0;
+    for h in 10..=16 {
+        let jobs = if h == 12 {
+            vec![]
+        } else {
+            vec![make_job(h, 1, 1, 1, 100, &genesis_id)]
+        };
+        let (next, derived) = apply_body(&state, &g, h, &jobs, &[]).unwrap();
+        if !jobs.is_empty() {
+            assert_eq!(derived.leases[0].share_id, ids[assigned % 2]);
+            assigned += 1;
+        }
+        assert_eq!(next.shares[&ids[0]].allocated_slots, assigned.div_ceil(2) as u64);
+        assert_eq!(next.shares[&ids[1]].allocated_slots, (assigned / 2) as u64);
+        assert_eq!(
+            state.shares.values().map(|s| s.allocated_slots).sum::<u64>(),
+            (assigned - jobs.len()) as u64,
+            "constructing the child must not mutate the parent snapshot"
+        );
+        state = next;
+    }
+    assert_eq!(assigned, 6);
+    assert_eq!(state.ledger.total(), u128::from(TOTAL_SUPPLY.get()));
+}
+
+#[test]
+fn dhondt_new_and_expiring_shares_preserve_survivors_counters() {
+    let mut g = fast_genesis();
+    g.snapshot_window = 10;
+    g.share_inclusion_window = 3;
+    let (state, genesis_id, ids) = scheduler_state(&g);
+    let job = make_job(10, 1, 1, 1, 100, &genesis_id);
+    let (s10, first) = apply_body(&state, &g, 10, &[job], &[]).unwrap();
+    assert_eq!(first.leases[0].share_id, ids[0]);
+
+    let newcomer = Digest([0; DIGEST_LEN]);
+    let new_share = synthetic_share(&key(3), newcomer, 11);
+    let (s11, _) = apply_body(&s10, &g, 11, &[], &[new_share]).unwrap();
+    assert_eq!(s11.shares[&newcomer].allocated_slots, 0);
+    assert_eq!(s11.shares[&ids[0]].allocated_slots, 1);
+
+    // The first share is no longer eligible at height 12. Its history is kept
+    // until ordinary pruning, while the newcomer becomes eligible with a_s = 0.
+    let job = make_job(12, 1, 1, 1, 100, &genesis_id);
+    let (s12, next) = apply_body(&s11, &g, 12, &[job], &[]).unwrap();
+    assert_eq!(next.leases[0].share_id, newcomer);
+    assert_eq!(s12.shares[&ids[0]].allocated_slots, 1);
+    assert_eq!(s12.shares[&newcomer].allocated_slots, 1);
+    let job = make_job(13, 1, 1, 1, 100, &genesis_id);
+    let (s13, next) = apply_body(&s12, &g, 13, &[job], &[]).unwrap();
+    assert_eq!(next.leases[0].share_id, newcomer);
+    assert!(!s13.shares.contains_key(&ids[0]));
+    assert_eq!(s13.shares[&newcomer].allocated_slots, 2);
+    assert_eq!(s13.shares[&ids[1]].allocated_slots, 0);
+}
+
+#[test]
+fn dhondt_counter_overflow_rejects_without_mutating_parent() {
+    let g = fast_genesis();
+    let (mut state, genesis_id, ids) = scheduler_state(&g);
+    state.shares.get_mut(&ids[0]).unwrap().allocated_slots = u64::MAX;
+    let job = make_job(10, 1, 1, 1, 100, &genesis_id);
+    assert!(matches!(
+        apply_body(&state, &g, 10, &[job], &[]),
+        Err(StfError::SchedulerError(message)) if message.contains("overflow")
+    ));
+    assert_eq!(state.height, 9);
+    assert_eq!(state.shares[&ids[0]].allocated_slots, u64::MAX);
+    assert_eq!(state.shares[&ids[1]].allocated_slots, 0);
+    assert_eq!(state.ledger.balance(StateCategory::Escrow), Atoms::ZERO);
+}
+
+#[test]
+fn dhondt_counters_follow_branch_state_on_reorg() {
+    let g = fast_genesis();
+    let mut tree = BlockTree::new(g).unwrap();
+    let miner = key(1);
+    for h in 1..=9 {
+        let block = mine_block_on(&tree, tree.tip_id(), &miner, &[], &[], h);
+        extend(&mut tree, block);
+    }
+    let fork = tree.tip_id();
+    let job = make_job(10, 1, 1, 1, 100, &tree.genesis_id());
+    let a10 = mine_block_on(&tree, fork, &miner, &[job], &[], 10);
+    let winner = a10.body.leases[0].share_id;
+    let a10_id = a10.header.block_id;
+    extend(&mut tree, a10);
+    assert_eq!(tree.tip_state().shares[&winner].allocated_slots, 1);
+
+    let b10 = mine_block_on(&tree, fork, &miner, &[], &[], 100);
+    let b10_id = b10.header.block_id;
+    extend(&mut tree, b10);
+    let b11 = mine_block_on(&tree, b10_id, &miner, &[], &[], 101);
+    let b11_id = b11.header.block_id;
+    extend(&mut tree, b11);
+    assert_eq!(tree.tip_id(), b11_id);
+    assert!(tree.tip_state().shares.values().all(|s| s.allocated_slots == 0));
+    assert_eq!(tree.get_state(&a10_id).unwrap().shares[&winner].allocated_slots, 1);
+
+    let a11 = mine_block_on(&tree, a10_id, &miner, &[], &[], 11);
+    let a11_id = a11.header.block_id;
+    extend(&mut tree, a11);
+    let a12 = mine_block_on(&tree, a11_id, &miner, &[], &[], 12);
+    let a12_id = a12.header.block_id;
+    extend(&mut tree, a12);
+    assert_eq!(tree.tip_id(), a12_id);
+    assert_eq!(tree.tip_state().shares[&winner].allocated_slots, 1);
+}
+
 /// Unit test 3 (§11): 200 blocks with random job counts, random fees and epoch boundaries.
 /// `apply_body` conserves `M = 1.5 * 10^15` atoms and passes `check_invariants()` after
 /// every block.

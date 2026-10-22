@@ -7,7 +7,7 @@ testnet crates wrap it into a multi-node P2P network, as specified in
 and every public item is documented.
 
 ```sh
-cargo test --workspace --release   # 88 tests, including the 3-node integration test (~2-3 min)
+cargo test --workspace --release   # 94 tests, including the 3-node integration test (~2-3 min)
 cargo run -p poc                   # core: mock block transition + ASCII summary
 scripts/testnet.sh                 # join the public testnet, or run a local 3-node dev net
 ```
@@ -219,6 +219,17 @@ and the shares of abandoned blocks return to it on a reorg.
 
 ## Known gaps (blueprint §1.2)
 
+**D'Hondt continuity fix.** Each registered share stores its cumulative
+`allocated_slots`. Lease allocation restores those counters before every batch and
+adds the newly assigned slots back to the block state. Counters survive idle blocks
+and epoch boundaries until the share is pruned; a reorganization selects the counters
+from the corresponding branch snapshot. The scheduler exposes `Cohort::with_counters`
+to restore that state without changing its allocation rule.
+
+This changes consensus-derived lease assignments. Updated and unpatched nodes can
+disagree on job-bearing blocks, and old chain logs may fail replay under the new rule.
+Coordinate activation or a testnet reset before deploying this update to a live network.
+
 Gaps 1 (placeholder hashing), 2 (self-declared integer owners, no signatures) and 4 (shares
 not gossiped) are closed in v1. The numbering of the remaining gaps follows the blueprint.
 
@@ -228,6 +239,13 @@ not gossiped) are closed in v1. The numbering of the remaining gaps follows the 
 
 3. **VerifyFW by recomputation.** Validators recompute every claimed tile instead of
    verifying a Circle STARK. There is no P-DAL (Reed–Solomon layer).
+   The Technical Specification derives a 19.5 GiB peak prover-memory bound for its
+   stated Circle STARK trace and buffer profile, and assumes a 2-second
+   discovery-to-validation delay bound in its nominal security analysis. These are
+   mathematical model bounds, conditional on the specified profile and assumptions,
+   rather than measured v1 performance. In this v1 testnet, VerifyFW is done via
+   recomputation. Empirical benchmarks for the STARK prover memory and the complete
+   proving-to-validation delay are pending full integration.
 5. **Commercial execution is replicated.** Every validator recomputes each job's result.
    The lessee is the executor by attribution only. Commercial weight stays 0
    (`scivm::CONSENSUS_WEIGHT`).

@@ -44,7 +44,7 @@ SEED_NODE_IP=""
 if grep -q "$(printf '\r')" "$0" 2>/dev/null; then printf '%s\n' "note: converting Windows (CRLF) line endings into $0.lf" >&2; tr -d '\r' < "$0" > "$0.lf" && exec bash "$0.lf" "$@"; exit 1; fi #
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi #
 #
-# Plauthium_Testnet.sh: the Plauthium Public Testnet v1 workspace in one script.
+# Plauthium_Testnet.sh: the Plauthium Public Testnet.
 __PLAU_STATIC__
 echo "# Source: branch $BRANCH, commit $COMMIT ($COUNT files, $BYTES bytes)."
 cat << '__PLAU_STATIC__'

@@ -4,7 +4,7 @@ if grep -q "$(printf '\r')" "$0" 2>/dev/null; then printf '%s\n' "note: converti
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi #
 #
 # Plauthium_Testnet.sh: the Plauthium Public Testnet.
-# Source: branch claude/gallant-mccarthy-87dbfp, commit 874e8c5 (48 files, 700388 bytes).
+# Source: branch codex/persist-dhondt-v1, commit a6590fa (49 files, 711008 bytes).
 #
 # SEED_NODE_IP (line 2) is the IP address of a public seed node, dialed on port 30333.
 # Leave it empty to start a new network as its first seed node.
@@ -100,8 +100,10 @@ fi
 
 mkdir -p "$ROOT"
 cd "$ROOT"
-echo "Writing 48 files to $(pwd)"
+echo "Writing 49 files to $(pwd)"
 
+mkdir -p .github
+mkdir -p .github/workflows
 mkdir -p chain
 mkdir -p chain/src
 mkdir -p chain/tests
@@ -126,6 +128,34 @@ mkdir -p wire/src
 mkdir -p wire/tests
 mkdir -p work
 mkdir -p work/src
+
+cat << 'EOF' > .github/workflows/rust.yml
+name: Rust tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Test the workspace
+        run: cargo +stable test --workspace --release --locked
+EOF
 
 cat << 'EOF' > .gitignore
 /target
@@ -1382,7 +1412,7 @@ testnet crates wrap it into a multi-node P2P network, as specified in
 and every public item is documented.
 
 ```sh
-cargo test --workspace --release   # 88 tests, including the 3-node integration test (~2-3 min)
+cargo test --workspace --release   # 94 tests, including the 3-node integration test (~2-3 min)
 cargo run -p poc                   # core: mock block transition + ASCII summary
 scripts/testnet.sh                 # join the public testnet, or run a local 3-node dev net
 ```
@@ -1594,6 +1624,17 @@ and the shares of abandoned blocks return to it on a reorg.
 
 ## Known gaps (blueprint §1.2)
 
+**D'Hondt continuity fix.** Each registered share stores its cumulative
+`allocated_slots`. Lease allocation restores those counters before every batch and
+adds the newly assigned slots back to the block state. Counters survive idle blocks
+and epoch boundaries until the share is pruned; a reorganization selects the counters
+from the corresponding branch snapshot. The scheduler exposes `Cohort::with_counters`
+to restore that state without changing its allocation rule.
+
+This changes consensus-derived lease assignments. Updated and unpatched nodes can
+disagree on job-bearing blocks, and old chain logs may fail replay under the new rule.
+Coordinate activation or a testnet reset before deploying this update to a live network.
+
 Gaps 1 (placeholder hashing), 2 (self-declared integer owners, no signatures) and 4 (shares
 not gossiped) are closed in v1. The numbering of the remaining gaps follows the blueprint.
 
@@ -1603,6 +1644,13 @@ not gossiped) are closed in v1. The numbering of the remaining gaps follows the 
 
 3. **VerifyFW by recomputation.** Validators recompute every claimed tile instead of
    verifying a Circle STARK. There is no P-DAL (Reed–Solomon layer).
+   The Technical Specification derives a 19.5 GiB peak prover-memory bound for its
+   stated Circle STARK trace and buffer profile, and assumes a 2-second
+   discovery-to-validation delay bound in its nominal security analysis. These are
+   mathematical model bounds, conditional on the specified profile and assumptions,
+   rather than measured v1 performance. In this v1 testnet, VerifyFW is done via
+   recomputation. Empirical benchmarks for the STARK prover memory and the complete
+   proving-to-validation delay are pending full integration.
 5. **Commercial execution is replicated.** Every validator recomputes each job's result.
    The lessee is the executor by attribution only. Commercial weight stays 0
    (`scivm::CONSENSUS_WEIGHT`).
@@ -2731,7 +2779,7 @@ use std::collections::BTreeMap;
 
 use ledger::{BalanceDelta, JobId, Ledger, LedgerError, StateCategory};
 use primitives::{Atoms, ShareWeight};
-use scheduler::{OwnerId, ShareID, dhondt_allocation};
+use scheduler::{Capacity, Cohort, OwnerId, ShareID};
 use wire::{
     CategoryDelta, Digest, FeeTransition, GenesisConfig, JobTransaction, LeaseAssignment,
     OwnerReward, SettlementReceipt, ShareProof,
@@ -2756,6 +2804,8 @@ pub struct ShareRecord {
     pub height: u64,
     /// Height of the block that registered it.
     pub included_at: u64,
+    /// Cumulative D'Hondt slots `a_s`, retained until this share is pruned.
+    pub allocated_slots: u64,
 }
 
 /// Admitted commercial job awaiting settlement in `NodeState` (§7.1).
@@ -3193,12 +3243,32 @@ pub fn apply_body(
             })
             .collect();
 
-        let alloc = dhondt_allocation(&share_ids, jobs.len())
+        // Restore each share's history from the parent state. Epoch boundaries and
+        // changes to the eligible set must not reset surviving shares' counters.
+        let counters: Vec<u64> = cohort.iter().map(|sh| sh.allocated_slots).collect();
+        if counters
+            .iter()
+            .any(|&count| count.checked_add(jobs.len() as u64).is_none())
+        {
+            return Err(StfError::SchedulerError(
+                "D'Hondt allocation counter would overflow".to_string(),
+            ));
+        }
+        let mut scheduler = Cohort::with_counters(share_ids, counters)
             .map_err(|e| StfError::SchedulerError(e.to_string()))?;
+        let alloc = scheduler.allocate_batch(jobs.len(), &Capacity::Unbounded);
         if alloc.assigned() != jobs.len() {
             return Err(StfError::SchedulerError(
                 "D'Hondt did not assign all requested job slots".to_string(),
             ));
+        }
+
+        for (share, &won_slots) in cohort.iter().zip(&alloc.per_share) {
+            let record = s.shares.get_mut(&share.work_id).ok_or_else(|| {
+                StfError::SchedulerError("allocated share missing from state".to_string())
+            })?;
+            // The batch-size check above bounds every possible increment.
+            record.allocated_slots += won_slots;
         }
 
         for ((tx, &(tx_id, job_id, dot_result)), &slot) in
@@ -3251,6 +3321,7 @@ pub fn apply_body(
                 weight: sh.weight,
                 height: sh.height,
                 included_at: h,
+                allocated_slots: 0,
             },
         );
     }
@@ -4295,6 +4366,7 @@ impl BlockTree {
                     weight: share_weight(block.header.share_target),
                     height: h,
                     included_at: h,
+                    allocated_slots: 0,
                 });
         }
 
@@ -4827,6 +4899,136 @@ fn extend(tree: &mut BlockTree, block: Block) {
     tree.pre_validate(&block, None).unwrap();
     BlockTree::verify_stage_a(&block).unwrap();
     tree.apply_verified_block(Arc::new(block)).unwrap();
+}
+
+/// Two equal-weight shares; the first reward becomes spendable at height 10.
+fn scheduler_state(g: &GenesisConfig) -> (chain::NodeState, Digest, [Digest; 2]) {
+    let (_, ledger, genesis_id) = chain::validate_genesis(g).unwrap();
+    let mut state = chain::NodeState::genesis(ledger);
+    let ids = [Digest([1; DIGEST_LEN]), Digest([2; DIGEST_LEN])];
+    for h in 1..=9 {
+        let shares = if h <= 2 {
+            vec![synthetic_share(&key(h as u8), ids[h as usize - 1], h)]
+        } else {
+            vec![]
+        };
+        state = apply_body(&state, g, h, &[], &shares).unwrap().0;
+    }
+    assert!(state.shares.values().all(|s| s.allocated_slots == 0));
+    (state, genesis_id, ids)
+}
+
+#[test]
+fn dhondt_counters_persist_across_blocks_idle_blocks_and_epochs() {
+    let g = fast_genesis();
+    let (mut state, genesis_id, ids) = scheduler_state(&g);
+    let mut assigned = 0;
+    for h in 10..=16 {
+        let jobs = if h == 12 {
+            vec![]
+        } else {
+            vec![make_job(h, 1, 1, 1, 100, &genesis_id)]
+        };
+        let (next, derived) = apply_body(&state, &g, h, &jobs, &[]).unwrap();
+        if !jobs.is_empty() {
+            assert_eq!(derived.leases[0].share_id, ids[assigned % 2]);
+            assigned += 1;
+        }
+        assert_eq!(next.shares[&ids[0]].allocated_slots, assigned.div_ceil(2) as u64);
+        assert_eq!(next.shares[&ids[1]].allocated_slots, (assigned / 2) as u64);
+        assert_eq!(
+            state.shares.values().map(|s| s.allocated_slots).sum::<u64>(),
+            (assigned - jobs.len()) as u64,
+            "constructing the child must not mutate the parent snapshot"
+        );
+        state = next;
+    }
+    assert_eq!(assigned, 6);
+    assert_eq!(state.ledger.total(), u128::from(TOTAL_SUPPLY.get()));
+}
+
+#[test]
+fn dhondt_new_and_expiring_shares_preserve_survivors_counters() {
+    let mut g = fast_genesis();
+    g.snapshot_window = 10;
+    g.share_inclusion_window = 3;
+    let (state, genesis_id, ids) = scheduler_state(&g);
+    let job = make_job(10, 1, 1, 1, 100, &genesis_id);
+    let (s10, first) = apply_body(&state, &g, 10, &[job], &[]).unwrap();
+    assert_eq!(first.leases[0].share_id, ids[0]);
+
+    let newcomer = Digest([0; DIGEST_LEN]);
+    let new_share = synthetic_share(&key(3), newcomer, 11);
+    let (s11, _) = apply_body(&s10, &g, 11, &[], &[new_share]).unwrap();
+    assert_eq!(s11.shares[&newcomer].allocated_slots, 0);
+    assert_eq!(s11.shares[&ids[0]].allocated_slots, 1);
+
+    // The first share is no longer eligible at height 12. Its history is kept
+    // until ordinary pruning, while the newcomer becomes eligible with a_s = 0.
+    let job = make_job(12, 1, 1, 1, 100, &genesis_id);
+    let (s12, next) = apply_body(&s11, &g, 12, &[job], &[]).unwrap();
+    assert_eq!(next.leases[0].share_id, newcomer);
+    assert_eq!(s12.shares[&ids[0]].allocated_slots, 1);
+    assert_eq!(s12.shares[&newcomer].allocated_slots, 1);
+    let job = make_job(13, 1, 1, 1, 100, &genesis_id);
+    let (s13, next) = apply_body(&s12, &g, 13, &[job], &[]).unwrap();
+    assert_eq!(next.leases[0].share_id, newcomer);
+    assert!(!s13.shares.contains_key(&ids[0]));
+    assert_eq!(s13.shares[&newcomer].allocated_slots, 2);
+    assert_eq!(s13.shares[&ids[1]].allocated_slots, 0);
+}
+
+#[test]
+fn dhondt_counter_overflow_rejects_without_mutating_parent() {
+    let g = fast_genesis();
+    let (mut state, genesis_id, ids) = scheduler_state(&g);
+    state.shares.get_mut(&ids[0]).unwrap().allocated_slots = u64::MAX;
+    let job = make_job(10, 1, 1, 1, 100, &genesis_id);
+    assert!(matches!(
+        apply_body(&state, &g, 10, &[job], &[]),
+        Err(StfError::SchedulerError(message)) if message.contains("overflow")
+    ));
+    assert_eq!(state.height, 9);
+    assert_eq!(state.shares[&ids[0]].allocated_slots, u64::MAX);
+    assert_eq!(state.shares[&ids[1]].allocated_slots, 0);
+    assert_eq!(state.ledger.balance(StateCategory::Escrow), Atoms::ZERO);
+}
+
+#[test]
+fn dhondt_counters_follow_branch_state_on_reorg() {
+    let g = fast_genesis();
+    let mut tree = BlockTree::new(g).unwrap();
+    let miner = key(1);
+    for h in 1..=9 {
+        let block = mine_block_on(&tree, tree.tip_id(), &miner, &[], &[], h);
+        extend(&mut tree, block);
+    }
+    let fork = tree.tip_id();
+    let job = make_job(10, 1, 1, 1, 100, &tree.genesis_id());
+    let a10 = mine_block_on(&tree, fork, &miner, &[job], &[], 10);
+    let winner = a10.body.leases[0].share_id;
+    let a10_id = a10.header.block_id;
+    extend(&mut tree, a10);
+    assert_eq!(tree.tip_state().shares[&winner].allocated_slots, 1);
+
+    let b10 = mine_block_on(&tree, fork, &miner, &[], &[], 100);
+    let b10_id = b10.header.block_id;
+    extend(&mut tree, b10);
+    let b11 = mine_block_on(&tree, b10_id, &miner, &[], &[], 101);
+    let b11_id = b11.header.block_id;
+    extend(&mut tree, b11);
+    assert_eq!(tree.tip_id(), b11_id);
+    assert!(tree.tip_state().shares.values().all(|s| s.allocated_slots == 0));
+    assert_eq!(tree.get_state(&a10_id).unwrap().shares[&winner].allocated_slots, 1);
+
+    let a11 = mine_block_on(&tree, a10_id, &miner, &[], &[], 11);
+    let a11_id = a11.header.block_id;
+    extend(&mut tree, a11);
+    let a12 = mine_block_on(&tree, a11_id, &miner, &[], &[], 12);
+    let a12_id = a12.header.block_id;
+    extend(&mut tree, a12);
+    assert_eq!(tree.tip_id(), a12_id);
+    assert_eq!(tree.tip_state().shares[&winner].allocated_slots, 1);
 }
 
 /// Unit test 3 (§11): 200 blocks with random job counts, random fees and epoch boundaries.
@@ -16075,6 +16277,13 @@ pub enum SchedulerError {
     DuplicateShareId(DomainSeparatedHash),
     /// A ShareID has zero weight; normative weights are at least `2^128`.
     ZeroWeight(DomainSeparatedHash),
+    /// Restoring a cohort requires one allocation counter per ShareID.
+    CounterCountMismatch {
+        /// Number of shares in the cohort.
+        shares: usize,
+        /// Number of supplied allocation counters.
+        counters: usize,
+    },
 }
 
 impl fmt::Display for SchedulerError {
@@ -16082,6 +16291,9 @@ impl fmt::Display for SchedulerError {
         match self {
             SchedulerError::DuplicateShareId(id) => write!(f, "duplicate ShareID {id:?}"),
             SchedulerError::ZeroWeight(id) => write!(f, "ShareID {id:?} has zero weight"),
+            SchedulerError::CounterCountMismatch { shares, counters } => {
+                write!(f, "cohort has {shares} shares but {counters} allocation counters")
+            }
         }
     }
 }
@@ -16118,6 +16330,22 @@ pub struct Cohort {
 impl Cohort {
     /// Forms a cohort, rejecting duplicate ShareIDs and zero weights.
     pub fn new(shares: Vec<ShareID>) -> Result<Self, SchedulerError> {
+        let counters = vec![0; shares.len()];
+        Self::with_counters(shares, counters)
+    }
+
+    /// Restores a cohort from its shares and cumulative allocation counters.
+    /// Counter `i` belongs to share `i`; neither vector is reordered.
+    pub fn with_counters(
+        shares: Vec<ShareID>,
+        counters: Vec<u64>,
+    ) -> Result<Self, SchedulerError> {
+        if shares.len() != counters.len() {
+            return Err(SchedulerError::CounterCountMismatch {
+                shares: shares.len(),
+                counters: counters.len(),
+            });
+        }
         let mut seen = BTreeSet::new();
         for share in &shares {
             if share.weight == 0 {
@@ -16127,7 +16355,6 @@ impl Cohort {
                 return Err(SchedulerError::DuplicateShareId(share.id));
             }
         }
-        let counters = vec![0; shares.len()];
         Ok(Cohort { shares, counters })
     }
 
@@ -16320,6 +16547,36 @@ mod tests {
         let joined: Vec<usize> = first.slots.iter().chain(&second.slots).copied().collect();
         assert_eq!(joined, whole.slots);
         assert_eq!(split.counters(), &[5, 3, 2]);
+    }
+
+    #[test]
+    fn restored_counters_continue_the_same_allocation() {
+        let shares = vec![share(0, 5, 0), share(1, 3, 1), share(2, 2, 2)];
+        let mut uninterrupted = Cohort::new(shares.clone()).unwrap();
+        uninterrupted.allocate_batch(7, &Capacity::Unbounded);
+        let mut restored =
+            Cohort::with_counters(shares, uninterrupted.counters().to_vec()).unwrap();
+
+        let expected = uninterrupted.allocate_batch(13, &Capacity::Unbounded);
+        assert_eq!(restored.allocate_batch(13, &Capacity::Unbounded), expected);
+        assert_eq!(restored.counters(), uninterrupted.counters());
+    }
+
+    #[test]
+    fn restored_cohort_validates_counter_count_and_shares() {
+        let s = share(0, 5, 0);
+        assert!(matches!(
+            Cohort::with_counters(vec![s], vec![]),
+            Err(SchedulerError::CounterCountMismatch { shares: 1, counters: 0 })
+        ));
+        assert!(matches!(
+            Cohort::with_counters(vec![s, s], vec![1, 2]),
+            Err(SchedulerError::DuplicateShareId(_))
+        ));
+        assert!(matches!(
+            Cohort::with_counters(vec![share(1, 0, 1)], vec![2]),
+            Err(SchedulerError::ZeroWeight(_))
+        ));
     }
 
     #[test]
@@ -16921,7 +17178,7 @@ SEED_NODE_IP=""
 if grep -q "$(printf '\r')" "$0" 2>/dev/null; then printf '%s\n' "note: converting Windows (CRLF) line endings into $0.lf" >&2; tr -d '\r' < "$0" > "$0.lf" && exec bash "$0.lf" "$@"; exit 1; fi #
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi #
 #
-# Plauthium_Testnet.sh: the Plauthium Public Testnet v1 workspace in one script.
+# Plauthium_Testnet.sh: the Plauthium Public Testnet.
 __PLAU_STATIC__
 echo "# Source: branch $BRANCH, commit $COMMIT ($COUNT files, $BYTES bytes)."
 cat << '__PLAU_STATIC__'
@@ -19504,19 +19761,20 @@ else
       bad=1
     fi
   done << 'EOF'
+e1b09c2dd8e4e132f05d1fb335493b9bf2d44ab082c7e2277079121bb87b19cc  .github/workflows/rust.yml
 44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb  .gitignore
 c0a5f5bf3d800d366ab192dc2e5a9268b5aa3c29561cb462494ce9a8d79ae46e  Cargo.lock
 b635b428c7b6b12ea5d6e288a18a72442f93d98904744dc55ac9467cb0cad814  Cargo.toml
-6e97c19c62b107e5f7226ac43b10f075cf7a145f0cb45578f72bda0f5913d631  README.md
+97e10f76e73f22bd7c253a4e73256d789d0221bf787a634b7d3961d1320cf690  README.md
 8c12e8600ddd2b133139d47f55bf0df16404a77754785a3d4247a1eb84e66f0e  chain/Cargo.toml
 74033c03a7541a684494111f76cde8ed0970ed5fcde719b61022de0a4fbf979f  chain/src/core_adapter.rs
 27e77bedf168a87d2f7be150ec740b615d70a8e495cd87a77248bfedd4bac328  chain/src/difficulty.rs
 42869ca13744560f79dff3c3f44b16c0f318fd02a418100b0c932303e27e84d7  chain/src/keys.rs
 0a0f950d25adf55f37cdba59f05114eb295244c55ab2f9e7b7f225160a92748e  chain/src/lib.rs
-24c488177b961436be2a16924e6b2edfb5de81e3c914480f049ed234e655b24a  chain/src/stf.rs
+fe1f267825ea1839c3c519bc65d58f535ba547a27f3fa35681a1e4923e8f3eb1  chain/src/stf.rs
 ea9d4dad93fa875a0474b51286d57f6d0a3e21cd4d718b14e45296927aaf144d  chain/src/template.rs
-35c1d7ea997ec15e88eaa7e21b02d116e8286bd49f593234d4e991dba694ed8d  chain/src/tree.rs
-1d1e6d1a1f103c9efdef64447be2dbff1a09d2d47cb9497b851983ba80fd9b07  chain/tests/consensus_suite.rs
+9dcdf2f82bd57716b2a8455c1edc7f44e708c511a08f6213c6076c22b9ab6595  chain/src/tree.rs
+ea2082dd3cd90ffcc6c7b008c97425bb2fab18e51ddb1787961bf390c5261ba0  chain/tests/consensus_suite.rs
 65bd285d17233a31a3fd881a831a686d223d888c811452b66dde78c7b521b340  chain/tests/vectors/ml_dsa_87_openssl.sig.hex
 9ceb5af43ddb447cd5961932125163e4eea86a731fbddd96d4dba9eaa8e59169  ledger/Cargo.toml
 fb6c260bdbe36066b7515b05752651760f0360ea0a6eea296b2a677d9eb744bc  ledger/src/lib.rs
@@ -19542,10 +19800,10 @@ daa05d86bf4eb672cb95df00c02dfc3e4a6fd1081f35b0778b29ea8023c9b7b5  node/tests/tes
 29d2e54e16fec1aa63d176c26cd68a3c771b6d29f15b4730f5f993b6a39537bb  primitives/Cargo.toml
 652502c1d491ea178ab478a89b07bab9416b19dec4b7ec47b693bf4516211e2c  primitives/src/lib.rs
 9bc020dcc84a1dd5180b5af65f6c756638c3a39ff50e4ed29176fb98d2e9d974  scheduler/Cargo.toml
-88c69749b2c6f1f2a67964f3990c6c8c980cafce01e9cd236504c3648180ecec  scheduler/src/lib.rs
+066165eb3a469d2a6a739f4ce867861109de6946abe2d75d1f62b5114cbc81d5  scheduler/src/lib.rs
 4030df8be42c977ed05a3d176d08b5fff501040326db7b28bf2ee989eff505bf  scivm/Cargo.toml
 3355af1b946eff294bb03a1b38e8d76b995005865f96bd8f93dbb5361111b518  scivm/src/lib.rs
-44f9b5fce315a40c419669a96b706d592087a8f26c83b333bae7ec1005eccec4  scripts/make_bundle.sh
+53feca30d3737a4a2c9d6c08cd57f87096841cec8ce44d68d06370ee395840ed  scripts/make_bundle.sh
 5ec617f702fc293257445727e28b112ebe9940fbbb9e9605647843b62787b884  scripts/testnet.sh
 1226d97292355a06bd7a58e839c38c4e260e158411dce16d8340db0893f0f7b8  wire/Cargo.toml
 ea55c1c5897186a4487a27595378962b12de38252acb117ba1c28a66727fc4fb  wire/src/lib.rs
@@ -19557,7 +19815,7 @@ EOF
     echo "error: this copy of Plauthium_Testnet.sh is incomplete or altered; download it again" >&2
     exit 1
   fi
-  echo "All 48 files written and verified (874e8c5)."
+  echo "All 49 files written and verified (a6590fa)."
 fi
 
 if [ "$EXTRACT_ONLY" = 1 ]; then

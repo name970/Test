@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use ledger::{BalanceDelta, JobId, Ledger, LedgerError, StateCategory};
 use primitives::{Atoms, ShareWeight};
-use scheduler::{OwnerId, ShareID, dhondt_allocation};
+use scheduler::{Capacity, Cohort, OwnerId, ShareID};
 use wire::{
     CategoryDelta, Digest, FeeTransition, GenesisConfig, JobTransaction, LeaseAssignment,
     OwnerReward, SettlementReceipt, ShareProof,
@@ -30,6 +30,8 @@ pub struct ShareRecord {
     pub height: u64,
     /// Height of the block that registered it.
     pub included_at: u64,
+    /// Cumulative D'Hondt slots `a_s`, retained until this share is pruned.
+    pub allocated_slots: u64,
 }
 
 /// Admitted commercial job awaiting settlement in `NodeState` (§7.1).
@@ -467,12 +469,32 @@ pub fn apply_body(
             })
             .collect();
 
-        let alloc = dhondt_allocation(&share_ids, jobs.len())
+        // Restore each share's history from the parent state. Epoch boundaries and
+        // changes to the eligible set must not reset surviving shares' counters.
+        let counters: Vec<u64> = cohort.iter().map(|sh| sh.allocated_slots).collect();
+        if counters
+            .iter()
+            .any(|&count| count.checked_add(jobs.len() as u64).is_none())
+        {
+            return Err(StfError::SchedulerError(
+                "D'Hondt allocation counter would overflow".to_string(),
+            ));
+        }
+        let mut scheduler = Cohort::with_counters(share_ids, counters)
             .map_err(|e| StfError::SchedulerError(e.to_string()))?;
+        let alloc = scheduler.allocate_batch(jobs.len(), &Capacity::Unbounded);
         if alloc.assigned() != jobs.len() {
             return Err(StfError::SchedulerError(
                 "D'Hondt did not assign all requested job slots".to_string(),
             ));
+        }
+
+        for (share, &won_slots) in cohort.iter().zip(&alloc.per_share) {
+            let record = s.shares.get_mut(&share.work_id).ok_or_else(|| {
+                StfError::SchedulerError("allocated share missing from state".to_string())
+            })?;
+            // The batch-size check above bounds every possible increment.
+            record.allocated_slots += won_slots;
         }
 
         for ((tx, &(tx_id, job_id, dot_result)), &slot) in
@@ -525,6 +547,7 @@ pub fn apply_body(
                 weight: sh.weight,
                 height: sh.height,
                 included_at: h,
+                allocated_slots: 0,
             },
         );
     }

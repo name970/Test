@@ -53,6 +53,13 @@ pub enum SchedulerError {
     DuplicateShareId(DomainSeparatedHash),
     /// A ShareID has zero weight; normative weights are at least `2^128`.
     ZeroWeight(DomainSeparatedHash),
+    /// Restoring a cohort requires one allocation counter per ShareID.
+    CounterCountMismatch {
+        /// Number of shares in the cohort.
+        shares: usize,
+        /// Number of supplied allocation counters.
+        counters: usize,
+    },
 }
 
 impl fmt::Display for SchedulerError {
@@ -60,6 +67,9 @@ impl fmt::Display for SchedulerError {
         match self {
             SchedulerError::DuplicateShareId(id) => write!(f, "duplicate ShareID {id:?}"),
             SchedulerError::ZeroWeight(id) => write!(f, "ShareID {id:?} has zero weight"),
+            SchedulerError::CounterCountMismatch { shares, counters } => {
+                write!(f, "cohort has {shares} shares but {counters} allocation counters")
+            }
         }
     }
 }
@@ -96,6 +106,22 @@ pub struct Cohort {
 impl Cohort {
     /// Forms a cohort, rejecting duplicate ShareIDs and zero weights.
     pub fn new(shares: Vec<ShareID>) -> Result<Self, SchedulerError> {
+        let counters = vec![0; shares.len()];
+        Self::with_counters(shares, counters)
+    }
+
+    /// Restores a cohort from its shares and cumulative allocation counters.
+    /// Counter `i` belongs to share `i`; neither vector is reordered.
+    pub fn with_counters(
+        shares: Vec<ShareID>,
+        counters: Vec<u64>,
+    ) -> Result<Self, SchedulerError> {
+        if shares.len() != counters.len() {
+            return Err(SchedulerError::CounterCountMismatch {
+                shares: shares.len(),
+                counters: counters.len(),
+            });
+        }
         let mut seen = BTreeSet::new();
         for share in &shares {
             if share.weight == 0 {
@@ -105,7 +131,6 @@ impl Cohort {
                 return Err(SchedulerError::DuplicateShareId(share.id));
             }
         }
-        let counters = vec![0; shares.len()];
         Ok(Cohort { shares, counters })
     }
 
@@ -298,6 +323,36 @@ mod tests {
         let joined: Vec<usize> = first.slots.iter().chain(&second.slots).copied().collect();
         assert_eq!(joined, whole.slots);
         assert_eq!(split.counters(), &[5, 3, 2]);
+    }
+
+    #[test]
+    fn restored_counters_continue_the_same_allocation() {
+        let shares = vec![share(0, 5, 0), share(1, 3, 1), share(2, 2, 2)];
+        let mut uninterrupted = Cohort::new(shares.clone()).unwrap();
+        uninterrupted.allocate_batch(7, &Capacity::Unbounded);
+        let mut restored =
+            Cohort::with_counters(shares, uninterrupted.counters().to_vec()).unwrap();
+
+        let expected = uninterrupted.allocate_batch(13, &Capacity::Unbounded);
+        assert_eq!(restored.allocate_batch(13, &Capacity::Unbounded), expected);
+        assert_eq!(restored.counters(), uninterrupted.counters());
+    }
+
+    #[test]
+    fn restored_cohort_validates_counter_count_and_shares() {
+        let s = share(0, 5, 0);
+        assert!(matches!(
+            Cohort::with_counters(vec![s], vec![]),
+            Err(SchedulerError::CounterCountMismatch { shares: 1, counters: 0 })
+        ));
+        assert!(matches!(
+            Cohort::with_counters(vec![s, s], vec![1, 2]),
+            Err(SchedulerError::DuplicateShareId(_))
+        ));
+        assert!(matches!(
+            Cohort::with_counters(vec![share(1, 0, 1)], vec![2]),
+            Err(SchedulerError::ZeroWeight(_))
+        ));
     }
 
     #[test]
