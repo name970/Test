@@ -734,6 +734,7 @@ impl BlockTree {
                     weight: share_weight(block.header.share_target),
                     height: h,
                     included_at: h,
+                    allocated_slots: 0,
                 });
         }
 
